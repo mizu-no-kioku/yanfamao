@@ -1,0 +1,452 @@
+from __future__ import annotations
+
+import copy
+import re
+import uuid
+from collections.abc import Collection
+from typing import Any, Literal
+
+from sqlalchemy import select, update
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from yuxi.agents.context import BaseContext, validate_resource_selection
+from yuxi.agents.presets import AgentPreset
+from yuxi.agents.presets.default_chatbot import PRESET as DEFAULT_AGENT
+from yuxi.permissions import ResourcePermission, normalize_permission_config, resolve_agent_permission
+from yuxi.storage.postgres.models_business import Agent, User
+from yuxi.utils.datetime_utils import utc_now_naive
+
+DEFAULT_AGENT_SLUG = DEFAULT_AGENT.slug
+DEFAULT_AGENT_NAME = DEFAULT_AGENT.name
+DEFAULT_AGENT_BACKEND_ID = DEFAULT_AGENT.backend_id
+DEFAULT_AGENT_DESCRIPTION = DEFAULT_AGENT.description
+SUB_AGENT_BACKEND_ID = "SubAgentBackend"
+DEFAULT_SHARE_CONFIG = {
+    "version": 2,
+    "read_scope": {"access_level": "global", "department_ids": [], "user_uids": []},
+    "manage_scope": None,
+}
+
+ADMIN_ROLES = {"admin", "superadmin"}
+
+
+def is_builtin_agent(agent: Agent) -> bool:
+    return agent.slug == DEFAULT_AGENT_SLUG
+
+
+def resolve_agent_is_subagent(backend_id: str, is_subagent: bool | None = None) -> bool:
+    expected = backend_id == SUB_AGENT_BACKEND_ID
+    if is_subagent is not None and bool(is_subagent) != expected:
+        raise ValueError("SubAgentBackend 与 is_subagent 必须保持一致")
+    return expected
+
+
+def get_allowed_agent_access_levels(user: User) -> list[str]:
+    if user.role in ADMIN_ROLES:
+        return ["global", "department", "user"]
+    return ["user"]
+
+
+def normalize_agent_share_config(
+    share_config: dict | None,
+    *,
+    allowed_access_levels: Collection[str] | None = None,
+) -> dict:
+    return normalize_permission_config(
+        share_config or DEFAULT_SHARE_CONFIG,
+        allowed_access_levels=allowed_access_levels,
+        unauthorized_access_level_message="当前用户无权使用该智能体共享范围",
+        strict=True,
+    )
+
+
+def user_can_access_agent(user: User, agent: Agent) -> bool:
+    return resolve_agent_permission(user, agent) != ResourcePermission.NONE
+
+
+def user_can_manage_agent(user: User, agent: Agent) -> bool:
+    if is_builtin_agent(agent):
+        return user.role in ADMIN_ROLES
+    return resolve_agent_permission(user, agent) == ResourcePermission.MANAGE
+
+
+def _slugify(value: str | None) -> str:
+    base = re.sub(r"[^a-zA-Z0-9_-]+", "-", (value or "").strip().lower()).strip("-")
+    return base[:56] or f"agent-{uuid.uuid4().hex[:12]}"
+
+
+class AgentRepository:
+    def __init__(self, db_session: AsyncSession):
+        self.db = db_session
+
+    async def ensure_default_agent(self, *, created_by: str | None = None) -> Agent:
+        agent = await self.get_by_slug(DEFAULT_AGENT_SLUG)
+        if agent:
+            needs_update = False
+            if agent.share_config != DEFAULT_SHARE_CONFIG:
+                agent.share_config = DEFAULT_SHARE_CONFIG.copy()
+                needs_update = True
+            if not agent.description:
+                agent.description = DEFAULT_AGENT_DESCRIPTION
+                needs_update = True
+            if getattr(agent, "is_subagent", False):
+                agent.is_subagent = False
+                needs_update = True
+            if not agent.is_default:
+                return await self.set_default(agent=agent, updated_by=created_by)
+            if needs_update:
+                agent.updated_by = created_by
+                agent.updated_at = utc_now_naive()
+                await self.db.commit()
+                await self.db.refresh(agent)
+            return agent
+
+        agent = Agent(
+            slug=DEFAULT_AGENT_SLUG,
+            backend_id=DEFAULT_AGENT_BACKEND_ID,
+            name=DEFAULT_AGENT_NAME,
+            description=DEFAULT_AGENT_DESCRIPTION,
+            icon=None,
+            pics=[],
+            config_json={"context": copy.deepcopy(DEFAULT_AGENT.context)},
+            share_config=DEFAULT_SHARE_CONFIG.copy(),
+            is_default=True,
+            is_subagent=False,
+            created_by=created_by,
+            updated_by=created_by,
+            created_at=utc_now_naive(),
+            updated_at=utc_now_naive(),
+        )
+        self.db.add(agent)
+        await self.db.commit()
+        await self.db.refresh(agent)
+        return agent
+
+    async def ensure_preset(self, preset: AgentPreset, *, created_by: str | None = None) -> Agent:
+        """首次落库预置角色，保留已存在的用户配置。"""
+        if preset.slug == DEFAULT_AGENT_SLUG:
+            return await self.ensure_default_agent(created_by=created_by)
+        agent = await self.get_by_slug(preset.slug)
+        if agent:
+            return agent
+
+        agent = Agent(
+            slug=preset.slug,
+            backend_id=preset.backend_id,
+            name=preset.name,
+            description=preset.description,
+            icon=None,
+            pics=[],
+            config_json={"context": copy.deepcopy(preset.context)},
+            share_config=DEFAULT_SHARE_CONFIG.copy(),
+            is_default=False,
+            is_subagent=resolve_agent_is_subagent(preset.backend_id),
+            created_by=created_by,
+            updated_by=created_by,
+            created_at=utc_now_naive(),
+            updated_at=utc_now_naive(),
+        )
+        self.db.add(agent)
+        await self.db.commit()
+        await self.db.refresh(agent)
+        return agent
+
+    async def list_visible(self, *, user: User, include_subagent_definitions: bool = False) -> list[Agent]:
+        """列出用户可见的主智能体，只有显式请求时才包含子智能体定义。"""
+        stmt = select(Agent)
+        if not include_subagent_definitions:
+            stmt = stmt.where(Agent.is_subagent.is_(False))
+        result = await self.db.execute(stmt.order_by(Agent.is_default.desc(), Agent.id.asc()))
+        agents = list(result.scalars().all())
+        if user.role == "superadmin":
+            return agents
+        return [agent for agent in agents if user_can_access_agent(user, agent)]
+
+    async def list_visible_subagents(self, *, user: User) -> list[Agent]:
+        result = await self.db.execute(
+            select(Agent).where(Agent.is_subagent.is_(True)).order_by(Agent.name.asc(), Agent.id.asc())
+        )
+        agents = list(result.scalars().all())
+        if user.role == "superadmin":
+            return agents
+        return [agent for agent in agents if user_can_access_agent(user, agent)]
+
+    async def get_by_slug(self, slug: str) -> Agent | None:
+        result = await self.db.execute(select(Agent).where(Agent.slug == slug))
+        return result.scalar_one_or_none()
+
+    async def list_by_slugs(self, slugs: list[str]) -> list[Agent]:
+        result = await self.db.execute(select(Agent).where(Agent.slug.in_(slugs)))
+        return list(result.scalars().all())
+
+    async def get_visible_by_slug(
+        self, *, slug: str, user: User, kind: Literal["main", "subagent", "any"] = "main"
+    ) -> Agent | None:
+        """按 slug 读取用户可见智能体，并按入口语义过滤主/子智能体。"""
+        agent = await self.get_by_slug(slug)
+        if not agent:
+            return None
+        if not user_can_access_agent(user, agent):
+            return None
+        if kind == "any":
+            return agent
+        if kind == "main":
+            return None if agent.is_subagent else agent
+        if kind == "subagent":
+            return agent if agent.is_subagent else None
+        raise ValueError(f"未知智能体入口类型: {kind}")
+
+    async def get_default(self) -> Agent | None:
+        result = await self.db.execute(select(Agent).where(Agent.is_default.is_(True)))
+        return result.scalar_one_or_none()
+
+    async def set_default(self, *, agent: Agent, updated_by: str | None = None) -> Agent:
+        if agent.is_subagent:
+            raise ValueError("子智能体不能设为默认智能体")
+        if not is_builtin_agent(agent):
+            raise ValueError("默认智能体已固定为内置智能助手")
+        share_config = agent.share_config or DEFAULT_SHARE_CONFIG.copy()
+        read_scope = share_config.get("read_scope") or {}
+        if read_scope.get("access_level") != "global":
+            raise ValueError("内置智能体必须全局共享")
+
+        now = utc_now_naive()
+        await self.db.execute(update(Agent).where(Agent.is_default.is_(True)).values(is_default=False, updated_at=now))
+        agent.is_default = True
+        agent.updated_by = updated_by
+        agent.updated_at = now
+        await self.db.commit()
+        await self.db.refresh(agent)
+        return agent
+
+    async def _slug_exists(self, slug: str) -> bool:
+        result = await self.db.execute(select(Agent.id).where(Agent.slug == slug))
+        return result.scalar_one_or_none() is not None
+
+    async def _unique_slug(self, desired: str | None, name: str) -> str:
+        base = _slugify(desired or name)
+        candidate = base
+        idx = 2
+        while await self._slug_exists(candidate):
+            suffix = f"-{idx}"
+            candidate = f"{base[: 80 - len(suffix)]}{suffix}"
+            idx += 1
+        return candidate
+
+    async def create(
+        self,
+        *,
+        name: str,
+        backend_id: str,
+        slug: str | None = None,
+        description: str | None = None,
+        icon: str | None = None,
+        pics: list[str] | None = None,
+        config_json: dict | None = None,
+        config_resource_access: dict[str, Collection[str]] | None = None,
+        share_config: dict | None = None,
+        is_default: bool = False,
+        is_subagent: bool | None = None,
+        created_by: str | None = None,
+        creator: User | None = None,
+    ) -> Agent:
+        resolved_is_subagent = resolve_agent_is_subagent(backend_id, is_subagent)
+        if resolved_is_subagent and is_default:
+            raise ValueError("子智能体不能设为默认智能体")
+        owner_uid = str(created_by or "")
+        default_share_config = {
+            "version": 2,
+            "read_scope": {
+                "access_level": "user",
+                "department_ids": [],
+                "user_uids": [owner_uid],
+            },
+            "manage_scope": None,
+        }
+        allowed_access_levels = get_allowed_agent_access_levels(creator) if creator else None
+        normalized_share_config = normalize_agent_share_config(
+            share_config or default_share_config,
+            allowed_access_levels=allowed_access_levels,
+        )
+        if is_default and (normalized_share_config.get("read_scope") or {}).get("access_level") != "global":
+            raise ValueError("默认智能体必须全局共享")
+
+        from yuxi.agents.buildin import get_agent_backend
+
+        agent = Agent(
+            slug=await self._unique_slug(slug, name),
+            backend_id=backend_id,
+            name=name.strip() or "未命名智能体",
+            description=description,
+            icon=icon,
+            pics=pics or [],
+            config_json=merge_agent_config_json(
+                {"context": {}},
+                config_json or {},
+                resource_access=config_resource_access or {},
+                context_schema=get_agent_backend(backend_id).context_schema,
+            ),
+            share_config=normalized_share_config,
+            is_default=False,
+            is_subagent=resolved_is_subagent,
+            created_by=created_by,
+            updated_by=created_by,
+            created_at=utc_now_naive(),
+            updated_at=utc_now_naive(),
+        )
+        self.db.add(agent)
+        await self.db.commit()
+        await self.db.refresh(agent)
+        if is_default:
+            return await self.set_default(agent=agent, updated_by=created_by)
+        return agent
+
+    async def update(
+        self,
+        agent: Agent,
+        *,
+        name: str | None = None,
+        description: str | None = None,
+        icon: str | None = None,
+        pics: list[str] | None = None,
+        config_json: dict | None = None,
+        config_resource_access: dict[str, Collection[str]] | None = None,
+        share_config: dict | None = None,
+        is_subagent: bool | None = None,
+        updated_by: str | None = None,
+        updater: User | None = None,
+    ) -> Agent:
+        if is_subagent is not None:
+            agent.is_subagent = resolve_agent_is_subagent(agent.backend_id, is_subagent)
+        if name is not None:
+            agent.name = name.strip() or "未命名智能体"
+        if description is not None:
+            agent.description = description
+        if icon is not None:
+            agent.icon = icon
+        if pics is not None:
+            agent.pics = pics
+        if config_json is not None:
+            from yuxi.agents.buildin import get_agent_backend
+
+            result = await self.db.execute(select(Agent.config_json).where(Agent.id == agent.id).with_for_update())
+            row = result.one_or_none()
+            if row is None:
+                raise ValueError("智能体不存在")
+            agent.config_json = merge_agent_config_json(
+                row[0],
+                config_json,
+                resource_access=config_resource_access or {},
+                context_schema=get_agent_backend(agent.backend_id).context_schema,
+            )
+        if share_config is not None:
+            if is_builtin_agent(agent):
+                agent.share_config = DEFAULT_SHARE_CONFIG.copy()
+            else:
+                allowed_access_levels = get_allowed_agent_access_levels(updater) if updater else None
+                agent.share_config = normalize_agent_share_config(
+                    share_config,
+                    allowed_access_levels=allowed_access_levels,
+                )
+
+        agent.updated_by = updated_by
+        agent.updated_at = utc_now_naive()
+        await self.db.commit()
+        await self.db.refresh(agent)
+        return agent
+
+    async def delete(self, *, agent: Agent) -> None:
+        await self.db.delete(agent)
+        await self.db.commit()
+
+    async def serialize(
+        self,
+        agent: Agent,
+        *,
+        user: User,
+        include_configurable_items: bool = False,
+        backend_info_cache: dict[tuple[str, bool, str], dict] | None = None,
+    ) -> dict[str, Any]:
+        data = agent.to_dict()
+        data["share_config"] = normalize_permission_config(
+            agent.share_config,
+        )
+        permission = resolve_agent_permission(user, agent)
+        is_builtin = is_builtin_agent(agent)
+        data["can_manage"] = user_can_manage_agent(user, agent)
+        data["effective_permission"] = permission.value
+        data["is_builtin"] = is_builtin
+        data["permission_locked"] = is_builtin
+
+        from yuxi.agents.buildin import get_agent_backend
+
+        backend = get_agent_backend(agent.backend_id)
+        cache_key = (agent.backend_id, include_configurable_items, user.role)
+        backend_info = backend_info_cache.get(cache_key) if backend_info_cache is not None else None
+        if backend_info is None:
+            backend_info = await backend.get_info(
+                include_configurable_items=include_configurable_items,
+                user_role=user.role,
+                db=self.db if include_configurable_items else None,
+                user=user if include_configurable_items else None,
+            )
+            if backend_info_cache is not None:
+                backend_info_cache[cache_key] = backend_info
+        data["capabilities"] = backend_info.get("capabilities", [])
+        data["metadata"] = backend_info.get("metadata", {})
+        if include_configurable_items:
+            data["configurable_items"] = backend_info.get("configurable_items", {})
+        return data
+
+
+def merge_agent_config_json(
+    existing: dict | None,
+    patch: dict,
+    *,
+    resource_access: dict[str, Collection[str]],
+    context_schema: type[BaseContext] = BaseContext,
+) -> dict:
+    """合并 Agent 配置补丁，并在资源字段上保留旧的不可见引用。"""
+    if not isinstance(patch, dict):
+        raise ValueError("智能体配置必须是对象")
+
+    current = copy.deepcopy(existing) if isinstance(existing, dict) else {}
+    patch_copy = copy.deepcopy(patch)
+    merged = {**current, **patch_copy}
+    if "context" not in patch:
+        return merged
+
+    patch_context = patch_copy["context"]
+    if not isinstance(patch_context, dict):
+        raise ValueError("智能体 context 配置必须是对象")
+
+    current_context = current.get("context")
+    if not isinstance(current_context, dict):
+        current_context = {}
+    merged_context = {**current_context, **patch_context}
+
+    for field_name in context_schema.get_resource_fields().keys() & patch_context.keys():
+        requested = validate_resource_selection(field_name, patch_context[field_name])
+        if requested == "all" or not requested:
+            merged_context[field_name] = requested
+            continue
+
+        if field_name not in resource_access:
+            raise ValueError(f"智能体资源字段 {field_name} 未经过权限校验")
+        accessible = {str(item) for item in resource_access[field_name]}
+        previous = current_context.get(field_name, [])
+        if previous == "all":
+            previous = []
+        previous = validate_resource_selection(field_name, previous)
+        previous_set = set(previous)
+        unauthorized_new = [item for item in requested if item not in accessible and item not in previous_set]
+        if unauthorized_new:
+            raise ValueError(f"无权新增智能体资源 {field_name}: {', '.join(unauthorized_new)}")
+
+        requested_set = set(requested)
+        kept_existing = [item for item in previous if item not in accessible or item in requested_set]
+        new_visible = [item for item in requested if item in accessible and item not in previous_set]
+        merged_context[field_name] = [*kept_existing, *new_visible]
+
+    merged["context"] = merged_context
+    return merged

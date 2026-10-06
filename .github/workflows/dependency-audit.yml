@@ -1,0 +1,102 @@
+name: Dependency Supply Chain Audit
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/dependency-audit.yml"
+      - "Makefile"
+      - "backend/pyproject.toml"
+      - "backend/package/pyproject.toml"
+      - "backend/uv.lock"
+      - "packages/yuxi-cli/pyproject.toml"
+      - "packages/yuxi-cli/uv.lock"
+      - "web/package.json"
+      - "web/pnpm-lock.yaml"
+      - "web/pnpm-workspace.yaml"
+      - "docs/package.json"
+      - "docs/pnpm-lock.yaml"
+      - "docs/pnpm-workspace.yaml"
+      - "scripts/dependency-audit-fixtures/**"
+  push:
+    tags: ['v[0-9]*']
+    branches: [main]
+    paths:
+      - ".github/workflows/dependency-audit.yml"
+      - "Makefile"
+      - "backend/pyproject.toml"
+      - "backend/package/pyproject.toml"
+      - "backend/uv.lock"
+      - "packages/yuxi-cli/pyproject.toml"
+      - "packages/yuxi-cli/uv.lock"
+      - "web/package.json"
+      - "web/pnpm-lock.yaml"
+      - "web/pnpm-workspace.yaml"
+      - "docs/package.json"
+      - "docs/pnpm-lock.yaml"
+      - "docs/pnpm-workspace.yaml"
+      - "scripts/dependency-audit-fixtures/**"
+  workflow_dispatch:
+
+concurrency:
+  group: dependency-audit-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    name: Python vulnerabilities and licenses
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+        with:
+          version: "0.12.6"
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Audit locked Python vulnerabilities
+        working-directory: backend
+        run: uv audit --locked --no-dev
+      - name: Exercise Python audit negative control
+        run: |
+          if uv audit --script scripts/dependency-audit-fixtures/vulnerable.py >python-audit-negative.log 2>&1; then
+            echo "Expected the vulnerable Python fixture to fail." >&2
+            exit 1
+          fi
+          grep -q "aiohttp 3.14.1 has" python-audit-negative.log
+          grep -q "GHSA-cq5v-8q36-5273" python-audit-negative.log
+      - name: Audit Python transitive licenses
+        working-directory: backend
+        run: uv run --isolated --no-dev --with pip-licenses pip-licenses --from mixed --format markdown
+      - name: Audit yuxi-cli locked vulnerabilities
+        working-directory: packages/yuxi-cli
+        run: uv audit --locked --no-dev
+      - name: Audit yuxi-cli transitive licenses
+        working-directory: packages/yuxi-cli
+        run: uv run --isolated --no-dev --with pip-licenses pip-licenses --from mixed --format markdown
+
+  node:
+    name: Node.js production vulnerabilities
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        project: [web, docs]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 11.24.0
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - name: Audit locked Node.js production dependencies
+        working-directory: ${{ matrix.project }}
+        run: pnpm audit --audit-level=high --prod
+      - name: Exercise Node.js audit negative control
+        run: |
+          bash scripts/dependency-audit-fixtures/run-node-negative-control.sh
