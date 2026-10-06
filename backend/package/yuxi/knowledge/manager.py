@@ -289,6 +289,7 @@ class KnowledgeBaseManager:
             "name": row.name,
             "description": row.description,
             "kb_type": kb_type,
+            "scope": row.scope,
             "embedding_model_spec": row.embedding_model_spec,
             "llm_model_spec": row.llm_model_spec,
             "query_params": dict(row.query_params or {}),

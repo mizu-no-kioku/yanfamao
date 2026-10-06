@@ -54,6 +54,32 @@ async def test_existing_rows_default_to_shared_scope(pg_pool):
 
 @pytest.mark.integration
 @pytest.mark.asyncio
+async def test_read_path_exposes_stored_scope(pg_pool):
+    """读取路径必须带回列里的真实取值：否则 personal 的行会被读成 dataclass 默认的 shared。"""
+    suffix = uuid4().hex
+    kb_id = f"pytest_scope_personal_{suffix}"
+
+    try:
+        async with pg_manager.get_async_session_context() as session:
+            await session.execute(
+                text(
+                    "INSERT INTO knowledge_bases (kb_id, name, kb_type, scope) "
+                    "VALUES (:kb_id, :name, 'milvus', 'personal')"
+                ),
+                {"kb_id": kb_id, "name": "scope 个人库"},
+            )
+
+        detail = await knowledge_base.get_database_info(kb_id)
+
+        assert detail is not None
+        assert detail.scope == "personal"
+    finally:
+        async with pg_manager.get_async_session_context() as session:
+            await session.execute(delete(KnowledgeBase).where(KnowledgeBase.kb_id == kb_id))
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
 async def test_create_database_defaults_to_shared_scope(pg_pool):
     suffix = uuid4().hex
     kb_id = None
