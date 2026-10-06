@@ -33,6 +33,9 @@ class KnowledgeBase(Base):
     name = Column(String(255), nullable=False, index=True)
     description = Column(Text)
     kb_type = Column(String(32), nullable=False, index=True)
+    # personal = 仅创建者（可定向分享给指定用户）；shared = 走 share_config 的 scope。
+    # 默认 shared 让迁移前的行语义不变。
+    scope = Column(String(16), nullable=False, default="shared", server_default="shared")
     embedding_model_spec = Column(String(512))
     llm_model_spec = Column(String(512))
     query_params = Column(JSON_VALUE)

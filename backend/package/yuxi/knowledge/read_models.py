@@ -41,6 +41,8 @@ class KnowledgeBaseSummary:
     share_config: dict[str, Any]
     created_by: str | None
     created_at: datetime | None
+    # personal = 仅创建者；shared = 走 share_config 的 scope。默认 shared 与迁移前的行一致。
+    scope: str = "shared"
     file_count: int = 0
     folder_count: int = 0
     row_count: int = 0
@@ -67,3 +69,4 @@ class KnowledgeBaseDetail(KnowledgeBaseSummary):
     files: dict[str, dict[str, Any]] | None = None
     files_truncated: bool = False
     files_page_size: int | None = None
+    scope: str = "shared"
