@@ -1,8 +1,35 @@
-export const createDefaultShareConfig = () => ({
-  version: 2,
-  read_scope: { access_level: 'global', department_ids: [], user_uids: [] },
-  manage_scope: null
-})
+// 后端 `_normalize_share_config` 在 `share_config` 为 None 时的派生结果（唯一事实来源）：
+// 个人库 → 仅创建者；共享库有部门 → 本部门；共享库无部门 → 仅创建者；永不 global。
+// 这里只用来驱动创建表单「权限」步的**默认显示**，让它与后端派生结果一致、绝不宽于后端；
+// 真正发送与否由调用方决定（未交互时不发送 share_config，派生权威仍在后端）。
+export const createDerivedShareConfig = ({ scope, departmentId, uid } = {}) => {
+  const numericDepartmentId =
+    departmentId === null || departmentId === undefined || departmentId === ''
+      ? null
+      : Number(departmentId)
+  if (scope === 'shared' && Number.isFinite(numericDepartmentId)) {
+    return {
+      version: 2,
+      read_scope: {
+        access_level: 'department',
+        department_ids: [numericDepartmentId],
+        user_uids: []
+      },
+      manage_scope: null
+    }
+  }
+  // 个人库、以及无部门的共享库都退到"仅创建者"。read_scope 必须非空，否则
+  // ShareConfigForm 会回落 global 并在挂载时 emit，把派生权威搬到前端。
+  return {
+    version: 2,
+    read_scope: {
+      access_level: 'user',
+      department_ids: [],
+      user_uids: uid ? [String(uid)] : []
+    },
+    manage_scope: null
+  }
+}
 
 export const createEmptyDatabaseForm = (embeddingModel = '') => ({
   name: '',

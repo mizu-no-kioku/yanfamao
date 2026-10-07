@@ -240,7 +240,7 @@ import { useUserStore } from '@/stores/user'
 import { getKbTypeIcon, getKbTypeLabel } from '@/utils/kb_utils'
 import {
   buildDatabaseRequest,
-  createDefaultShareConfig,
+  createDerivedShareConfig,
   createEmptyDatabaseForm,
   selectDatabaseType,
   validateDatabaseConfig
@@ -264,15 +264,29 @@ const {
 const stepLabels = ['类型', '配置', '权限']
 const currentStep = ref(0)
 const form = reactive(createEmptyDatabaseForm(configStore.config?.embed_model))
-const shareConfig = ref(createDefaultShareConfig())
-// 显式的"未配置"信号：false 时不发送 share_config，让后端按 scope 派生默认读取范围。
-// 否则表单的默认读取范围（global）会走后端的显式分支，让"共享库默认限本部门"永不生效。
-const shareConfigConfigured = ref(false)
-const shareConfigFormRef = ref(null)
 const creating = computed(() => databaseStore.state.creating)
 // 范围默认值按角色取，与后端未显式传 scope 时的默认一致。
 const defaultScope = () => (userStore.isAdmin ? 'shared' : 'personal')
 const scope = ref(defaultScope())
+// 表单未交互时展示的默认读取范围，与后端 `_normalize_share_config` 的 None 分支逐条对齐。
+// 它只决定"显示"：发送与否由 shareConfigConfigured 决定，派生权威始终在后端。
+const currentDerivedShareConfig = () =>
+  createDerivedShareConfig({
+    scope: scope.value,
+    departmentId: userStore.departmentId,
+    uid: userStore.uid
+  })
+const shareConfig = ref(currentDerivedShareConfig())
+// 显式的"未配置"信号：false 时不发送 share_config，让后端按 scope 派生默认读取范围。
+// 否则表单的默认读取范围会走后端的显式分支，让"共享库默认限本部门"永不生效。
+const shareConfigConfigured = ref(false)
+const shareConfigFormRef = ref(null)
+// scope 切换（个人↔共享）后，未交互的默认展示要跟着后端派生规则变；
+// 已交互的配置也随之作废（原来的访问级别可能对新的 scope 不再合法）。
+watch(scope, () => {
+  shareConfig.value = currentDerivedShareConfig()
+  shareConfigConfigured.value = false
+})
 const canChooseScope = computed(() => userStore.isAdmin)
 // 普通用户不渲染共享选项：后端会拒绝普通用户创建的共享库，给出来就是个坏控件。
 const scopeOptions = computed(() =>
@@ -325,9 +339,9 @@ const reset = () => {
   Object.assign(form, createEmptyDatabaseForm(configStore.config?.embed_model))
   const firstType = Object.keys(props.supportedKbTypes)[0] || ''
   Object.assign(form, selectDatabaseType(form, firstType, props.supportedKbTypes[firstType]))
-  shareConfig.value = createDefaultShareConfig()
-  shareConfigConfigured.value = false
   scope.value = defaultScope()
+  shareConfig.value = currentDerivedShareConfig()
+  shareConfigConfigured.value = false
   currentStep.value = 0
 }
 
