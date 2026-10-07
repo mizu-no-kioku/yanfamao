@@ -602,17 +602,21 @@ async def test_update_database_additional_params_merge_keeps_chunk_preset(
 async def test_knowledge_routes_enforce_permissions(test_client, standard_user, scope_denied_knowledge_database):
     """普通用户的拒绝依据分两类：管理端路由按角色，知识库路由按知识库范围。"""
 
-    # 前三条走 get_admin_user（角色闸门）：普通用户被拒与知识库范围无关。
-    forbidden_create = await test_client.post(
+    # 创建路由已换成任意登录用户：普通用户能建个人库，但显式请求共享库必须被角色拒绝。
+    forbidden_shared_create = await test_client.post(
         "/api/knowledge/databases",
         json={
-            "database_name": "unauthorized_db",
+            "database_name": f"pytest_unauthorized_shared_{uuid.uuid4().hex[:8]}",
             "description": "Should not succeed",
             "embedding_model_spec": "siliconflow-cn:Pro/BAAI/bge-m3",
+            "kb_type": "milvus",
+            "scope": "shared",
         },
         headers=standard_user["headers"],
     )
-    _assert_forbidden_response(forbidden_create)
+    _assert_forbidden_response(forbidden_shared_create)
+
+    # 下面两条走 get_admin_user（角色闸门）：普通用户被拒与知识库范围无关。
 
     forbidden_list = await test_client.get("/api/knowledge/databases", headers=standard_user["headers"])
     _assert_forbidden_response(forbidden_list)
@@ -989,17 +993,24 @@ async def test_get_accessible_databases(test_client, admin_headers, knowledge_da
     assert knowledge_database["kb_id"] in kb_ids
 
 
-async def test_create_database_defaults_to_global_share_config(test_client, admin_headers):
-    database = await _create_test_database(test_client, admin_headers)
-    kb_id = database["kb_id"]
-    try:
-        assert database["share_config"] == {
+async def test_legacy_global_knowledge_base_stays_visible_to_plain_user(
+    test_client, admin_headers, standard_user
+):
+    """Review Focus 5：已存在的 global 共享库对普通用户立即可见，这是本轮有意接受的取舍。"""
+    database = await _create_test_database(
+        test_client,
+        admin_headers,
+        {
             "version": 2,
             "read_scope": {"access_level": "global", "department_ids": [], "user_uids": []},
             "manage_scope": None,
-        }
+        },
+    )
+    try:
+        assert database["share_config"]["read_scope"]["access_level"] == "global"
+        assert database["kb_id"] in await _accessible_kb_ids(test_client, standard_user["headers"])
     finally:
-        await test_client.delete(f"/api/knowledge/databases/{kb_id}", headers=admin_headers)
+        await test_client.delete(f"/api/knowledge/databases/{database['kb_id']}", headers=admin_headers)
 
 
 @pytest.mark.parametrize(
@@ -1234,3 +1245,144 @@ async def test_document_search_is_gated_by_knowledge_base_scope(
         headers=standard_user["headers"],
     )
     _assert_forbidden_response(response)
+
+
+# =============================================================================
+# === 个人知识库的范围收敛 ===
+# =============================================================================
+
+# milvus 类型要求嵌入模型，缺少它建库会 400；这里只验证范围收敛，故取集成测试通用的 spec。
+_CREATE_EMBEDDING_SPEC = "siliconflow-cn:Pro/BAAI/bge-m3"
+
+
+async def _create_other_plain_user(test_client, admin_headers):
+    """另建一个非超管、非创建者的普通用户，用于验证拒绝方向。"""
+    departments = (await test_client.get("/api/departments", headers=admin_headers)).json()
+    assert departments, "没有可用于绑定普通用户的部门"
+    return await _create_test_user(test_client, admin_headers, departments[0]["id"])
+
+
+async def test_plain_user_can_create_personal_knowledge_base(test_client, standard_user):
+    response = await test_client.post(
+        "/api/knowledge/databases",
+        json={
+            "database_name": f"pytest_personal_{uuid.uuid4().hex[:8]}",
+            "description": "普通用户创建的个人知识库",
+            "embedding_model_spec": _CREATE_EMBEDDING_SPEC,
+            "kb_type": "milvus",
+        },
+        headers=standard_user["headers"],
+    )
+
+    assert response.status_code == 200, response.text
+    kb_id = response.json()["kb_id"]
+    try:
+        detail = await test_client.get(f"/api/knowledge/databases/{kb_id}", headers=standard_user["headers"])
+        assert detail.status_code == 200, detail.text
+        body = detail.json()
+        assert body["scope"] == "personal"
+        assert body["can_manage"] is True
+
+        # 列表路径（get_databases_by_user → resolve_knowledge_base_permission）也要带上它，
+        # 否则建完在列表里看不到，等于建了个看不见的库。
+        listing = await test_client.get("/api/knowledge/databases/accessible", headers=standard_user["headers"])
+        assert listing.status_code == 200, listing.text
+        items = {item["kb_id"]: item for item in listing.json()["databases"]}
+        assert kb_id in items
+        assert items[kb_id]["can_manage"] is True
+    finally:
+        await test_client.delete(f"/api/knowledge/databases/{kb_id}", headers=standard_user["headers"])
+
+
+async def test_plain_user_cannot_create_shared_knowledge_base(test_client, standard_user):
+    response = await test_client.post(
+        "/api/knowledge/databases",
+        json={
+            "database_name": f"pytest_shared_denied_{uuid.uuid4().hex[:8]}",
+            "description": "普通用户不得创建共享库",
+            "embedding_model_spec": _CREATE_EMBEDDING_SPEC,
+            "kb_type": "milvus",
+            "scope": "shared",
+        },
+        headers=standard_user["headers"],
+    )
+
+    assert response.status_code in (400, 403), response.text
+
+
+async def test_admin_created_shared_knowledge_base_defaults_to_own_department(test_client, admin_headers):
+    response = await test_client.post(
+        "/api/knowledge/databases",
+        json={
+            "database_name": f"pytest_dept_{uuid.uuid4().hex[:8]}",
+            "description": "共享库默认限本部门",
+            "embedding_model_spec": _CREATE_EMBEDDING_SPEC,
+            "kb_type": "milvus",
+        },
+        headers=admin_headers,
+    )
+
+    assert response.status_code == 200, response.text
+    kb_id = response.json()["kb_id"]
+    try:
+        detail = await test_client.get(f"/api/knowledge/databases/{kb_id}", headers=admin_headers)
+        assert detail.status_code == 200, detail.text
+        body = detail.json()
+        assert body["scope"] == "shared"
+        read_scope = body["share_config"]["read_scope"]
+        assert read_scope["access_level"] == "department"
+        assert read_scope["department_ids"]
+    finally:
+        await test_client.delete(f"/api/knowledge/databases/{kb_id}", headers=admin_headers)
+
+
+async def test_personal_knowledge_base_owner_can_use_graph_endpoints(test_client, admin_headers, standard_user):
+    """个人库创建者要能用图谱能力（抽取配置与查询），非创建者不能。"""
+    kb_id = None
+    # 超管对任何知识库都是 MANAGE（资源权限解析的既有事实），因此拒绝方向只能由
+    # 另一个非超管、非创建者的普通用户来证明，用 admin_headers 断言 403 会假绿。
+    intruder = None
+    try:
+        create = await test_client.post(
+            "/api/knowledge/databases",
+            json={
+                "database_name": f"pytest_personal_graph_{uuid.uuid4().hex[:8]}",
+                "description": "个人库的图谱能力",
+                "embedding_model_spec": _CREATE_EMBEDDING_SPEC,
+                "kb_type": "milvus",
+            },
+            headers=standard_user["headers"],
+        )
+        assert create.status_code == 200, create.text
+        kb_id = create.json()["kb_id"]
+        intruder = await _create_other_plain_user(test_client, admin_headers)
+
+        # 抽取配置：创建者通过（404 也可以接受，只要不是 403）
+        config = await test_client.post(
+            f"/api/knowledge/databases/{kb_id}/graph-build/config",
+            json={"extractor_type": "llm", "extractor_options": {}},
+            headers=standard_user["headers"],
+        )
+        assert config.status_code != 403, config.text
+
+        # 图谱查询：创建者通过
+        subgraph = await test_client.post(
+            "/api/graph/subgraph", json={"kb_id": kb_id}, headers=standard_user["headers"]
+        )
+        assert subgraph.status_code == 200, subgraph.text
+
+        # 另一个普通用户对这个库没有管理权（它不是共享库、也没被分享给他）
+        denied = await test_client.post(
+            f"/api/knowledge/databases/{kb_id}/graph-build/index",
+            headers=intruder["headers"],
+        )
+        assert denied.status_code == 403, denied.text
+
+        # 读路径同样按范围拒绝非创建者
+        denied_read = await test_client.get(f"/api/knowledge/databases/{kb_id}", headers=intruder["headers"])
+        _assert_forbidden_response(denied_read)
+    finally:
+        if kb_id:
+            await test_client.delete(f"/api/knowledge/databases/{kb_id}", headers=standard_user["headers"])
+        if intruder:
+            await _delete_user_by_id(test_client, admin_headers, intruder["user"]["id"])

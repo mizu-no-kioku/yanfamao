@@ -44,6 +44,7 @@ def serialize_knowledge_base(
         "name": database.name,
         "description": database.description,
         "kb_type": database.kb_type,
+        "scope": database.scope,
         "embedding_model_spec": database.embedding_model_spec,
         "llm_model_spec": database.llm_model_spec,
         "query_params": dict(database.query_params),

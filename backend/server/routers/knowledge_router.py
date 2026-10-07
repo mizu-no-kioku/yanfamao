@@ -245,11 +245,23 @@ async def create_database(
     additional_params: dict | None = Body(None),
     llm_model_spec: str | None = Body(None),
     share_config: dict | None = Body(None),
-    current_user: User = Depends(get_admin_user),
+    scope: str | None = Body(None),
+    current_user: User = Depends(get_required_user),
 ):
-    """创建知识库"""
+    """创建知识库。
+
+    普通角色只能创建个人知识库；显式请求共享库必须被拒，不能静默降级。
+    未显式指定范围时按角色取默认：普通用户得到个人库，管理员仍得到共享库。
+    """
+    if scope is None:
+        scope = "shared" if current_user.role in {"admin", "superadmin"} else "personal"
+    if scope not in {"personal", "shared"}:
+        raise HTTPException(status_code=400, detail="知识库范围只能是 personal 或 shared")
+    if scope == "shared" and current_user.role not in {"admin", "superadmin"}:
+        raise HTTPException(status_code=403, detail="共享知识库仅管理员可创建")
+
     logger.debug(
-        f"Create database {database_name} with kb_type {kb_type}, "
+        f"Create database {database_name} with kb_type {kb_type}, scope {scope}, "
         f"additional_params {additional_params}, llm_model_spec {llm_model_spec}, "
         f"embedding_model_spec {embedding_model_spec}, share_config {share_config}"
     )
@@ -261,6 +273,7 @@ async def create_database(
             embedding_model_spec=embedding_model_spec,
             llm_model_spec=llm_model_spec,
             share_config=share_config,
+            scope=scope,
             created_by=current_user.uid,
             created_by_department_id=current_user.department_id,
             **(additional_params or {}),
@@ -291,6 +304,8 @@ async def get_accessible_databases(current_user: User = Depends(get_required_use
                 "description": db.description or "",
                 "created_by": db.created_by,
                 "kb_type": db.kb_type,
+                "scope": db.scope,
+                "can_manage": db.effective_permission == ResourcePermission.MANAGE,
                 "supports_documents": knowledge_base.database_type_supports_documents(db.kb_type),
             }
             for db in databases

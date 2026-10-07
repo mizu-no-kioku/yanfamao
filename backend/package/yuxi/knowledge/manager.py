@@ -194,13 +194,31 @@ class KnowledgeBaseManager:
         *,
         user_uid: str | None = None,
         department_id: int | str | None = None,
+        scope: str = "shared",
     ) -> dict:
+        """归一化共享配置；未显式给出时按知识库范围生成默认读取范围。
+
+        个人库只对创建者开放；共享库默认只对创建者所在部门开放；创建者没有部门时
+        fail-closed 退到“仅创建者”，绝不写 global——那会让人人可见一个本该私有的库。
+        没有创建者 uid 时（种子脚本、内部调用）无法构造“仅创建者”，退到空读取范围
+        （只留超管），同样不写 global——空的 user 级范围不是合法的 v2 配置。
+        """
+
         if share_config is None:
-            return {
-                "version": 2,
-                "read_scope": {"access_level": "global", "department_ids": [], "user_uids": []},
-                "manage_scope": None,
-            }
+            creator_only_scope = (
+                {"access_level": "user", "department_ids": [], "user_uids": [str(user_uid)]} if user_uid else None
+            )
+            if scope == "personal":
+                read_scope = creator_only_scope
+            elif department_id is not None:
+                read_scope = {
+                    "access_level": "department",
+                    "department_ids": [int(department_id)],
+                    "user_uids": [],
+                }
+            else:
+                read_scope = creator_only_scope
+            return {"version": 2, "read_scope": read_scope, "manage_scope": None}
 
         if share_config and share_config.get("version") == 2:
             normalized = normalize_permission_config(
@@ -284,6 +302,16 @@ class KnowledgeBaseManager:
         persisted_stats = additional_params.pop("stats", None)
         normalized_stats = self._normalize_database_stats(stats if stats is not None else persisted_stats)
 
+        # share_config 列为 NULL 的存量行今天的语义就是全局可见；创建期的按范围默认值只服务新库，
+        # 不能借归一化把历史行的可见性悄悄收紧。
+        share_config = row.share_config
+        if share_config is None:
+            share_config = {
+                "version": 2,
+                "read_scope": {"access_level": "global", "department_ids": [], "user_uids": []},
+                "manage_scope": None,
+            }
+
         return {
             "kb_id": row.kb_id,
             "name": row.name,
@@ -294,7 +322,7 @@ class KnowledgeBaseManager:
             "llm_model_spec": row.llm_model_spec,
             "query_params": dict(row.query_params or {}),
             "additional_params": additional_params,
-            "share_config": self._normalize_share_config(row.share_config),
+            "share_config": self._normalize_share_config(share_config),
             "created_by": row.created_by,
             "created_at": row.created_at,
             **normalized_stats,
@@ -463,6 +491,7 @@ class KnowledgeBaseManager:
         embedding_model_spec: str | None = None,
         llm_model_spec: str | None = None,
         share_config: dict | None = None,
+        scope: str = "shared",
         created_by: str | None = None,
         created_by_department_id: int | str | None = None,
         **kwargs,
@@ -477,6 +506,7 @@ class KnowledgeBaseManager:
             embedding_model_spec: 嵌入模型 spec
             llm_model_spec: LLM 模型 spec
             share_config: 共享配置
+            scope: 知识库范围，personal 或 shared
             created_by: 创建者 uid
             created_by_department_id: 创建者部门 ID
             **kwargs: 其他配置参数
@@ -495,6 +525,7 @@ class KnowledgeBaseManager:
             share_config,
             user_uid=created_by,
             department_id=created_by_department_id,
+            scope=scope,
         )
 
         kb_instance = await self._get_or_create_kb_instance(kb_type)
@@ -538,6 +569,7 @@ class KnowledgeBaseManager:
                 "query_params": query_params,
                 "additional_params": persisted_additional_params,
                 "share_config": share_config,
+                "scope": scope,
                 "created_by": created_by,
             }
         )

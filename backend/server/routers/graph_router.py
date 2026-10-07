@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from server.utils.auth_middleware import get_admin_user
+from server.utils.auth_middleware import get_admin_user, get_required_user
 from server.utils.knowledge_permissions import (
     ensure_knowledge_base_permission,
     require_knowledge_base_read,
@@ -98,12 +98,13 @@ class GraphSubgraphQuery(BaseModel):
 @graph.post("/subgraph")
 async def post_subgraph(
     query: GraphSubgraphQuery,
-    current_user: User = Depends(get_admin_user),
+    current_user: User = Depends(get_required_user),
 ):
     """按起点（可选终点）与四类筛选查询 Milvus 知识库图谱子图"""
     # kb_id 只来自请求体，因此不能依赖 require_knowledge_base_read：它自身声明了 kb_id 参数，
     # 对请求体形态的路由会被 FastAPI 解析成必填 query 参数，导致只发请求体的调用方拿到 422，
     # 且授权校验读到的 kb_id 与实际执行的 kb_id 不是同一个。这里显式用请求体的 kb_id 校验。
+    # 底座是任意登录用户：个人库创建者要能查自己库的图谱，权限仍由下面这一行按范围判定。
     await ensure_knowledge_base_permission(query.kb_id, current_user, ResourcePermission.READ)
     invalid_names = sorted(
         {
