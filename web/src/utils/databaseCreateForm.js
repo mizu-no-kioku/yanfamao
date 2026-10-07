@@ -69,8 +69,13 @@ export const buildDatabaseRequest = (
     description: form.description?.trim() || '',
     kb_type: form.kb_type,
     additional_params: additionalParams,
-    share_config: shareConfig,
     scope
+  }
+  // shareConfig 为 null/undefined 表示用户没有显式配置共享：不发送该字段，
+  // 让后端 `_normalize_share_config` 按 scope 派生默认读取范围
+  // （个人库→仅创建者；共享库→创建者所在部门；无部门→仅创建者，绝不 global）。
+  if (shareConfig) {
+    request.share_config = shareConfig
   }
   if (typeInfo?.requires_embedding_model) {
     request.embedding_model_spec = form.embedding_model_spec || defaultEmbeddingModel

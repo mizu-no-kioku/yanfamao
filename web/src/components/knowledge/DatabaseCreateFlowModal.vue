@@ -202,10 +202,11 @@
           </div>
           <ShareConfigForm
             ref="shareConfigFormRef"
-            v-model="shareConfig"
+            :model-value="shareConfig"
             :auto-select-user-dept="true"
             :require-read-scope="true"
             :allowed-access-levels="shareAllowedAccessLevels"
+            @update:model-value="onShareConfigUpdate"
           />
         </section>
       </main>
@@ -264,6 +265,9 @@ const stepLabels = ['类型', '配置', '权限']
 const currentStep = ref(0)
 const form = reactive(createEmptyDatabaseForm(configStore.config?.embed_model))
 const shareConfig = ref(createDefaultShareConfig())
+// 显式的"未配置"信号：false 时不发送 share_config，让后端按 scope 派生默认读取范围。
+// 否则表单的默认读取范围（global）会走后端的显式分支，让"共享库默认限本部门"永不生效。
+const shareConfigConfigured = ref(false)
 const shareConfigFormRef = ref(null)
 const creating = computed(() => databaseStore.state.creating)
 // 范围默认值按角色取，与后端未显式传 scope 时的默认一致。
@@ -322,8 +326,14 @@ const reset = () => {
   const firstType = Object.keys(props.supportedKbTypes)[0] || ''
   Object.assign(form, selectDatabaseType(form, firstType, props.supportedKbTypes[firstType]))
   shareConfig.value = createDefaultShareConfig()
+  shareConfigConfigured.value = false
   scope.value = defaultScope()
   currentStep.value = 0
+}
+
+const onShareConfigUpdate = (value) => {
+  shareConfig.value = value
+  shareConfigConfigured.value = true
 }
 
 const selectType = (type) =>
@@ -371,7 +381,7 @@ const handleCreate = async () => {
   const request = buildDatabaseRequest(
     form,
     selectedTypeInfo.value,
-    shareConfig.value,
+    shareConfigConfigured.value ? shareConfig.value : null,
     configStore.config?.embed_model,
     scope.value
   )

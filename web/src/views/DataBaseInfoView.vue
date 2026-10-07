@@ -428,6 +428,7 @@ import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useDatabaseStore } from '@/stores/database'
 import { useTaskerStore } from '@/stores/tasker'
+import { useUserStore } from '@/stores/user'
 import {
   BarChart3,
   ChevronDown,
@@ -476,6 +477,7 @@ const route = useRoute()
 const router = useRouter()
 const store = useDatabaseStore()
 const taskerStore = useTaskerStore()
+const userStore = useUserStore()
 const {
   chunkPresetSelectOptions: chunkPresetOptions,
   chunkPresetLoading,
@@ -498,12 +500,17 @@ const isConnector = computed(
 )
 const tabs = computed(() => {
   if (isMilvus.value) {
-    return [
+    const items = [
       { key: 'filetable', label: '文件管理', icon: FileText },
       { key: 'query', label: '检索测试', icon: Search, forceRender: true },
-      { key: 'graph', label: '知识图谱', icon: Network },
-      { key: 'evaluation', label: '评估', icon: BarChart3 }
+      { key: 'graph', label: '知识图谱', icon: Network }
     ]
+    // 评估数据集是管理级资源（evaluationApi 保持 apiAdmin*），普通用户即使能管理自己的
+    // 个人库也不该看到这个页签——否则只会渲染出一个前端伪造的"需要管理员权限"。
+    if (userStore.isAdmin) {
+      items.push({ key: 'evaluation', label: '评估', icon: BarChart3 })
+    }
+    return items
   }
 
   return [{ key: 'query', label: '检索测试', icon: Search, forceRender: true }]

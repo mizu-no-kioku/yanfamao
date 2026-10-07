@@ -85,6 +85,35 @@ test('请求体带上知识库范围，且普通用户的共享范围被收敛�
   assert.equal(shared.scope, 'shared')
 })
 
+test('未显式配置共享时不发送 share_config，显式配置时按用户选择发送', () => {
+  const form = {
+    ...createEmptyDatabaseForm('embed/model'),
+    name: '共享库',
+    kb_type: 'milvus'
+  }
+  const typeInfo = { requires_embedding_model: true, create_params: { options: [] } }
+
+  // 未配置共享：不发送 share_config，交由后端按 scope 派生默认读取范围
+  // （共享库→创建者所在部门；个人库→仅创建者），否则后端的部门默认永远不生效。
+  const unconfigured = buildDatabaseRequest(form, typeInfo, null, 'fallback/model', 'shared')
+  assert.equal('share_config' in unconfigured, false)
+
+  // 用户显式配置：仍然按用户选择发送。
+  const configured = buildDatabaseRequest(
+    form,
+    typeInfo,
+    {
+      version: 2,
+      read_scope: { access_level: 'department', department_ids: [7], user_uids: [] },
+      manage_scope: null
+    },
+    'fallback/model',
+    'shared'
+  )
+  assert.equal(configured.share_config.read_scope.access_level, 'department')
+  assert.deepEqual(configured.share_config.read_scope.department_ids, [7])
+})
+
 test('知识库类型标签映射将 milvus 解析为研发猫', () => {
   assert.equal(getKbTypeLabel('milvus'), '研发猫')
   assert.equal(getKbTypeLabel('Milvus'), '研发猫')
