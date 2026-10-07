@@ -939,11 +939,11 @@ const fileList = computed(() => {
 const canEditShareConfig = computed(() => canManageDatabase.value)
 
 // 个人库只提供「指定人」；共享库保持三档。
-// 这两个数组必须是**模块级常量**：自动刷新会不断重新赋值 store.database（`stores/database.js`
-// 的 enableAutoRefresh），computed 因此一次次失效重算；只有每次返回**同一引用**，子组件
-// ShareConfigForm 的 `watch(allowedAccessLevels)` 才不会按引用触发、重新从 `modelValue` 派生
-// scopes 并丢弃尚未保存的本地选择。只在数组字面量写在 computed 里不够——那样 scope 未变时
-// 也会产出新数组。
+// 这两个数组是 setup 作用域常量（每个组件实例创建一次，不是跨实例共享的单例）。数组字面量
+// 不能写在 computed 里：自动刷新会不断重新赋值 store.database（`stores/database.js` 的
+// enableAutoRefresh），computed 因此一次次失效重算；只有复用同一实例内的同一引用，子组件
+// ShareConfigForm 的 `watch(allowedAccessLevels)` 才不会按引用触发、重新从 `modelValue`
+// 派生 scopes 并丢弃尚未保存的本地选择。
 const SHARE_ACCESS_LEVELS_PERSONAL = ['user']
 const SHARE_ACCESS_LEVELS_SHARED = ['global', 'department', 'user']
 

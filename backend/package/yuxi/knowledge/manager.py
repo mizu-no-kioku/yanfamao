@@ -25,7 +25,12 @@ from yuxi.knowledge.read_models import (
 )
 from yuxi.knowledge.schemas import FindOutputSchema, OpenOutputSchema
 from yuxi.knowledge.utils.security import redact_sensitive_params
-from yuxi.permissions import ResourcePermission, normalize_permission_config, resolve_knowledge_base_permission
+from yuxi.permissions import (
+    ResourcePermission,
+    ResourcePermissionDenied,
+    normalize_permission_config,
+    resolve_knowledge_base_permission,
+)
 from yuxi.storage.postgres.models_business import User
 from yuxi.utils import logger
 from yuxi.utils.datetime_utils import utc_isoformat
@@ -235,6 +240,42 @@ class KnowledgeBaseManager:
             return normalized
 
         raise ValueError("知识库共享配置必须使用 version 2")
+
+    async def _ensure_share_scope_within_operator_department(
+        self,
+        share_config: dict,
+        *,
+        operator_role: str | None,
+        operator_department_id: int | str | None,
+    ) -> None:
+        """普通用户只能把知识库定向分享给本部门的用户。
+
+        只约束 role == "user"：管理员与超管不受影响。校验的是**归一化之后**的 user_uids
+        （`_normalize_share_config` 会把操作者自己并进该列表，那一定是他本部门的人）。
+        未知 uid（批量查不到用户）一律拒绝，否则能把库"分享"给不存在的账号。存量数据不回溯，
+        这里只管写入路径。
+        """
+        from yuxi.repositories.user_repository import UserRepository
+
+        if operator_role != "user":
+            return
+
+        uids = {
+            str(uid)
+            for key in ("read_scope", "manage_scope")
+            for uid in (share_config.get(key) or {}).get("user_uids") or []
+        }
+        if not uids:
+            return
+
+        users = await UserRepository().list_by_uids(sorted(uids))
+        try:
+            department_id = int(operator_department_id)
+        except (TypeError, ValueError):
+            raise ResourcePermissionDenied("只能分享给本部门的用户") from None
+
+        if len(users) != len(uids) or any(user.department_id != department_id for user in users):
+            raise ResourcePermissionDenied("只能分享给本部门的用户")
 
     @staticmethod
     def _normalize_database_stats(stats: dict | None) -> dict[str, int]:
@@ -494,6 +535,7 @@ class KnowledgeBaseManager:
         scope: str = "shared",
         created_by: str | None = None,
         created_by_department_id: int | str | None = None,
+        created_by_role: str | None = None,
         **kwargs,
     ) -> KnowledgeBaseDetail:
         """
@@ -509,6 +551,7 @@ class KnowledgeBaseManager:
             scope: 知识库范围，personal 或 shared
             created_by: 创建者 uid
             created_by_department_id: 创建者部门 ID
+            created_by_role: 创建者角色，用于约束普通用户的定向分享范围
             **kwargs: 其他配置参数
 
         Returns:
@@ -526,6 +569,11 @@ class KnowledgeBaseManager:
             user_uid=created_by,
             department_id=created_by_department_id,
             scope=scope,
+        )
+        await self._ensure_share_scope_within_operator_department(
+            share_config,
+            operator_role=created_by_role,
+            operator_department_id=created_by_department_id,
         )
 
         kb_instance = await self._get_or_create_kb_instance(kb_type)
@@ -1146,6 +1194,7 @@ class KnowledgeBaseManager:
         share_config: dict | None = None,
         operator_uid: str | None = None,
         operator_department_id: int | str | None = None,
+        operator_role: str | None = None,
     ) -> KnowledgeBaseDetail:
         """更新数据库"""
         from yuxi.repositories.knowledge_base_repository import KnowledgeBaseRepository
@@ -1183,6 +1232,11 @@ class KnowledgeBaseManager:
                 share_config,
                 user_uid=operator_uid,
                 department_id=operator_department_id,
+            )
+            await self._ensure_share_scope_within_operator_department(
+                update_data["share_config"],
+                operator_role=operator_role,
+                operator_department_id=operator_department_id,
             )
 
         # 保存到数据库

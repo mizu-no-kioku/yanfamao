@@ -34,6 +34,7 @@ from yuxi.knowledge.utils.sample_question_utils import (
 from yuxi.knowledge.utils.url_fetcher import fetch_url_content
 from yuxi.permissions import (
     ResourcePermission,
+    ResourcePermissionDenied,
     resolve_knowledge_base_permission,
 )
 from yuxi.services.knowledge_folder_service import knowledge_folder_service
@@ -286,6 +287,7 @@ async def create_database(
             scope=scope,
             created_by=current_user.uid,
             created_by_department_id=current_user.department_id,
+            created_by_role=current_user.role,
             **(additional_params or {}),
         )
 
@@ -294,6 +296,8 @@ async def create_database(
         return response
     except KBNameConflictError as e:
         raise HTTPException(status_code=409, detail=str(e)) from e
+    except ResourcePermissionDenied as e:
+        raise HTTPException(status_code=403, detail=str(e)) from e
     except HTTPException:
         raise
     except Exception as e:
@@ -452,8 +456,11 @@ async def update_database_info(
             share_config=data.share_config,
             operator_uid=current_user.uid,
             operator_department_id=current_user.department_id,
+            operator_role=current_user.role,
         )
         return {"message": "更新成功", "database": serialize_knowledge_base(database)}
+    except ResourcePermissionDenied as e:
+        raise HTTPException(status_code=403, detail=str(e)) from e
     except HTTPException:
         raise
     except Exception as e:

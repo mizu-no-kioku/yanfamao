@@ -333,6 +333,9 @@ const setAccessLevel = (scopeKey, accessLevel) => {
     !normalizedAllowedAccessLevels.value.includes(accessLevel)
   )
     return
+  // 切到「部门共享」时补一次：加载失败后，这是同一次弹窗会话里唯一可达的重试时机
+  //（详情页传的是实例内稳定的数组，重渲染不会再触发 allowedAccessLevels 的 watcher）。
+  if (accessLevel === 'department') ensureDepartmentsLoaded()
   scopes[scopeKey].access_level = accessLevel
   scopes[scopeKey] = normalizeScope(scopes[scopeKey], {
     includeCurrent: scopeKey === 'read_scope' && props.autoSelectUserDept

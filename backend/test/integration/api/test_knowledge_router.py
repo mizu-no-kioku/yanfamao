@@ -1323,6 +1323,131 @@ async def test_plain_user_cannot_create_shared_knowledge_base(test_client, stand
     assert response.status_code in (400, 403), response.text
 
 
+def _user_share_config(uids: list[str]) -> dict:
+    """构造只定向分享给给定 uid 的 v2 读取范围。"""
+
+    return {
+        "version": 2,
+        "read_scope": {"access_level": "user", "department_ids": [], "user_uids": uids},
+        "manage_scope": None,
+    }
+
+
+async def _create_department_admin_headers(test_client, admin_headers, department_id: int) -> dict:
+    """创建一个非超管管理员并返回其登录 headers。"""
+
+    suffix = uuid.uuid4().hex[:8]
+    password = f"Pw!{suffix}"
+    response = await test_client.post(
+        "/api/auth/users",
+        json={
+            "username": f"pytest_deptadmin_{suffix}",
+            "password": password,
+            "role": "admin",
+            "department_id": department_id,
+        },
+        headers=admin_headers,
+    )
+    assert response.status_code == 200, response.text
+    user = response.json()
+
+    login_response = await test_client.post(
+        "/api/auth/token", data={"username": user["uid"], "password": password}
+    )
+    assert login_response.status_code == 200, login_response.text
+    return {"user": user, "headers": {"Authorization": f"Bearer {login_response.json()['access_token']}"}}
+
+
+async def test_plain_user_share_scope_is_limited_to_own_department(
+    test_client, admin_headers, standard_user
+):
+    """普通用户的定向分享只能落在本部门；管理员与超管不受限。
+
+    单元层用假用户目录验证了判定逻辑，这里证明它确实接在真实写入路径上、并映射成真实 403。
+    """
+
+    other_department = await _create_test_department(test_client, admin_headers, "pytest_share_scope")
+    created_user_ids: list[int] = []
+    database_ids: list[str] = []
+    try:
+        same_department_peer = await _create_test_user(
+            test_client, admin_headers, standard_user["user"]["department_id"]
+        )
+        other_department_user = await _create_test_user(test_client, admin_headers, other_department["id"])
+        department_admin = await _create_department_admin_headers(
+            test_client, admin_headers, standard_user["user"]["department_id"]
+        )
+        created_user_ids.extend(
+            [
+                same_department_peer["user"]["id"],
+                other_department_user["user"]["id"],
+                department_admin["user"]["id"],
+            ]
+        )
+
+        # 本部门同事 → 放行
+        created = await test_client.post(
+            "/api/knowledge/databases",
+            json={
+                "database_name": f"pytest_share_scope_{uuid.uuid4().hex[:8]}",
+                "description": "普通用户定向分享边界",
+                "embedding_model_spec": _CREATE_EMBEDDING_SPEC,
+                "kb_type": "milvus",
+                "share_config": _user_share_config([same_department_peer["user"]["uid"]]),
+            },
+            headers=standard_user["headers"],
+        )
+        assert created.status_code == 200, created.text
+        kb_id = created.json()["kb_id"]
+        database_ids.append(kb_id)
+
+        # 他部门用户 → 403
+        cross_department = await test_client.put(
+            f"/api/knowledge/databases/{kb_id}",
+            json={
+                "name": "pytest_share_scope_cross",
+                "description": "越部门分享应被拒",
+                "share_config": _user_share_config([other_department_user["user"]["uid"]]),
+            },
+            headers=standard_user["headers"],
+        )
+        _assert_forbidden_response(cross_department)
+
+        # 未知 uid → 403
+        unknown_uid = await test_client.put(
+            f"/api/knowledge/databases/{kb_id}",
+            json={
+                "name": "pytest_share_scope_unknown",
+                "description": "未知用户应被拒",
+                "share_config": _user_share_config(["pytest_missing_uid"]),
+            },
+            headers=standard_user["headers"],
+        )
+        _assert_forbidden_response(unknown_uid)
+
+        # 非超管管理员把他部门用户写进共享库 → 放行：这条约束只针对普通用户
+        admin_created = await test_client.post(
+            "/api/knowledge/databases",
+            json={
+                "database_name": f"pytest_share_scope_admin_{uuid.uuid4().hex[:8]}",
+                "description": "管理员不受定向分享部门限制",
+                "embedding_model_spec": _CREATE_EMBEDDING_SPEC,
+                "kb_type": "milvus",
+                "scope": "shared",
+                "share_config": _user_share_config([other_department_user["user"]["uid"]]),
+            },
+            headers=department_admin["headers"],
+        )
+        assert admin_created.status_code == 200, admin_created.text
+        database_ids.append(admin_created.json()["kb_id"])
+    finally:
+        for kb_id in database_ids:
+            await test_client.delete(f"/api/knowledge/databases/{kb_id}", headers=admin_headers)
+        for user_id in created_user_ids:
+            await _delete_user_by_id(test_client, admin_headers, user_id)
+        await _delete_department_with_admin(test_client, admin_headers, other_department)
+
+
 async def test_admin_created_shared_knowledge_base_defaults_to_own_department(test_client, admin_headers):
     response = await test_client.post(
         "/api/knowledge/databases",

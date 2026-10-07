@@ -121,7 +121,7 @@ test('详情页与 API 传输层：分享选择器不再要求管理员', () => 
     /async function getUserAccessOptions\(\) \{\s*return apiAdminGet/
   )
 
-  // 个人库只提供「指定人」，共享库三档。两个数组必须是**模块级常量**，computed 只负责选择：
+  // 个人库只提供「指定人」，共享库三档。两个数组是 setup 作用域常量，computed 只负责选择：
   // 自动刷新会不断重新赋值 store.database，若数组字面量写在 computed 里，每次重算都会产出新
   // 数组、prop 身份抖动，进而让 ShareConfigForm 重新派生 scopes 并丢弃未保存的本地选择。
   assert.match(detailSource, /const SHARE_ACCESS_LEVELS_PERSONAL = \['user'\]/)
@@ -251,7 +251,7 @@ test('挂载后放宽为共享库时补拉部门列表，而不是永久空选�
   }
 })
 
-test('部门列表加载失败后会重试，而不是永久停在「暂无可选项」', async () => {
+test('部门列表加载失败后，切到「部门共享」会重试', async () => {
   globalThis.window = {
     getComputedStyle: () => ({
       lineHeight: '20',
@@ -266,26 +266,29 @@ test('部门列表加载失败后会重试，而不是永久停在「暂无可�
   globalThis.__departmentLoadFailures = 1
 
   const server = await createServer(serverOptions())
-  const allowed = ref(['global', 'department', 'user'])
   let app
   try {
     const { default: ShareConfigForm } = await server.ssrLoadModule(
       'virtual:knowledge-share-picker-test'
     )
 
+    // 共享库 + 无部门 → 初始为「指定人」，三档都可选。
     const mounted = await mountWrapper(
       ShareConfigForm,
-      createDerivedShareConfig({ scope: 'shared', departmentId: 3, uid: 'creator-uid' }),
-      allowed
+      createDerivedShareConfig({ scope: 'shared', departmentId: null, uid: 'creator-uid' }),
+      ref(['global', 'department', 'user'])
     )
     app = mounted.app
     await flush()
     assert.equal(globalThis.__departmentLoadCalls, 1, '首次加载应已发起')
 
-    // 首次失败后，下一次「需要部门」的时机必须重试，否则选择器永久为空、validate() 挡住保存。
-    allowed.value = ['global', 'department', 'user']
+    // 生产里可达的重试时机：用户切到「部门共享」。首次失败后否则选择器永久为空、validate() 挡住保存。
+    const departmentCard = shareCards(mounted.host).find((card) =>
+      /部门共享/.test(textContent(card))
+    )
+    departmentCard.props.onClick()
     await flush()
-    assert.equal(globalThis.__departmentLoadCalls, 2, '首次失败后应允许重试')
+    assert.equal(globalThis.__departmentLoadCalls, 2, '切到部门共享时应重试')
     app.unmount()
     app = undefined
   } finally {
