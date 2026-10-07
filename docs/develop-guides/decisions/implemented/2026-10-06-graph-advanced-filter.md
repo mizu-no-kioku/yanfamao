@@ -102,11 +102,11 @@ Milvus 知识库的图谱查询只有一个关键词入口：关键词子串匹�
 | 中间实体与实体属性只约束中间实体，起点与终点豁免 | 起点缺该属性导致所有路径被滤掉 | 中间实体谓词的 `exempt` | `test_query_subgraph_intermediate_entity_condition_exempts_start`、`test_query_subgraph_entity_attribute_condition_matches_name_and_value` | 去掉终点豁免后这两个用例 FAIL（实测） | Passed |
 | 关系类条件作用于每条关系，任一条不满足则整条路径不返回 | 存在一条满足即保留 | 关系谓词 | `test_query_subgraph_relation_type_condition_filters_whole_path`、`test_query_subgraph_relation_attribute_text_uses_substring_match` | 后者含「企业→项目」边不含关键词时返回空的反向断言 | Passed |
 | 实体属性要求属性名与属性值同时相等 | 值相同而名不同被判命中 | `_build_entity_records` 投影 | `test_milvus_graph_service_entity_records_project_attributes_as_parallel_arrays`、`..._keep_attribute_values_with_separators` | `状态=已完成` 的路径不返回 | Passed |
-| 属性未回填时就绪门拒绝而不是静默空结果 | 返回 200 与空结果 | `attributes_ready` + 路由 409 分支 | `test_query_subgraph_rejects_entity_attributes_before_backfill`（服务层）、`test_attributes_ready_detects_unprojected_attributes`（真实 Neo4j） | 回填后 `attributes_ready` 由 False 转 True | Passed（服务层）；路由层 409 见下方 `Not run` |
+| 属性未回填时就绪门拒绝而不是静默空结果 | 返回 200 与空结果 | `attributes_ready` + 路由 409 分支 | `test_query_subgraph_rejects_entity_attributes_before_backfill`（服务层）、`test_attributes_ready_detects_unprojected_attributes`（真实 Neo4j）；**路由层真实 HTTP**：对未回填的知识库带 `entity_attributes` 筛选 → 409 与预期 detail，同一知识库不带该筛选 → 200（对照） | 回填后 `attributes_ready` 由 False 转 True | Passed（服务层 + 路由层） |
 | 回填幂等且不改变图结构 | 重复执行产生重复或改动节点 | `backfill_attribute_projection` | `test_backfill_attribute_projection_is_idempotent`：两次结果相同、实体计数不变 | 把 `SET e.attribute_names` 改名后该用例 FAIL（实测） | Passed |
-| 层数上限 3 | 生成超过上限的跳数 | 路由 `le=3` + service 夹取 | `test_query_subgraph_clamps_depth_to_max_subgraph_depth` | 请求 `max_depth=5` 的路由断言见 `Not run` | Passed（service 层） |
+| 层数上限 3 | 生成超过上限的跳数 | 路由 `le=3` + service 夹取 | `test_query_subgraph_clamps_depth_to_max_subgraph_depth`（service 层）；`test_subgraph_endpoint_rejects_max_depth_above_limit`（路由层真实 HTTP，422） | 去掉 service 侧夹取会让前者变红（实测） | Passed |
 | 截断可与「确实为空」区分，且节点与边两个上限都要算 | 边被上限砍掉却报告不截断，用户以为看到了全部关系 | Cypher 的 `truncated` 表达式 | `test_query_subgraph_returns_nodes_edges_and_truncation`；`test_query_subgraph_reports_truncation_when_edges_hit_the_cap`（真实 Neo4j：节点 3 ≤ `max_nodes` 4 而边 10 > 8 → `truncated` 为真且只返回 8 条边）；概览用例断言 `truncated` 为假 | 去掉 `size(edges) > $max_nodes * 2` 后该用例 FAIL（实测） | Passed |
-| Neo4j 不可用时抛出而不是返回空图 | 返回 200 与空 `nodes` | `query_subgraph` 的异常传播 | `test_query_subgraph_propagates_neo4j_failure` | 路由 503 映射见 `Not run` | Passed（服务层） |
+| Neo4j 不可用时抛出而不是返回空图 | 返回 200 与空 `nodes` | `query_subgraph` 的异常传播 | `test_query_subgraph_propagates_neo4j_failure`（服务层） | 路由 503 的映射仍未执行——需要把 Neo4j 停掉才能观察，见下方 `Not run` | Passed（服务层）；路由 503 映射 `Not run` |
 | 关键词搜索能力迁移到 `GET /api/graph/entities` | 起点选择器无数据可搜 | `search_entities` | `test_search_entities_matches_name_substring`（真实 Neo4j） | 不存在名字返回空列表 | Passed |
 | 四类筛选枚举与图谱实际取值一致 | 下拉出现图谱里没有的取值 | `_filter_options_sync` | `test_get_filter_options_merges_attribute_values_by_name`、`test_get_filter_options_reports_graph_enums` | — | Passed |
 | 图谱写入链路完整：实体记录能同时落 Neo4j 与 PostgreSQL 镜像 | 投影多出的两个键不是表列，镜像写入整批编译失败，图构建任务全量 `write_failed`、图谱永远建不成 | `KnowledgeGraphRepository.upsert_chunk_graph` | `test_write_chunk_graph_records_can_be_written_to_postgres_mirror`（真实 PostgreSQL + Neo4j，走完 `write_chunk_graph → upsert_chunk_graph`） | 不在落库前剔除 `attribute_names` / `attribute_values` 时，该用例以 `CompileError: Unconsumed column names` 失败（实测） | Passed |
@@ -116,11 +116,12 @@ Milvus 知识库的图谱查询只有一个关键词入口：关键词子串匹�
 | 回填分页不被一页空属性实体顶死 | 空属性实体占满一页即被误判取完，后续实体永远回填不到、该库的属性筛选永久不可用 | `list_entities_with_attributes_by_kb_id` | `test_list_entities_with_attributes_does_not_stop_on_attribute_less_page`（真实 PostgreSQL：3 个空属性实体在前、页大小 2） | 只在 Python 侧过滤时该用例返回 `[]` 而不是那行有属性的实体（实测） | Passed |
 | 进入图谱页时默认展示全图，构建完成后能看到图 | 默认视图为空，用户以为图谱没建好 | `_build_subgraph_cypher` 的概览分支 + `loadGraph` 的默认请求 | `test_query_subgraph_overview_without_start_returns_reachable_entities`（真实 Neo4j）；并在真实知识库上直接核对：不填起点查询返回 100 节点 / 73–125 边，`truncated` 为真 | — | Passed（服务层）；前端的默认自动加载没有执行证据，见 `Not run` |
 | 前端按面板状态装配请求体 | 面板与请求体不一致 | `web/src/utils/graph_query_payload.js` | `web/test/unit/graph_advanced_filter.test.js`（4 例）；全量 web 单测 399/399；lint 无告警；build 成功 | 类型行只提供多选，构造不出恒空条件；已被占用的属性名从其它行下拉移除、本行保留（同一文件的第三、四个用例） | Passed（装配与静态检查） |
-| 路由层行为：鉴权、非 Milvus 404、`GET` 返回 405、`max_depth=5` 返回 422、只填终点与同点返回 400、未知关系属性名返回 422 | 旧路由仍可访问或校验缺失 | `graph_router.py` | `test/integration/api/test_unified_graph_router.py` 中相应用例已写入 | 该文件无负向对照 | **Not run** |
+| 路由层行为：鉴权、非 Milvus 404、`GET` 返回 405、`max_depth=5` 返回 422、只填终点与同点返回 400、未知关系属性名返回 422 | 旧路由仍可访问或校验缺失 | `graph_router.py` | `docker compose exec -T -e TEST_USERNAME=… -e TEST_PASSWORD=… api python -m pytest test/integration/api/test_unified_graph_router.py -p no:cacheprovider -q` → **21 passed**（含 `test_subgraph_get_is_gone` 405、`..._rejects_max_depth_above_limit` 422、`..._rejects_end_without_start` / `..._rejects_same_start_and_end` 400、`..._rejects_unknown_relation_attribute_name` 422、枚举接口形状、鉴权 401/403） | 该文件无显式负向对照；但它同时覆盖了「旧 GET 已失效」与「新增校验生效」两侧 | **Passed**（2026-10-07 补齐凭证后执行） |
 | 真实页面交互与视觉 | 面板布局、暗色对比度、下拉开合 | `KnowledgeGraphSection.vue` | 需要浏览器 | — | **Not run** |
 
 `Not run` 的原因说明：
 
-- 路由层集成用例依赖 `TEST_USERNAME` / `TEST_PASSWORD`，本环境没有配置这两个变量（`.env` 与 `.env.template` 里都没有），因此 `backend/test/integration/api/` 整体被 `pytest.skip`，不只是本次新增的用例。服务层的同义约束已由真实 Neo4j 覆盖。
-- 这次被跳过的范围并不只是「缺证据」：独立 Review 正是在这里发现 `POST /api/graph/subgraph` 因为权限依赖被解析成必填 query 参数而必然返回 422，旧的路由断言若被执行会直接失败。缺陷已修复，并由「子图查询路由不额外要求 query 参数」这一行的契约用例覆盖——它读应用生成的 OpenAPI、不依赖凭证、真实执行。其余路由层断言（非 Milvus 拒绝、405、层数与参数校验）仍待凭证补齐后执行。
+- **路由层集成用例原先依赖 `TEST_USERNAME` / `TEST_PASSWORD`**，本环境当时没有配置，因此 `backend/test/integration/api/` 整体被 `pytest.skip`。2026-10-07 补齐凭证后已执行：`test_unified_graph_router.py` **21 passed**，本页随之更新的三行路由层结论即来自该次执行；此外就绪门的路由层 409 也以真实 HTTP 复核（带筛选 409 / 不带筛选 200 的对照）。
+- 当时被跳过的范围并不只是「缺证据」：独立 Review 正是在这里发现 `POST /api/graph/subgraph` 因为权限依赖被解析成必填 query 参数而必然返回 422，旧的路由断言若被执行会直接失败。缺陷已修复，并由「子图查询路由不额外要求 query 参数」这一行的契约用例覆盖——它读应用生成的 OpenAPI、不依赖凭证、真实执行。
+- **仍未执行的一项是路由层 503 的映射**：要观察到「Neo4j 不可用 → 503」需要把 Neo4j 停掉，本次未做；服务层的异常传播已由单测覆盖。
 - 真实页面验证需要浏览器，本次执行环境没有浏览器自动化能力。
