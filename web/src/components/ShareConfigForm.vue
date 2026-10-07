@@ -416,8 +416,22 @@ const loadUsers = async () => {
   }
 }
 
+const departmentsRequested = ref(false)
+// 只在「能提供部门级」且尚未请求过时加载。departmentApi.getDepartments 走 apiAdmin 传输层，
+// 普通用户在发请求之前就会被 checkAdminPermission() 抛错，所以不能无条件调用；同时不能只在
+// 挂载时判断一次——个人库的实例可能在挂载后才放宽为共享库，那时部门选择器需要数据。
+const ensureDepartmentsLoaded = () => {
+  if (departmentsRequested.value) return
+  if (!normalizedAllowedAccessLevels.value.includes('department')) return
+  departmentsRequested.value = true
+  loadDepartments()
+}
+
 watch(() => props.modelValue, initConfig, { deep: true })
-watch(normalizedAllowedAccessLevels, initConfig)
+watch(normalizedAllowedAccessLevels, () => {
+  initConfig()
+  ensureDepartmentsLoaded()
+})
 watch(
   scopes,
   () => {
@@ -454,11 +468,7 @@ const hasManageScopeViolation = computed(() =>
 
 onMounted(() => {
   initConfig()
-  // 不能提供「部门共享」时（如个人库只允许「指定人」），不发起部门列表请求：
-  // departmentApi 走 apiAdmin 传输层，普通用户会直接 403。
-  if (normalizedAllowedAccessLevels.value.includes('department')) {
-    loadDepartments()
-  }
+  ensureDepartmentsLoaded()
   loadUsers()
 })
 

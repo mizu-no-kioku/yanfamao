@@ -399,11 +399,7 @@
                     v-model="editShareConfig"
                     :auto-select-user-dept="true"
                     :require-read-scope="true"
-                    :allowed-access-levels="
-                      database.scope === 'personal'
-                        ? ['user']
-                        : ['global', 'department', 'user']
-                    "
+                    :allowed-access-levels="shareAllowedAccessLevels"
                   />
                 </a-form-item-rest>
               </a-form-item>
@@ -941,6 +937,13 @@ const fileList = computed(() => {
 })
 
 const canEditShareConfig = computed(() => canManageDatabase.value)
+
+// 个人库只提供「指定人」；共享库保持三档。必须是 computed：内联数组字面量每次父组件重渲染
+// 都是新数组，会让 ShareConfigForm 的 `watch(allowedAccessLevels)` 按引用反复触发、重新从
+// `modelValue` 派生 scopes，从而丢弃尚未保存的本地选择（自动刷新期间父组件会反复重渲染）。
+const shareAllowedAccessLevels = computed(() =>
+  database.value.scope === 'personal' ? ['user'] : ['global', 'department', 'user']
+)
 
 const shareConfigDisplay = computed(() => {
   const shareConfig = database.value?.share_config || {}

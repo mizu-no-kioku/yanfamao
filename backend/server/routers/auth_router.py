@@ -681,13 +681,14 @@ def _ensure_user_in_current_department(current_user: User, target_user: User) ->
 
 @auth.get("/users/access-options", response_model=list[UserAccessOption])
 async def read_user_access_options(
-    skip: int = 0,
-    limit: int = 1000,
+    skip: int = Query(0, ge=0),
+    limit: int = Query(1000, ge=1, le=1000),
     current_user: User = Depends(get_required_user),
     db: AsyncSession = Depends(get_db),
 ):
     # 底座是 get_required_user：它已对无部门调用者 fail-closed（400），所以这里不需要额外的
     # `department_id is None` 守卫——那个分支不可达。超管看全部，其余只看本部门。
+    # limit 上界 1000：超过 1000 人的部门会被静默截断（既有局限，见决策记录）。
     user_repo = UserRepository(db)
     if current_user.role == "superadmin":
         users_with_dept = await user_repo.list_with_department(skip=skip, limit=limit)

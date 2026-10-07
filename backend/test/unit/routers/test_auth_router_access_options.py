@@ -138,3 +138,11 @@ async def test_unauthenticated_caller_is_rejected(env):
     response = await env["client"].get("/api/auth/users/access-options")
 
     assert response.status_code == 401, response.text
+
+
+async def test_invalid_pagination_is_rejected(env):
+    env["caller"]["user"] = env["users"]["user_a"]
+
+    for params in ({"skip": -1}, {"limit": 0}, {"limit": 1001}):
+        response = await env["client"].get("/api/auth/users/access-options", params=params)
+        assert response.status_code == 422, f"{params} -> {response.status_code}: {response.text}"

@@ -82,7 +82,12 @@ fail-closed 的（`global` / `department` 会被静默忽略），于是创建�
 - **只有表单这一处**不再请求部门列表。详情页视图自身另有一处
   `loadDepartments()`（`web/src/views/DataBaseInfoView.vue` 的 `onMounted`，用于只读展示部门名）
   仍会调用 `departmentApi.getDepartments()`；普通用户在客户端就被 `checkAdminPermission()` 挡下、
-  错误被视图自己的 `catch` 吞掉。本次未收敛这一处（不在本次范围内），记为已知残留。
+  错误被视图自己的 `catch` 吞掉。**用户可见后果**：普通用户查看**共享库**的只读权限展示时，
+  部门名会退化成 `getDepartmentName` 的兜底「部门3」而不是真实名称。本次未收敛这一处
+  （放宽 `departmentApi` 是又一次授权面扩张，需单独决定），记为已知残留。
+- **超过 1000 人的部门会被静默截断**：`limit` 默认且上限为 1000（`Query(1000, ge=1, le=1000)`），
+  部门成员多于 1000 时选择器只显示前 1000 个。这是既有局限，本次不做服务端搜索，仅在
+  `skip` / `limit` 上补了取值校验（负 `skip`、`limit<=0`、`limit>1000` 现在是 422）。
 - 未认证 → 401；已登录但未绑定部门 → 400（与知识库路由一致）。
 
 ## 验证
@@ -100,7 +105,11 @@ fail-closed 的（`global` / `department` 会被静默忽略），于是创建�
 | 前端传输层不再要求管理员 | 普通用户仍被前端 `checkAdminPermission()` 预判挡住 | `web/src/apis/auth_api.js` | `web/test/unit/knowledge_share_picker.test.js` 的源码断言（`apiGet`） | RED（实现前实测）：仍为 `apiAdminGet` | Passed |
 | 个人库详情页只提供「指定人」 | 个人库展示全局/部门档，选后被后端静默忽略 | `DataBaseInfoView.vue` | 同上：挂载渲染 1 张卡片 + 源码断言 `allowed-access-levels` 三态表达式 | RED（实现前实测）：无该绑定、渲染 3 张卡片 | Passed |
 | 不能提供部门级时表单不请求部门列表 | 表单挂载时发起一次在客户端就注定失败的部门请求 | `ShareConfigForm.vue` | 同上：`__departmentLoadCalls === 0`；选定部门级时为 1 | RED（实现前实测）：实际调用 1 次 | Passed |
-| 本次改动没有破坏既有行为 | 全量回归出现新增失败 | 全部 | `pytest test/unit -m "not slow" --ignore test/unit/services/test_run_worker.py` → **2447 passed, 58 skipped, 0 failed**（基线 2441 + 新增 6）；`pnpm run test:unit` → **416 passed / 0 failed**（基线 414 + 新增 2）；`pnpm run lint:check` 退出 0；`pnpm run build` 成功；`python3 scripts/verify_engineering_contracts.py` 退出 0 | 基线对照即负向案例 | Passed |
+| 普通用户（有部门）经**真实 HTTP + PostgreSQL** 只拿到本部门候选，且响应不含 `role` | 单元层换了内存 SQLite 与认证依赖，证明不了真实链路 | `read_user_access_options` + `get_required_user` | `test/integration/api/test_auth_router.py::test_access_options_are_department_scoped_for_plain_users`（真实登录凭证 + 真实库，由控制器执行） | 该用例断言另一部门用户的 uid **不在**结果里、且所有 `department_id` 等于调用者的部门 | Not run（已编写；运行需凭证，本次未执行） |
+| `skip` / `limit` 的非法取值被拒 | 负 `skip` 传到 Postgres 变成 `OFFSET -5` → 500 | `read_user_access_options` 的 `Query` 约束 | `test/unit/routers/test_auth_router_access_options.py::test_invalid_pagination_is_rejected` | RED（实现前实测）：`{'skip': -1} -> 200`（而非 422） | Passed |
+| 挂载后放宽为共享库时补拉部门列表 | 部门选择器永久「暂无可选项」，`validate()` 以「至少需要选择一个部门」挡住保存 | `ShareConfigForm.vue` 的 `ensureDepartmentsLoaded` | `web/test/unit/knowledge_share_picker.test.js`「挂载后放宽为共享库时补拉部门列表…」 | RED（实现前实测）：`__departmentLoadCalls` 实际为 0 | Passed |
+| 详情页传**身份稳定**的 `allowedAccessLevels` | 内联数组字面量使 `watch(allowedAccessLevels)` 反复触发，**丢弃尚未保存的本地选择** | `DataBaseInfoView.vue` 的 `shareAllowedAccessLevels` | 同上：「详情页与 API 传输层…」断言 computed 且禁止内联；「allowedAccessLevels 身份稳定…」用同引用/每次新建数组两组对照证明危害真实 | RED（实现前实测）：源码断言不匹配（当时无 computed，为内联数组） | Passed |
+| 本次改动没有破坏既有行为 | 全量回归出现新增失败 | 全部 | `pytest test/unit -m "not slow" --ignore test/unit/services/test_run_worker.py` → **2448 passed, 58 skipped, 0 failed**（相对 2441 基线 +7）；`pnpm run test:unit` → **418 passed / 0 failed**（相对 414 基线 +4）；`pnpm run lint:check` 退出 0；`pnpm run build` 成功；`python3 scripts/verify_engineering_contracts.py` 退出 0；`cd docs && node node_modules/vitepress/bin/vitepress.js build` 成功 | 基线对照即负向案例 | Passed |
 | 真实浏览器中的可见性 | 端到端界面表现 | 前端 | `Not run` | — | Not run |
 
 `Not run` 的原因说明：
@@ -108,6 +117,8 @@ fail-closed 的（`global` / `department` 会被静默忽略），于是创建�
 - **真实页面与视觉验证未执行**：本次执行环境没有浏览器自动化能力。未验证的内容是普通账号进入
   知识库详情页后的实际呈现（选择器里出现本部门同事、个人库只显示「指定人」卡片）。
   `pnpm run build` 通过只证明 SFC 能编译，不构成可视断言。
-- **带凭证的集成套件未执行**：`backend/test/integration/api/test_auth_router.py` 里已有
-  `access-options` 的管理员用例（第 372-378 行，只断言 uid 与 department_id，不涉及被删的
-  `role`），由控制器单独运行。
+- **带凭证的集成套件未执行**：本次为普通用户新增的
+  `test_access_options_are_department_scoped_for_plain_users` 已写入
+  `backend/test/integration/api/test_auth_router.py`，但**未运行**（需要真实登录凭证与 PostgreSQL，
+  由控制器执行）；因此上表该行记为 `Not run`，**不能当作通过**。该文件既有的
+  `access-options` 管理员用例（第 372-378 行）只断言 uid 与 department_id，不涉及被删的 `role`。

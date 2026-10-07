@@ -416,6 +416,78 @@ async def test_department_admin_is_limited_to_own_department_users(test_client, 
             await _cleanup_department(test_client, admin_headers, department_id)
 
 
+async def _create_user_with_headers(test_client, headers, label: str, role: str = "user") -> dict:
+    """用管理员的 headers 创建一个用户，并返回该用户自己的登录 headers。"""
+    suffix = uuid.uuid4().hex[:8]
+    username = f"u{label}_{suffix}"
+    password = f"Pw!{suffix}"
+    response = await test_client.post(
+        "/api/auth/users",
+        json={"username": username, "password": password, "role": role},
+        headers=headers,
+    )
+    assert response.status_code == 200, response.text
+    user = response.json()
+
+    login_response = await test_client.post(
+        "/api/auth/token", data={"username": username, "password": password}
+    )
+    assert login_response.status_code == 200, login_response.text
+    return {
+        "user": user,
+        "headers": {"Authorization": f"Bearer {login_response.json()['access_token']}"},
+    }
+
+
+async def test_access_options_are_department_scoped_for_plain_users(test_client, admin_headers):
+    """普通用户（role=user）调 access-options 只拿到本部门候选，且响应不含 role。
+
+    这是「普通账号第一次获得用户目录读取权」这条授权主张的核心证据，必须由真实 HTTP +
+    真实 PostgreSQL 证明；单元层换了内存 SQLite 和认证依赖，不能代替。
+    """
+    await _require_superadmin(test_client, admin_headers)
+
+    user_ids: list[int] = []
+    admin_ids: list[int] = []
+    department_ids: list[int] = []
+
+    try:
+        dept_a = await _create_department_with_admin(test_client, admin_headers, "opt_a")
+        dept_b = await _create_department_with_admin(test_client, admin_headers, "opt_b")
+        department_a = dept_a["department"]
+        department_b = dept_b["department"]
+        department_ids.extend([department_a["id"], department_b["id"]])
+        admin_ids.extend([dept_a["admin_id"], dept_b["admin_id"]])
+
+        # 部门管理员创建用户时自动继承本部门。
+        plain_a = await _create_user_with_headers(test_client, dept_a["admin_headers"], "opt_a")
+        plain_b = await _create_user_with_headers(test_client, dept_b["admin_headers"], "opt_b")
+        user_ids.extend([plain_a["user"]["id"], plain_b["user"]["id"]])
+        assert plain_a["user"]["department_id"] == department_a["id"]
+        assert plain_b["user"]["department_id"] == department_b["id"]
+
+        options_response = await test_client.get(
+            "/api/auth/users/access-options", headers=plain_a["headers"]
+        )
+        assert options_response.status_code == 200, options_response.text
+        options = options_response.json()
+
+        option_uids = {option["uid"] for option in options}
+        assert plain_a["user"]["uid"] in option_uids
+        assert plain_b["user"]["uid"] not in option_uids
+        assert all(option["department_id"] == department_a["id"] for option in options)
+
+        # 放宽到登录用户后不再输出角色：普通账号没有理由看到同事的 role。
+        assert all("role" not in option for option in options)
+    finally:
+        for user_id in user_ids:
+            await _cleanup_user(test_client, admin_headers, user_id)
+        for admin_id in admin_ids:
+            await _cleanup_user(test_client, admin_headers, admin_id)
+        for department_id in department_ids:
+            await _cleanup_department(test_client, admin_headers, department_id)
+
+
 async def test_invalid_token_is_rejected(test_client):
     headers = {"Authorization": "Bearer not-a-real-token"}
     response = await test_client.get("/api/auth/me", headers=headers)
