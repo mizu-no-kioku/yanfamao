@@ -253,6 +253,20 @@ def test_personal_knowledge_base_stranger_gets_none():
     assert resolve_knowledge_base_permission(stranger, resource) == ResourcePermission.NONE
 
 
+def test_personal_knowledge_base_superadmin_gets_manage():
+    """超管管理一切：别人的个人库对超管仍是 MANAGE——个人库的回退是「仅创建者 + 超管可见」。"""
+    from yuxi.permissions import resolve_knowledge_base_permission
+
+    superadmin = _user(uid="u-9", role="superadmin", department_id=None)
+    resource = _kb(
+        created_by="u-1",
+        share_config={"version": 2, "read_scope": _user_scope(["u-2"]), "manage_scope": None},
+        scope="personal",
+    )
+
+    assert resolve_knowledge_base_permission(superadmin, resource) == ResourcePermission.MANAGE
+
+
 @pytest.mark.parametrize(
     "read_scope",
     [

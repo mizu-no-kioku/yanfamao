@@ -209,12 +209,17 @@ def require_resource_permission(
 def resolve_knowledge_base_permission(user: Any, resource: ShareableResource) -> ResourcePermission:
     """解析知识库权限。
 
-    个人知识库采用 fail-closed 判定：只有创建者拿到 MANAGE，其余人仅能被 read_scope 的
-    user 级定向分享放宽到 READ。这里刻意不走通用 scope 判定——通用路径会照 share_config
+    个人知识库采用 fail-closed 判定：只有创建者与超管拿到 MANAGE，其余人仅能被 read_scope
+    的 user 级定向分享放宽到 READ。这里刻意不走通用 scope 判定——通用路径会照 share_config
     的字面值放行，一旦个人库的 read_scope 被误设成 global 或 department，陌生人就会拿到
     READ，个人库的可见性边界会被它自己的 share_config 悄悄撑破；因此除 user 级定向分享外
-    一律 NONE。共享库不受影响，仍走受角色上限约束的通用判定。
+    一律 NONE。超管的放行与通用路径同形，且同样早于个人库判定，否则超管也会被夹成 NONE
+    而看不到别人的个人库。共享库交回通用判定，其余行为与通用路径一致（含创建者早于角色
+    上限返回这一条）。
     """
+
+    if _value(user, "role") == "superadmin":
+        return ResourcePermission.MANAGE
 
     if _value(resource, "scope") == "personal":
         if str(_value(resource, "created_by", "") or "") == str(_value(user, "uid", "") or ""):
