@@ -51,7 +51,13 @@ export const validateDatabaseConfig = (form, typeInfo) => {
   return ''
 }
 
-export const buildDatabaseRequest = (form, typeInfo, shareConfig, defaultEmbeddingModel) => {
+export const buildDatabaseRequest = (
+  form,
+  typeInfo,
+  shareConfig,
+  defaultEmbeddingModel,
+  scope = 'shared'
+) => {
   const additionalParams = {}
   for (const field of typeInfo?.create_params?.options || []) {
     const value = form.additional_params[field.key]
@@ -63,7 +69,8 @@ export const buildDatabaseRequest = (form, typeInfo, shareConfig, defaultEmbeddi
     description: form.description?.trim() || '',
     kb_type: form.kb_type,
     additional_params: additionalParams,
-    share_config: shareConfig
+    share_config: shareConfig,
+    scope
   }
   if (typeInfo?.requires_embedding_model) {
     request.embedding_model_spec = form.embedding_model_spec || defaultEmbeddingModel

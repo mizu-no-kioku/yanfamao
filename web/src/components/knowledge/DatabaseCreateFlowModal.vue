@@ -70,6 +70,17 @@
               </button>
             </div>
           </div>
+          <div class="form-section">
+            <label>知识库范围</label>
+            <a-radio-group
+              v-model:value="scope"
+              :options="scopeOptions"
+              :disabled="!canChooseScope"
+              option-type="button"
+              aria-label="知识库范围"
+            />
+            <small>{{ scopeDescription }}</small>
+          </div>
         </section>
 
         <section v-else-if="currentStep === 1" class="flow-section">
@@ -194,6 +205,7 @@
             v-model="shareConfig"
             :auto-select-user-dept="true"
             :require-read-scope="true"
+            :allowed-access-levels="shareAllowedAccessLevels"
           />
         </section>
       </main>
@@ -223,6 +235,7 @@ import ShareConfigForm from '@/components/ShareConfigForm.vue'
 import { useChunkPresetOptions } from '@/composables/useChunkPresetOptions'
 import { useConfigStore } from '@/stores/config'
 import { useDatabaseStore } from '@/stores/database'
+import { useUserStore } from '@/stores/user'
 import { getKbTypeIcon, getKbTypeLabel } from '@/utils/kb_utils'
 import {
   buildDatabaseRequest,
@@ -239,6 +252,7 @@ const props = defineProps({
 const emit = defineEmits(['update:open', 'completed'])
 const configStore = useConfigStore()
 const databaseStore = useDatabaseStore()
+const userStore = useUserStore()
 const {
   chunkPresetSelectOptions: chunkPresetOptions,
   chunkPresetLoading,
@@ -252,6 +266,29 @@ const form = reactive(createEmptyDatabaseForm(configStore.config?.embed_model))
 const shareConfig = ref(createDefaultShareConfig())
 const shareConfigFormRef = ref(null)
 const creating = computed(() => databaseStore.state.creating)
+// 范围默认值按角色取，与后端未显式传 scope 时的默认一致。
+const defaultScope = () => (userStore.isAdmin ? 'shared' : 'personal')
+const scope = ref(defaultScope())
+const canChooseScope = computed(() => userStore.isAdmin)
+// 普通用户不渲染共享选项：后端会拒绝普通用户创建的共享库，给出来就是个坏控件。
+const scopeOptions = computed(() =>
+  canChooseScope.value
+    ? [
+        { value: 'personal', label: '个人知识库' },
+        { value: 'shared', label: '共享知识库' }
+      ]
+    : [{ value: 'personal', label: '个人知识库' }]
+)
+const scopeDescription = computed(() => {
+  if (!canChooseScope.value) return '普通账号只能创建个人知识库，仅自己可见。'
+  return scope.value === 'personal'
+    ? '仅自己可见，可在下一步指定他人读取。'
+    : '按权限共享给部门或指定用户。'
+})
+// 个人库只允许「指定人」共享，不提供部门与全局。
+const shareAllowedAccessLevels = computed(() =>
+  scope.value === 'personal' ? ['user'] : ['global', 'department', 'user']
+)
 const selectedTypeInfo = computed(() => props.supportedKbTypes[form.kb_type] || null)
 const selectedTypeLabel = computed(
   () => getKbTypeLabel(form.kb_type) || selectedTypeInfo.value?.name || form.kb_type
@@ -285,6 +322,7 @@ const reset = () => {
   const firstType = Object.keys(props.supportedKbTypes)[0] || ''
   Object.assign(form, selectDatabaseType(form, firstType, props.supportedKbTypes[firstType]))
   shareConfig.value = createDefaultShareConfig()
+  scope.value = defaultScope()
   currentStep.value = 0
 }
 
@@ -334,7 +372,8 @@ const handleCreate = async () => {
     form,
     selectedTypeInfo.value,
     shareConfig.value,
-    configStore.config?.embed_model
+    configStore.config?.embed_model,
+    scope.value
   )
   try {
     const result = await databaseStore.createDatabase(request)

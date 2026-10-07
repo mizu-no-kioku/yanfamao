@@ -70,49 +70,54 @@
       </template>
     </ResourceEmptyState>
 
-    <!-- 数据库列表 -->
-    <ExtensionCardGrid v-else>
-      <InfoCard
-        v-for="database in filteredDatabases"
-        :key="database.kb_id"
-        :title="database.name"
-        :subtitle="cardSubtitle(database)"
-        :description="database.description || '暂无描述'"
-        :tags="cardTags(database)"
-        :disabled="kbUtils.isReadOnlyDatabase(database)"
-        @click="navigateToDatabase(database)"
-      >
-        <template #icon>
-          <component :is="getKbTypeIcon(database.kb_type || 'milvus')" :size="20" />
-        </template>
-        <template #card-more-action-corner>
-          <a-menu
-            class="database-action-menu"
-            @click="({ key }) => handleDatabaseAction(key, database)"
+    <!-- 数据库列表：按归属分两段渲染，空段不渲染标题；同一份卡片模板供两段复用 -->
+    <template v-else>
+      <template v-for="section in databaseSections" :key="section.key">
+        <div class="extension-section-header">{{ section.title }}</div>
+        <ExtensionCardGrid>
+          <InfoCard
+            v-for="database in section.databases"
+            :key="database.kb_id"
+            :title="database.name"
+            :subtitle="cardSubtitle(database)"
+            :description="database.description || '暂无描述'"
+            :tags="cardTags(database)"
+            :disabled="kbUtils.isReadOnlyDatabase(database)"
+            @click="navigateToDatabase(database)"
           >
-            <a-menu-item key="copy">
-              <span class="lucide-menu-item">
-                <Copy :size="15" />
-                <span>复制 ID</span>
-              </span>
-            </a-menu-item>
-            <a-menu-item v-if="database.can_manage" key="edit">
-              <span class="lucide-menu-item">
-                <Pencil :size="15" />
-                <span>编辑知识库</span>
-              </span>
-            </a-menu-item>
-            <a-menu-divider />
-            <a-menu-item v-if="database.can_manage" key="delete" danger>
-              <span class="lucide-menu-item">
-                <Trash2 :size="15" />
-                <span>删除知识库</span>
-              </span>
-            </a-menu-item>
-          </a-menu>
-        </template>
-      </InfoCard>
-    </ExtensionCardGrid>
+            <template #icon>
+              <component :is="getKbTypeIcon(database.kb_type || 'milvus')" :size="20" />
+            </template>
+            <template #card-more-action-corner>
+              <a-menu
+                class="database-action-menu"
+                @click="({ key }) => handleDatabaseAction(key, database)"
+              >
+                <a-menu-item key="copy">
+                  <span class="lucide-menu-item">
+                    <Copy :size="15" />
+                    <span>复制 ID</span>
+                  </span>
+                </a-menu-item>
+                <a-menu-item v-if="database.can_manage" key="edit">
+                  <span class="lucide-menu-item">
+                    <Pencil :size="15" />
+                    <span>编辑知识库</span>
+                  </span>
+                </a-menu-item>
+                <a-menu-divider />
+                <a-menu-item v-if="database.can_manage" key="delete" danger>
+                  <span class="lucide-menu-item">
+                    <Trash2 :size="15" />
+                    <span>删除知识库</span>
+                  </span>
+                </a-menu-item>
+              </a-menu>
+            </template>
+          </InfoCard>
+        </ExtensionCardGrid>
+      </template>
+    </template>
   </div>
 </template>
 
@@ -121,6 +126,7 @@ import { ref, onMounted, reactive, watch, computed } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { storeToRefs } from 'pinia'
 import { useDatabaseStore } from '@/stores/database'
+import { useUserStore } from '@/stores/user'
 import { Copy, Pencil, Plus, Trash2 } from '@lucide/vue'
 import { message, Modal } from 'ant-design-vue'
 import { databaseApi, typeApi } from '@/apis/knowledge_api'
@@ -137,6 +143,7 @@ import { getShareConfigLabel } from '@/utils/shareConfig'
 const route = useRoute()
 const router = useRouter()
 const databaseStore = useDatabaseStore()
+const userStore = useUserStore()
 
 const props = defineProps({
   embedded: { type: Boolean, default: false }
@@ -169,6 +176,27 @@ const filteredDatabases = computed(() => {
   }
   return list
 })
+
+// 分段依据是归属（scope 为 personal 且 created_by 是我），不是 scope 值本身：
+// 别人分享给我的个人库要落在「共享知识库」段，否则会被误认为是我自己建的。
+const myPersonalDatabases = computed(() =>
+  filteredDatabases.value.filter((database) =>
+    kbUtils.isOwnPersonalDatabase(database, userStore.uid)
+  )
+)
+const sharedDatabases = computed(() =>
+  filteredDatabases.value.filter(
+    (database) => !kbUtils.isOwnPersonalDatabase(database, userStore.uid)
+  )
+)
+
+// 某段为空时不渲染该段（连同标题一起）。
+const databaseSections = computed(() =>
+  [
+    { key: 'personal', title: '个人知识库', databases: myPersonalDatabases.value },
+    { key: 'shared', title: '共享知识库', databases: sharedDatabases.value }
+  ].filter((section) => section.databases.length)
+)
 
 const state = reactive({
   openNewDatabaseModel: false
@@ -325,6 +353,11 @@ defineExpose({
   loading: computed(() => dbState.value.listLoading)
 })
 </script>
+
+<style lang="less" scoped>
+/* 复用扩展列表的分段标题样式，不为两段列表另造一套标题样式。 */
+@import '@/assets/css/extensions.less';
+</style>
 
 <style lang="less" scoped>
 .database-container {

@@ -59,9 +59,19 @@ export const isReadOnlyDatabase = (database, kbTypes = {}) => {
   return READ_ONLY_KB_TYPES.has(kbType)
 }
 
+/**
+ * 判断知识库是否是当前用户自己的个人库。
+ *
+ * 判据是归属而不是管理权限：管理员对所有知识库的 `can_manage` 都是 true，
+ * 用它当归属依据会把别人的个人库错认成自己建的。
+ */
+export const isOwnPersonalDatabase = (database, uid) =>
+  database?.scope === 'personal' && database?.created_by === uid
+
 export const kbUtils = {
   getKbTypeLabel,
   getKbTypeIcon,
   getKbTypeColor,
-  isReadOnlyDatabase
+  isReadOnlyDatabase,
+  isOwnPersonalDatabase
 }

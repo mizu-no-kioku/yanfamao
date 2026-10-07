@@ -59,6 +59,32 @@ test('只为需要嵌入模型的类型构建模型和分块参数', () => {
   assert.equal('chunk_preset_id' in connectorRequest.additional_params, false)
 })
 
+test('请求体带上知识库范围，且普通用户的共享范围被收敛成指定用户', () => {
+  const form = {
+    ...createEmptyDatabaseForm('embed/model'),
+    name: '我的资料',
+    kb_type: 'milvus'
+  }
+
+  const personal = buildDatabaseRequest(
+    form,
+    { requires_embedding_model: true, create_params: { options: [] } },
+    { version: 2 },
+    'fallback/model',
+    'personal'
+  )
+  assert.equal(personal.scope, 'personal')
+
+  const shared = buildDatabaseRequest(
+    form,
+    { requires_embedding_model: true, create_params: { options: [] } },
+    { version: 2 },
+    'fallback/model',
+    'shared'
+  )
+  assert.equal(shared.scope, 'shared')
+})
+
 test('知识库类型标签映射将 milvus 解析为研发猫', () => {
   assert.equal(getKbTypeLabel('milvus'), '研发猫')
   assert.equal(getKbTypeLabel('Milvus'), '研发猫')
