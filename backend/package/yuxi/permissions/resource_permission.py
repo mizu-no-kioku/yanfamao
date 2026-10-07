@@ -207,7 +207,22 @@ def require_resource_permission(
 
 
 def resolve_knowledge_base_permission(user: Any, resource: ShareableResource) -> ResourcePermission:
-    """解析知识库权限，普通用户最多只能获得只读权限。"""
+    """解析知识库权限。
+
+    个人知识库采用 fail-closed 判定：只有创建者拿到 MANAGE，其余人仅能被 read_scope 的
+    user 级定向分享放宽到 READ。这里刻意不走通用 scope 判定——通用路径会照 share_config
+    的字面值放行，一旦个人库的 read_scope 被误设成 global 或 department，陌生人就会拿到
+    READ，个人库的可见性边界会被它自己的 share_config 悄悄撑破；因此除 user 级定向分享外
+    一律 NONE。共享库不受影响，仍走受角色上限约束的通用判定。
+    """
+
+    if _value(resource, "scope") == "personal":
+        if str(_value(resource, "created_by", "") or "") == str(_value(user, "uid", "") or ""):
+            return ResourcePermission.MANAGE
+        read_scope = normalize_permission_config(_value(resource, "share_config"))["read_scope"]
+        if read_scope and read_scope.get("access_level") == "user" and scope_matches(user, read_scope):
+            return ResourcePermission.READ
+        return ResourcePermission.NONE
 
     return resolve_resource_permission(
         user,
