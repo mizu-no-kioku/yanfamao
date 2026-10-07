@@ -454,7 +454,11 @@ const hasManageScopeViolation = computed(() =>
 
 onMounted(() => {
   initConfig()
-  loadDepartments()
+  // 不能提供「部门共享」时（如个人库只允许「指定人」），不发起部门列表请求：
+  // departmentApi 走 apiAdmin 传输层，普通用户会直接 403。
+  if (normalizedAllowedAccessLevels.value.includes('department')) {
+    loadDepartments()
+  }
   loadUsers()
 })
 

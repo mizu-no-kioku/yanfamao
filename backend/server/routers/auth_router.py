@@ -118,7 +118,6 @@ class UserPageResponse(BaseModel):
 class UserAccessOption(BaseModel):
     uid: str
     username: str
-    role: str
     department_id: int | None = None
     department_name: str | None = None
 
@@ -684,9 +683,11 @@ def _ensure_user_in_current_department(current_user: User, target_user: User) ->
 async def read_user_access_options(
     skip: int = 0,
     limit: int = 1000,
-    current_user: User = Depends(get_admin_user),
+    current_user: User = Depends(get_required_user),
     db: AsyncSession = Depends(get_db),
 ):
+    # 底座是 get_required_user：它已对无部门调用者 fail-closed（400），所以这里不需要额外的
+    # `department_id is None` 守卫——那个分支不可达。超管看全部，其余只看本部门。
     user_repo = UserRepository(db)
     if current_user.role == "superadmin":
         users_with_dept = await user_repo.list_with_department(skip=skip, limit=limit)
@@ -698,7 +699,6 @@ async def read_user_access_options(
         {
             "uid": user.uid,
             "username": user.username,
-            "role": user.role,
             "department_id": user.department_id,
             "department_name": dept_name,
         }

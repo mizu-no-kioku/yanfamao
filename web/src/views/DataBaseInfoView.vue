@@ -399,6 +399,11 @@
                     v-model="editShareConfig"
                     :auto-select-user-dept="true"
                     :require-read-scope="true"
+                    :allowed-access-levels="
+                      database.scope === 'personal'
+                        ? ['user']
+                        : ['global', 'department', 'user']
+                    "
                   />
                 </a-form-item-rest>
               </a-form-item>

@@ -31,6 +31,19 @@ async function getOIDCLoginUrl(redirectPath = '/') {
 }
 
 /**
+ * 获取可分享的用户候选。超管看全部，其余只看本部门。
+ * @returns {Promise<Array<{
+ *   uid: string,
+ *   username: string,
+ *   department_id: number | null,
+ *   department_name: string | null
+ * }>>}
+ */
+async function getUserAccessOptions() {
+  return apiGet('/api/auth/users/access-options')
+}
+
+/**
  * 使用一次性 code 交换 OIDC 登录结果
  * @param {string} code - 一次性登录 code
  * @returns {Promise<{
@@ -46,10 +59,6 @@ async function getOIDCLoginUrl(redirectPath = '/') {
  *   department_name: string | null
  * }>}
  */
-async function getUserAccessOptions() {
-  return apiAdminGet('/api/auth/users/access-options')
-}
-
 async function exchangeOIDCCode(code) {
   return apiPost('/api/auth/oidc/exchange-code', { code }, {}, false)
 }
