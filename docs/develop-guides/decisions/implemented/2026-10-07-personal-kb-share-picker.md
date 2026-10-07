@@ -110,7 +110,7 @@ fail-closed 的（`global` / `department` 会被静默忽略），于是创建�
 | 前端传输层不再要求管理员 | 普通用户仍被前端 `checkAdminPermission()` 预判挡住 | `web/src/apis/auth_api.js` | `web/test/unit/knowledge_share_picker.test.js` 的源码断言（`apiGet`） | RED（实现前实测）：仍为 `apiAdminGet` | Passed |
 | 个人库详情页只提供「指定人」 | 个人库展示全局/部门档，选后被后端静默忽略 | `DataBaseInfoView.vue` | 同上：挂载渲染 1 张卡片 + 源码断言 `allowed-access-levels` 三态表达式 | RED（实现前实测）：无该绑定、渲染 3 张卡片 | Passed |
 | 不能提供部门级时表单不请求部门列表 | 表单挂载时发起一次在客户端就注定失败的部门请求 | `ShareConfigForm.vue` | 同上：`__departmentLoadCalls === 0`；选定部门级时为 1 | RED（实现前实测）：实际调用 1 次 | Passed |
-| 普通用户（有部门）经**真实 HTTP + PostgreSQL** 只拿到本部门候选 | 单元层换了内存 SQLite 与认证依赖，证明不了真实链路 | `read_user_access_options` + `get_required_user` | `test/integration/api/test_auth_router.py::test_access_options_are_department_scoped_for_plain_users`（真实登录凭证 + 真实库，由控制器执行） | 该用例断言另一部门用户的 uid **不在**结果里、且所有 `department_id` 等于调用者的部门 | Not run（已编写；运行需凭证，本次未执行） |
+| 普通用户（有部门）经**真实 HTTP + PostgreSQL** 只拿到本部门候选 | 单元层换了内存 SQLite 与认证依赖，证明不了真实链路 | `read_user_access_options` + `get_required_user` | `test/integration/api/test_auth_router.py::test_access_options_are_department_scoped_for_plain_users`（真实登录凭证 + 真实库，由控制器执行） | 该用例断言另一部门用户的 uid **不在**结果里、且所有 `department_id` 等于调用者的部门 | **Passed**（控制器用真实登录凭证 + 真实 PostgreSQL 执行：**`1 passed in 2.27s`**） |
 | `skip` / `limit` 的非法取值被拒 | 负 `skip` 传到 Postgres 变成 `OFFSET -5` → 500 | `read_user_access_options` 的 `Query` 约束 | `test/unit/routers/test_auth_router_access_options.py::test_invalid_pagination_is_rejected` | RED（实现前实测）：`{'skip': -1} -> 200`（而非 422） | Passed |
 | 挂载后放宽为共享库时补拉部门列表 | 部门选择器永久「暂无可选项」，`validate()` 以「至少需要选择一个部门」挡住保存 | `ShareConfigForm.vue` 的 `ensureDepartmentsLoaded` | `web/test/unit/knowledge_share_picker.test.js`「挂载后放宽为共享库时补拉部门列表…」 | RED（实现前实测）：`__departmentLoadCalls` 实际为 0 | Passed |
 | 详情页传**身份稳定**的 `allowedAccessLevels` | 自动刷新不断重新赋值 `store.database`，computed 重算若产出新数组，就会让 `watch(allowedAccessLevels)` 反复触发、**丢弃尚未保存的本地选择** | `DataBaseInfoView.vue` 的 `shareAllowedAccessLevels` | 同上「详情页与 API 传输层…」的源码断言：两档数组是**模块级常量**，computed 只做选择且体内无数组字面量 | RED（实现前实测）：`const SHARE_ACCESS_LEVELS_PERSONAL = ['user']` 不存在（当时字面量写在 computed 内） | Passed |
@@ -125,6 +125,23 @@ fail-closed 的（`global` / `department` 会被静默忽略），于是创建�
   `pnpm run build` 通过只证明 SFC 能编译，不构成可视断言。
 - **带凭证的集成套件未执行**：本次为普通用户新增的
   `test_access_options_are_department_scoped_for_plain_users` 已写入
-  `backend/test/integration/api/test_auth_router.py`，但**未运行**（需要真实登录凭证与 PostgreSQL，
-  由控制器执行）；因此上表该行记为 `Not run`，**不能当作通过**。该文件既有的
+  `backend/test/integration/api/test_auth_router.py`；实现者环境无凭证，故未运行。
+  该用例已由控制器执行并通过，见下方「带凭证的集成实测」。该文件既有的
   `access-options` 管理员用例（第 372-378 行）只断言 uid 与 department_id，不涉及被删的 `role`。
+
+带凭证的集成实测（由控制器执行；凭证经环境变量注入，不入库、不入文档）：
+
+- **新增用例已执行并通过**：`test_access_options_are_department_scoped_for_plain_users`
+  单独执行 → **`1 passed in 2.27s`**。上表该行据实记为 `Passed`。
+- **分支全跑**：`python -m pytest test/integration/api/test_auth_router.py
+  test/integration/api/test_knowledge_router.py -q` → **`59 passed, 3 errors in 15.52s`**。
+- **BASE 对照**：`main`（`5ee7f10`）上同一条命令 → **`58 passed, 3 errors in 19.01s`**，
+  **三条 error 逐条同名**：`test_user_is_locked_after_repeated_failed_logins`、
+  `test_deleted_user_token_is_rejected`、`test_locked_user_token_is_rejected`。
+  `passed` 之差 58 → 59 正是本次新增的那条用例。
+- **三条 error 与本次改动无关，是既有结构性失败**：报错点在 `standard_user` 夹具 teardown 的
+  `cleanup_test_chat_resources`（`backend/test/integration/conftest.py:221-225`），它用的是
+  **被测用户自己的 token**；而这三个用例恰好把自己那个用户**锁掉或删掉**，认证中间件对 token
+  请求同样返回 423「登录被锁定」，teardown 于是必然抛 `RuntimeError`。旁证：DB 中被锁的都是夹具
+  现造的 `pytest_user_*`，管理员 `ty1` 未被锁，锁定时长 5 分钟。BASE 对照给出完全一致的错误集合，
+  因此不要把它读成本次改动引入的失败。
