@@ -1341,7 +1341,7 @@ async def _create_department_admin_headers(test_client, admin_headers, departmen
     response = await test_client.post(
         "/api/auth/users",
         json={
-            "username": f"pytest_deptadmin_{suffix}",
+            "username": f"pytest_da_{suffix}",
             "password": password,
             "role": "admin",
             "department_id": department_id,
