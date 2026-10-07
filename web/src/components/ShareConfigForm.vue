@@ -404,8 +404,10 @@ const loadDepartments = async () => {
   try {
     const result = await departmentApi.getDepartments()
     departments.value = result.departments || result || []
+    return true
   } catch (error) {
     console.error('加载部门列表失败:', error)
+    return false
   }
 }
 const loadUsers = async () => {
@@ -420,11 +422,12 @@ const departmentsRequested = ref(false)
 // 只在「能提供部门级」且尚未请求过时加载。departmentApi.getDepartments 走 apiAdmin 传输层，
 // 普通用户在发请求之前就会被 checkAdminPermission() 抛错，所以不能无条件调用；同时不能只在
 // 挂载时判断一次——个人库的实例可能在挂载后才放宽为共享库，那时部门选择器需要数据。
-const ensureDepartmentsLoaded = () => {
+const ensureDepartmentsLoaded = async () => {
   if (departmentsRequested.value) return
   if (!normalizedAllowedAccessLevels.value.includes('department')) return
   departmentsRequested.value = true
-  loadDepartments()
+  // 请求失败时复位，否则选择器会永久停在「暂无可选项」、validate() 挡住保存。
+  if (!(await loadDepartments())) departmentsRequested.value = false
 }
 
 watch(() => props.modelValue, initConfig, { deep: true })

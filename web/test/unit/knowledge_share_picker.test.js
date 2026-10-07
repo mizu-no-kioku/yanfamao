@@ -68,7 +68,14 @@ const stubModules = {
   '@/stores/user': 'export const useUserStore = () => globalThis.__sharePickerUser',
   '@/apis/auth_api': 'export const authApi = { getUserAccessOptions: async () => [] }',
   '@/apis/department_api':
-    'export const departmentApi = { getDepartments: async () => { globalThis.__departmentLoadCalls = (globalThis.__departmentLoadCalls || 0) + 1; return { departments: [{ id: 3, name: "研发部" }] } } }'
+    'export const departmentApi = { getDepartments: async () => { globalThis.__departmentLoadCalls = (globalThis.__departmentLoadCalls || 0) + 1; if (globalThis.__departmentLoadFailures > 0) { globalThis.__departmentLoadFailures -= 1; throw new Error("department request failed") }; return { departments: [{ id: 3, name: "研发部" }] } } }'
+}
+
+const flush = async () => {
+  await nextTick()
+  await nextTick()
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  await nextTick()
 }
 
 const shareCards = (host) => findAll(host, (node) => node.props.role === 'radio')
@@ -114,14 +121,26 @@ test('详情页与 API 传输层：分享选择器不再要求管理员', () => 
     /async function getUserAccessOptions\(\) \{\s*return apiAdminGet/
   )
 
-  // 个人库只提供「指定人」，共享库三档；且必须以 computed 形式传递，见下一条测试。
-  assert.match(
-    detailSource,
-    /const shareAllowedAccessLevels = computed\(\s*\(\) =>[\s\S]{0,120}?database\.value\.scope === 'personal'[\s\S]{0,80}?\['user'\][\s\S]{0,80}?\['global', 'department', 'user'\]/
-  )
+  // 个人库只提供「指定人」，共享库三档。两个数组必须是**模块级常量**，computed 只负责选择：
+  // 自动刷新会不断重新赋值 store.database，若数组字面量写在 computed 里，每次重算都会产出新
+  // 数组、prop 身份抖动，进而让 ShareConfigForm 重新派生 scopes 并丢弃未保存的本地选择。
+  assert.match(detailSource, /const SHARE_ACCESS_LEVELS_PERSONAL = \['user'\]/)
+  assert.match(detailSource, /const SHARE_ACCESS_LEVELS_SHARED = \['global', 'department', 'user'\]/)
   assert.match(detailSource, /:allowed-access-levels="shareAllowedAccessLevels"/)
-  // 内联数组字面量会让 prop 身份每次父组件重渲染都变化，禁止回到那种写法。
   assert.doesNotMatch(detailSource, /:allowed-access-levels="\s*database\.scope/)
+
+  const computedBlock = detailSource.match(
+    /const shareAllowedAccessLevels = computed\(\(\) =>[\s\S]*?\n\)/
+  )
+  assert.ok(computedBlock, '应存在 shareAllowedAccessLevels computed')
+  assert.match(computedBlock[0], /database\.value\.scope === 'personal'/)
+  assert.match(computedBlock[0], /SHARE_ACCESS_LEVELS_PERSONAL/)
+  assert.match(computedBlock[0], /SHARE_ACCESS_LEVELS_SHARED/)
+  assert.doesNotMatch(
+    computedBlock[0],
+    /\['/,
+    'computed 内不得出现数组字面量，否则 scope 未变时也会产出新数组'
+  )
 })
 
 test('个人库只渲染「指定人」且不请求部门列表；共享库仍有三档', async () => {
@@ -232,7 +251,57 @@ test('挂载后放宽为共享库时补拉部门列表，而不是永久空选�
   }
 })
 
-test('allowedAccessLevels 身份稳定：同一数组引用不丢弃未保存的本地选择', async () => {
+test('部门列表加载失败后会重试，而不是永久停在「暂无可选项」', async () => {
+  globalThis.window = {
+    getComputedStyle: () => ({
+      lineHeight: '20',
+      paddingTop: '0',
+      paddingBottom: '0',
+      borderTopWidth: '0',
+      borderBottomWidth: '0'
+    })
+  }
+  globalThis.__sharePickerUser = { departmentId: 3, uid: 'creator-uid', isAdmin: false }
+  globalThis.__departmentLoadCalls = 0
+  globalThis.__departmentLoadFailures = 1
+
+  const server = await createServer(serverOptions())
+  const allowed = ref(['global', 'department', 'user'])
+  let app
+  try {
+    const { default: ShareConfigForm } = await server.ssrLoadModule(
+      'virtual:knowledge-share-picker-test'
+    )
+
+    const mounted = await mountWrapper(
+      ShareConfigForm,
+      createDerivedShareConfig({ scope: 'shared', departmentId: 3, uid: 'creator-uid' }),
+      allowed
+    )
+    app = mounted.app
+    await flush()
+    assert.equal(globalThis.__departmentLoadCalls, 1, '首次加载应已发起')
+
+    // 首次失败后，下一次「需要部门」的时机必须重试，否则选择器永久为空、validate() 挡住保存。
+    allowed.value = ['global', 'department', 'user']
+    await flush()
+    assert.equal(globalThis.__departmentLoadCalls, 2, '首次失败后应允许重试')
+    app.unmount()
+    app = undefined
+  } finally {
+    app?.unmount()
+    await server.close()
+    delete globalThis.window
+    delete globalThis.__sharePickerUser
+    delete globalThis.__departmentLoadCalls
+    delete globalThis.__departmentLoadFailures
+  }
+})
+
+// 这条**刻画** ShareConfigForm 的行为：allowedAccessLevels 的身份变化会让它重新从 modelValue
+// 派生 scopes、丢弃未保存的本地选择。它跑的是同一份组件代码，区分不了详情页修复前后，因此
+// **不构成** #4 修复的证据；详情页那一侧的修复由上面「详情页与 API 传输层…」的源码断言证明。
+test('（刻画）ShareConfigForm 对 allowedAccessLevels 的身份敏感', async () => {
   globalThis.window = {
     getComputedStyle: () => ({
       lineHeight: '20',

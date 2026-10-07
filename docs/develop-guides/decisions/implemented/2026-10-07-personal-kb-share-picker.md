@@ -79,12 +79,17 @@ fail-closed 的（`global` / `department` 会被静默忽略），于是创建�
   （`backend/package/yuxi/repositories/user_repository.py:154` 的 `if department_id is not None:`），
   届时处理函数必须补上 `None` 守卫。改动 `get_required_user` 的部门要求时，必须同步检查本接口。
 - 个人库详情页不再展示全局/部门档位；共享库不受影响，仍三档。
-- **只有表单这一处**不再请求部门列表。详情页视图自身另有一处
-  `loadDepartments()`（`web/src/views/DataBaseInfoView.vue` 的 `onMounted`，用于只读展示部门名）
-  仍会调用 `departmentApi.getDepartments()`；普通用户在客户端就被 `checkAdminPermission()` 挡下、
-  错误被视图自己的 `catch` 吞掉。**用户可见后果**：普通用户查看**共享库**的只读权限展示时，
-  部门名会退化成 `getDepartmentName` 的兜底「部门3」而不是真实名称。本次未收敛这一处
-  （放宽 `departmentApi` 是又一次授权面扩张，需单独决定），记为已知残留。
+- **只剩一次注定失败的多余请求，没有用户可见后果**。详情页视图自身另有一处 `loadDepartments()`
+  （`web/src/views/DataBaseInfoView.vue` 的 `onMounted`）仍会调用 `departmentApi.getDepartments()`；
+  普通用户在客户端就被 `checkAdminPermission()` 挡下、错误被视图自己的 `catch` 吞掉，
+  `departments` 因此为空。但它**唯一的消费者**是只读展示分支
+  `v-else-if="database.share_config"`（`:406-409`），而该分支**不可达**：编辑弹窗只在
+  `canManageDatabase` 为真时打开（`showEditModal()` 的两个调用点 `:823`/`:1032` 都在
+  `canManageDatabase` 门内），弹窗内 `canEditShareConfig` 恒等于 `canManageDatabase`（`:939`），
+  所以它恒真、后面的只读分支是防御性死分支。结论：多余的失败请求确实存在，但**没有用户可见后果**
+  （既不会显示错误的部门名，也不会显示「部门3」，因为那段展示不执行）。不因此放宽
+  `departmentApi.getDepartments`（那是又一次授权面扩张，需单独决定）；那个死分支是否该删是另一件事，
+  本次不动。
 - **超过 1000 人的部门会被静默截断**：`limit` 默认且上限为 1000（`Query(1000, ge=1, le=1000)`），
   部门成员多于 1000 时选择器只显示前 1000 个。这是既有局限，本次不做服务端搜索，仅在
   `skip` / `limit` 上补了取值校验（负 `skip`、`limit<=0`、`limit>1000` 现在是 422）。
@@ -101,15 +106,16 @@ fail-closed 的（`global` / `department` 会被静默忽略），于是创建�
 | `superadmin` 仍可见全部用户 | 放宽时误把超管也收窄到本部门 | 同上 | `::test_superadmin_sees_all_users` | — | Passed |
 | 无部门的调用者被拒绝（**这才是真正的闸门**） | 无部门账号可枚举全部用户 | `get_required_user` | `::test_caller_without_department_is_rejected`（断言 400） | 该用例覆盖 `get_current_user` 而非 `get_required_user`，让真实的 400 分支执行；删掉 `get_required_user` 的 `if not user.department_id` 会让它变红 | Passed |
 | 未认证的调用者被拒绝 | 匿名可读用户目录 | `get_current_user` | `::test_unauthenticated_caller_is_rejected`（断言 401） | — | Passed |
-| 响应不再暴露 `role` | 放宽后把同事角色暴露给所有普通用户 | `UserAccessOption` | `::test_access_options_do_not_expose_role` | RED（实现前实测）：响应含 `role` | Passed |
+| 响应不再暴露 `role` | 放宽后把同事角色暴露给所有普通用户 | `UserAccessOption`（响应模型） | **由响应模型保证**：FastAPI 按 `response_model` 序列化时会剥离未声明字段，所以断言恒真、**不构成授权证据**；测试 `::test_access_options_do_not_expose_role` 留作双保险 | RED 只来自实现前模型里声明了 `role` 这一点，不能证明「字典里也删了」 | Passed |
 | 前端传输层不再要求管理员 | 普通用户仍被前端 `checkAdminPermission()` 预判挡住 | `web/src/apis/auth_api.js` | `web/test/unit/knowledge_share_picker.test.js` 的源码断言（`apiGet`） | RED（实现前实测）：仍为 `apiAdminGet` | Passed |
 | 个人库详情页只提供「指定人」 | 个人库展示全局/部门档，选后被后端静默忽略 | `DataBaseInfoView.vue` | 同上：挂载渲染 1 张卡片 + 源码断言 `allowed-access-levels` 三态表达式 | RED（实现前实测）：无该绑定、渲染 3 张卡片 | Passed |
 | 不能提供部门级时表单不请求部门列表 | 表单挂载时发起一次在客户端就注定失败的部门请求 | `ShareConfigForm.vue` | 同上：`__departmentLoadCalls === 0`；选定部门级时为 1 | RED（实现前实测）：实际调用 1 次 | Passed |
-| 普通用户（有部门）经**真实 HTTP + PostgreSQL** 只拿到本部门候选，且响应不含 `role` | 单元层换了内存 SQLite 与认证依赖，证明不了真实链路 | `read_user_access_options` + `get_required_user` | `test/integration/api/test_auth_router.py::test_access_options_are_department_scoped_for_plain_users`（真实登录凭证 + 真实库，由控制器执行） | 该用例断言另一部门用户的 uid **不在**结果里、且所有 `department_id` 等于调用者的部门 | Not run（已编写；运行需凭证，本次未执行） |
+| 普通用户（有部门）经**真实 HTTP + PostgreSQL** 只拿到本部门候选 | 单元层换了内存 SQLite 与认证依赖，证明不了真实链路 | `read_user_access_options` + `get_required_user` | `test/integration/api/test_auth_router.py::test_access_options_are_department_scoped_for_plain_users`（真实登录凭证 + 真实库，由控制器执行） | 该用例断言另一部门用户的 uid **不在**结果里、且所有 `department_id` 等于调用者的部门 | Not run（已编写；运行需凭证，本次未执行） |
 | `skip` / `limit` 的非法取值被拒 | 负 `skip` 传到 Postgres 变成 `OFFSET -5` → 500 | `read_user_access_options` 的 `Query` 约束 | `test/unit/routers/test_auth_router_access_options.py::test_invalid_pagination_is_rejected` | RED（实现前实测）：`{'skip': -1} -> 200`（而非 422） | Passed |
 | 挂载后放宽为共享库时补拉部门列表 | 部门选择器永久「暂无可选项」，`validate()` 以「至少需要选择一个部门」挡住保存 | `ShareConfigForm.vue` 的 `ensureDepartmentsLoaded` | `web/test/unit/knowledge_share_picker.test.js`「挂载后放宽为共享库时补拉部门列表…」 | RED（实现前实测）：`__departmentLoadCalls` 实际为 0 | Passed |
-| 详情页传**身份稳定**的 `allowedAccessLevels` | 内联数组字面量使 `watch(allowedAccessLevels)` 反复触发，**丢弃尚未保存的本地选择** | `DataBaseInfoView.vue` 的 `shareAllowedAccessLevels` | 同上：「详情页与 API 传输层…」断言 computed 且禁止内联；「allowedAccessLevels 身份稳定…」用同引用/每次新建数组两组对照证明危害真实 | RED（实现前实测）：源码断言不匹配（当时无 computed，为内联数组） | Passed |
-| 本次改动没有破坏既有行为 | 全量回归出现新增失败 | 全部 | `pytest test/unit -m "not slow" --ignore test/unit/services/test_run_worker.py` → **2448 passed, 58 skipped, 0 failed**（相对 2441 基线 +7）；`pnpm run test:unit` → **418 passed / 0 failed**（相对 414 基线 +4）；`pnpm run lint:check` 退出 0；`pnpm run build` 成功；`python3 scripts/verify_engineering_contracts.py` 退出 0；`cd docs && node node_modules/vitepress/bin/vitepress.js build` 成功 | 基线对照即负向案例 | Passed |
+| 详情页传**身份稳定**的 `allowedAccessLevels` | 自动刷新不断重新赋值 `store.database`，computed 重算若产出新数组，就会让 `watch(allowedAccessLevels)` 反复触发、**丢弃尚未保存的本地选择** | `DataBaseInfoView.vue` 的 `shareAllowedAccessLevels` | 同上「详情页与 API 传输层…」的源码断言：两档数组是**模块级常量**，computed 只做选择且体内无数组字面量 | RED（实现前实测）：`const SHARE_ACCESS_LEVELS_PERSONAL = ['user']` 不存在（当时字面量写在 computed 内） | Passed |
+| 部门列表加载失败后可重试 | 首次失败即永久「暂无可选项」，`validate()` 挡住保存 | `ShareConfigForm.vue` 的 `departmentsRequested` 复位 | `knowledge_share_picker.test.js`「部门列表加载失败后会重试…」 | RED（实现前实测）：`__departmentLoadCalls` 停在 1（期望 2） | Passed |
+| 本次改动没有破坏既有行为 | 全量回归出现新增失败 | 全部 | `pytest test/unit -m "not slow" --ignore test/unit/services/test_run_worker.py` → **2448 passed, 58 skipped, 0 failed**（相对 2441 基线 +7）；`pnpm run test:unit` → **419 passed / 0 failed**（相对 414 基线 +5）；`pnpm run lint:check` 退出 0；`pnpm run build` 成功；`python3 scripts/verify_engineering_contracts.py` 退出 0；`cd docs && node node_modules/vitepress/bin/vitepress.js build` 成功 | 基线对照即负向案例 | Passed |
 | 真实浏览器中的可见性 | 端到端界面表现 | 前端 | `Not run` | — | Not run |
 
 `Not run` 的原因说明：
