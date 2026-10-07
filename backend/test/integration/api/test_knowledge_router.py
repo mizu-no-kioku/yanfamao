@@ -10,6 +10,7 @@ import uuid
 from pathlib import Path
 
 import pytest
+import pytest_asyncio
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 from yuxi.knowledge.chunking.ragflow_like.presets import CHUNK_PRESET_IDS
@@ -105,6 +106,31 @@ async def _create_test_database(test_client, admin_headers, share_config=None):
     )
     assert response.status_code == 200, response.text
     return response.json()
+
+
+def _scope_denied_share_config() -> dict:
+    """构造一个 read_scope 只定向分享给占位 uid 的共享库配置。
+
+    任何真实测试用户（含 standard_user）的 uid 都不会命中它，因此读取该库会在
+    require_knowledge_base_read 的范围判定上被拒，与调用者的角色无关。
+    """
+
+    return {
+        "version": 2,
+        "read_scope": {"access_level": "user", "department_ids": [], "user_uids": ["pytest_scope_denied_uid"]},
+        "manage_scope": None,
+    }
+
+
+@pytest_asyncio.fixture(scope="function")
+async def scope_denied_knowledge_database(test_client, admin_headers):
+    """共享库里读取范围不含标准用户的知识库，用于触发基于范围（而非角色）的 403。"""
+
+    database = await _create_test_database(test_client, admin_headers, _scope_denied_share_config())
+    try:
+        yield database
+    finally:
+        await test_client.delete(f"/api/knowledge/databases/{database['kb_id']}", headers=admin_headers)
 
 
 async def _wait_for_task(test_client, headers, task_id):
@@ -573,9 +599,10 @@ async def test_update_database_additional_params_merge_keeps_chunk_preset(
     assert info_response.json()["additional_params"]["chunk_preset_id"] == "qa"
 
 
-async def test_knowledge_routes_enforce_permissions(test_client, standard_user, knowledge_database):
-    kb_id = knowledge_database["kb_id"]
+async def test_knowledge_routes_enforce_permissions(test_client, standard_user, scope_denied_knowledge_database):
+    """普通用户的拒绝依据分两类：管理端路由按角色，知识库路由按知识库范围。"""
 
+    # 前三条走 get_admin_user（角色闸门）：普通用户被拒与知识库范围无关。
     forbidden_create = await test_client.post(
         "/api/knowledge/databases",
         json={
@@ -592,6 +619,10 @@ async def test_knowledge_routes_enforce_permissions(test_client, standard_user, 
 
     forbidden_chunk_presets = await test_client.get("/api/knowledge/chunk-presets", headers=standard_user["headers"])
     _assert_forbidden_response(forbidden_chunk_presets)
+
+    # 后两条走 require_knowledge_base_read：该库 read_scope 只定向分享给占位 uid，
+    # 标准用户的 uid 不命中，403 来自范围判定而不是 get_admin_user 的角色闸门。
+    kb_id = scope_denied_knowledge_database["kb_id"]
 
     forbidden_get = await test_client.get(f"/api/knowledge/databases/{kb_id}", headers=standard_user["headers"])
     _assert_forbidden_response(forbidden_get)
@@ -1143,21 +1174,24 @@ async def test_sample_questions_endpoints(test_client, admin_headers, knowledge_
     assert "中没有文件" in generate_response.json()["detail"]
 
 
-async def test_mindmap_permissions(test_client, standard_user, knowledge_database):
+async def test_mindmap_permissions(test_client, standard_user, knowledge_database, scope_denied_knowledge_database):
     """测试思维导图接口的权限控制"""
-    kb_id = knowledge_database["kb_id"]
 
-    # 普通用户应该无法访问
+    # /mindmap/databases 走 get_admin_user（角色闸门）。
     forbidden_list = await test_client.get("/api/knowledge/mindmap/databases", headers=standard_user["headers"])
     _assert_forbidden_response(forbidden_list)
 
+    # /mindmap/files 走 require_knowledge_base_read：范围外的库按范围拒绝。
     forbidden_files = await test_client.get(
-        f"/api/knowledge/databases/{kb_id}/mindmap/files", headers=standard_user["headers"]
+        f"/api/knowledge/databases/{scope_denied_knowledge_database['kb_id']}/mindmap/files",
+        headers=standard_user["headers"],
     )
     _assert_forbidden_response(forbidden_files)
 
+    # /mindmap/generate 走 require_knowledge_base_manage：全局可读的共享库 manage_scope=None，
+    # 普通用户可读也不可管理，403 来自范围（manage 不命中）而非角色。
     forbidden_generate = await test_client.post(
-        f"/api/knowledge/databases/{kb_id}/mindmap/generate",
+        f"/api/knowledge/databases/{knowledge_database['kb_id']}/mindmap/generate",
         json={"file_ids": []},
         headers=standard_user["headers"],
     )
@@ -1189,9 +1223,11 @@ async def test_document_search_returns_empty_results(test_client, admin_headers,
         assert payload["limit"] == search_params["limit"]
 
 
-async def test_document_search_requires_admin(test_client, standard_user, knowledge_database):
-    """普通用户不能访问管理端搜索接口。"""
-    kb_id = knowledge_database["kb_id"]
+async def test_document_search_is_gated_by_knowledge_base_scope(
+    test_client, standard_user, scope_denied_knowledge_database
+):
+    """搜索接口走 require_knowledge_base_read：范围不命中的知识库对普通用户返回 403。"""
+    kb_id = scope_denied_knowledge_database["kb_id"]
     response = await test_client.get(
         f"/api/knowledge/databases/{kb_id}/documents/search",
         params={"query": "x"},
