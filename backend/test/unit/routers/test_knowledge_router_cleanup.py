@@ -107,8 +107,11 @@ async def test_document_file_exists_rejects_blank_filename(monkeypatch):
 async def test_upload_file_rejects_jsonl_uploads():
     upload = UploadFile(filename="dataset.jsonl", file=BytesIO(b'{"query":"hello"}\n'))
 
+    # 不带 kb_id 的通用上传通道限管理员，故这里的调用者必须带管理员角色。
     with pytest.raises(HTTPException) as exc_info:
-        await knowledge_router.upload_file(upload, kb_id=None, current_user=SimpleNamespace(uid="user_1"))
+        await knowledge_router.upload_file(
+            upload, kb_id=None, current_user=SimpleNamespace(uid="user_1", role="admin")
+        )
 
     assert exc_info.value.status_code == 400
     assert exc_info.value.detail == "Unsupported file type: .jsonl"

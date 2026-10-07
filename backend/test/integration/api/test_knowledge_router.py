@@ -616,13 +616,14 @@ async def test_knowledge_routes_enforce_permissions(test_client, standard_user, 
     )
     _assert_forbidden_response(forbidden_shared_create)
 
-    # 下面两条走 get_admin_user（角色闸门）：普通用户被拒与知识库范围无关。
+    # 下面这条走 get_admin_user（角色闸门）：普通用户被拒与知识库范围无关。
 
     forbidden_list = await test_client.get("/api/knowledge/databases", headers=standard_user["headers"])
     _assert_forbidden_response(forbidden_list)
 
-    forbidden_chunk_presets = await test_client.get("/api/knowledge/chunk-presets", headers=standard_user["headers"])
-    _assert_forbidden_response(forbidden_chunk_presets)
+    # chunk-presets 是静态预设列表，普通用户建个人库时即需要，故底座已换成登录用户。
+    chunk_presets = await test_client.get("/api/knowledge/chunk-presets", headers=standard_user["headers"])
+    assert chunk_presets.status_code == 200, chunk_presets.text
 
     # 后两条走 require_knowledge_base_read：该库 read_scope 只定向分享给占位 uid，
     # 标准用户的 uid 不命中，403 来自范围判定而不是 get_admin_user 的角色闸门。
@@ -637,6 +638,18 @@ async def test_knowledge_routes_enforce_permissions(test_client, standard_user, 
         headers=standard_user["headers"],
     )
     _assert_forbidden_response(forbidden_exists)
+
+
+async def test_plain_user_can_read_static_knowledge_metadata(test_client, standard_user):
+    """静态元数据端点对普通用户开放：建库表单与上传流程都依赖它们。"""
+
+    for path in (
+        "/api/knowledge/types",
+        "/api/knowledge/chunk-presets",
+        "/api/knowledge/files/supported-types",
+    ):
+        response = await test_client.get(path, headers=standard_user["headers"])
+        assert response.status_code == 200, f"{path}: {response.text}"
 
 
 async def test_kb_image_proxy_requires_auth_and_streams_private_image(

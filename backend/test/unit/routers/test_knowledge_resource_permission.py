@@ -167,3 +167,39 @@ async def test_adapter_base_is_logged_in_user_not_admin():
     ):
         dependency = inspect.signature(adapter).parameters["current_user"].default
         assert await dependency.dependency(plain_user) is plain_user
+
+
+@pytest.mark.parametrize(
+    ("route_handler", "expected_dependency"),
+    [
+        # 静态元数据：普通用户建库与上传流程都要用，底座是登录用户。
+        ("get_knowledge_base_types", "get_required_user"),
+        ("get_knowledge_chunk_presets", "get_required_user"),
+        ("get_supported_file_types", "get_required_user"),
+        ("generate_description", "get_required_user"),
+        # 跨知识库的全量/聚合视图：仍限管理员，普通用户走各自的可访问列表。
+        ("get_databases", "get_admin_user"),
+        ("get_mindmap_databases", "get_admin_user"),
+        ("get_knowledge_base_statistics", "get_admin_user"),
+    ],
+)
+def test_knowledge_route_dependency_class(route_handler, expected_dependency):
+    """固定这几个知识库路由的底座归属，防止静态路由被重新收紧或全量视图被放开。"""
+
+    dependency = inspect.signature(getattr(knowledge_router, route_handler)).parameters["current_user"].default
+    assert dependency.dependency is getattr(knowledge_router, expected_dependency)
+
+
+@pytest.mark.asyncio
+async def test_generic_upload_channel_without_kb_id_stays_admin_only():
+    """未带 kb_id 的上传/抓取通道不含知识库范围，仍限管理员；带 kb_id 时由按库 MANAGE 判定。"""
+
+    plain_user = SimpleNamespace(uid="u-1", role="user", department_id=2)
+    admin_user = SimpleNamespace(uid="a-1", role="admin", department_id=1)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await knowledge_router._require_admin_when_no_kb_id(None, plain_user)
+    assert exc_info.value.status_code == 403
+
+    assert await knowledge_router._require_admin_when_no_kb_id("kb-1", plain_user) is None
+    assert await knowledge_router._require_admin_when_no_kb_id(None, admin_user) is None

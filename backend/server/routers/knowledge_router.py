@@ -161,6 +161,16 @@ async def _require_manage_permission_if_kb_id(kb_id: str | None, current_user: U
         await _ensure_database_permission(kb_id, current_user, ResourcePermission.MANAGE)
 
 
+async def _require_admin_when_no_kb_id(kb_id: str | None, current_user: User) -> None:
+    """未指定 kb_id 的通用上传/抓取通道不含知识库范围，仍限管理员。
+
+    带 kb_id 的上传/抓取按该知识库的管理权限判定（见 `_require_manage_permission_if_kb_id`），
+    这里只兜住无知识库归属的通用通道，避免它变成任意登录用户可用的对象存储入口。
+    """
+    if not kb_id and current_user.role not in {"admin", "superadmin"}:
+        raise HTTPException(status_code=403, detail="未指定知识库时该操作仅限管理员")
+
+
 async def _ensure_database_supports_documents(kb_id: str, operation: str) -> dict:
     db_info, supports_documents = await knowledge_base.get_database_document_support(kb_id)
     if not db_info:
@@ -1551,13 +1561,14 @@ async def move_document(
 async def fetch_url(
     url: str = Body(..., embed=True),
     kb_id: str | None = Body(None, embed=True),
-    current_user: User = Depends(get_admin_user),
+    current_user: User = Depends(get_required_user),
 ):
     """
     抓取 URL 内容并上传到 MinIO
     """
     logger.debug(f"Fetching URL: {url} for kb_id: {kb_id}")
     try:
+        await _require_admin_when_no_kb_id(kb_id, current_user)
         await _require_manage_permission_if_kb_id(kb_id, current_user)
         # 1. 下载内容 (包含白名单校验、大小限制、类型检查)
         content_bytes, final_url = await fetch_url_content(url)
@@ -1621,7 +1632,7 @@ async def fetch_url(
 @knowledge.post("/files/import-workspace")
 async def import_workspace_files(
     payload: WorkspaceImportRequest,
-    current_user: User = Depends(get_admin_user),
+    current_user: User = Depends(get_required_user),
 ):
     """将当前用户工作区文件导入 MinIO，返回与普通文件上传一致的预处理结果。"""
     kb_id = payload.kb_id.strip()
@@ -1685,11 +1696,13 @@ async def import_workspace_files(
 async def upload_file(
     file: UploadFile = File(...),
     kb_id: str | None = Query(None),
-    current_user: User = Depends(get_admin_user),
+    current_user: User = Depends(get_required_user),
 ):
     """上传文件"""
     if not file.filename:
         raise HTTPException(status_code=400, detail="No selected file")
+
+    await _require_admin_when_no_kb_id(kb_id, current_user)
 
     if kb_id:
         await _require_manage_permission_if_kb_id(kb_id, current_user)
@@ -1757,7 +1770,7 @@ async def upload_file(
 
 
 @knowledge.get("/files/supported-types")
-async def get_supported_file_types(current_user: User = Depends(get_admin_user)):
+async def get_supported_file_types(current_user: User = Depends(get_required_user)):
     """获取当前支持的文件类型"""
     return {"message": "success", "file_types": sorted(SUPPORTED_FILE_EXTENSIONS)}
 
@@ -1807,8 +1820,8 @@ async def mark_it_down(file: UploadFile = File(...), current_user: User = Depend
 
 
 @knowledge.get("/types")
-async def get_knowledge_base_types(current_user: User = Depends(get_admin_user)):
-    """获取支持的知识库类型"""
+async def get_knowledge_base_types(current_user: User = Depends(get_required_user)):
+    """获取支持的知识库类型（静态列表，任意登录用户可读）"""
     try:
         kb_types = knowledge_base.get_supported_kb_types()
         return {"kb_types": kb_types, "message": "success"}
@@ -1820,8 +1833,8 @@ async def get_knowledge_base_types(current_user: User = Depends(get_admin_user))
 
 
 @knowledge.get("/chunk-presets")
-async def get_knowledge_chunk_presets(current_user: User = Depends(get_admin_user)):
-    """获取支持的知识库分块策略"""
+async def get_knowledge_chunk_presets(current_user: User = Depends(get_required_user)):
+    """获取支持的知识库分块策略（静态列表，普通用户建库时即需要）"""
     return {"chunk_presets": get_chunk_preset_options(), "message": "success"}
 
 
@@ -1848,12 +1861,13 @@ async def generate_description(
     name: str = Body(..., description="知识库名称"),
     current_description: str = Body("", description="当前描述（可选，用于优化）"),
     file_list: list[str] | None = Body(None, description="文件列表"),
-    current_user: User = Depends(get_admin_user),
+    current_user: User = Depends(get_required_user),
     db: AsyncSession = Depends(get_db),
 ):
     """使用 LLM 生成或优化知识库描述
 
     根据知识库名称和现有描述，使用 LLM 生成适合作为智能体工具描述的内容。
+    不读写任何知识库状态，是建库表单的辅助能力，故底座为任意登录用户。
     """
     from yuxi.models import select_model
 
