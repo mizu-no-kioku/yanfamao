@@ -1,3 +1,4 @@
+import inspect
 from types import SimpleNamespace
 
 import pytest
@@ -81,3 +82,88 @@ async def test_query_parameter_routes_apply_knowledge_base_acl(monkeypatch):
             "kb-1", SimpleNamespace(uid="admin-2", role="admin", department_id=2)
         )
     assert exc_info.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_plain_user_with_scope_match_passes_read_adapter(monkeypatch):
+    """普通角色命中读取范围时可以通过适配器——这正是本特性要放开的能力。"""
+    database = {
+        "created_by": "owner",
+        "scope": "shared",
+        "share_config": {
+            "version": 2,
+            "read_scope": {"access_level": "user", "user_uids": ["u-1"]},
+            "manage_scope": None,
+        },
+    }
+
+    async def fake_get_database_info(_kb_id):
+        return database
+
+    monkeypatch.setattr(knowledge_router.knowledge_base, "get_database_info", fake_get_database_info)
+    plain_user = SimpleNamespace(uid="u-1", role="user", department_id=2)
+
+    assert await knowledge_router.require_knowledge_base_read("kb-1", plain_user) is plain_user
+
+
+@pytest.mark.asyncio
+async def test_plain_user_without_scope_match_is_still_denied(monkeypatch):
+    """放开底座不能变成"人人可读"：范围不命中仍必须 403。"""
+    database = {
+        "created_by": "owner",
+        "scope": "shared",
+        "share_config": {
+            "version": 2,
+            "read_scope": {"access_level": "user", "user_uids": ["u-1"]},
+            "manage_scope": None,
+        },
+    }
+
+    async def fake_get_database_info(_kb_id):
+        return database
+
+    monkeypatch.setattr(knowledge_router.knowledge_base, "get_database_info", fake_get_database_info)
+    other_user = SimpleNamespace(uid="u-9", role="user", department_id=2)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await knowledge_router.require_knowledge_base_read("kb-1", other_user)
+
+    assert exc_info.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_plain_user_without_scope_match_cannot_manage(monkeypatch):
+    database = {
+        "created_by": "owner",
+        "scope": "shared",
+        "share_config": {
+            "version": 2,
+            "read_scope": {"access_level": "user", "user_uids": ["u-1"]},
+            "manage_scope": None,
+        },
+    }
+
+    async def fake_get_database_info(_kb_id):
+        return database
+
+    monkeypatch.setattr(knowledge_router.knowledge_base, "get_database_info", fake_get_database_info)
+    sharee = SimpleNamespace(uid="u-1", role="user", department_id=2)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await knowledge_router.require_knowledge_base_manage("kb-1", sharee)
+
+    assert exc_info.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_adapter_base_is_logged_in_user_not_admin():
+    """底座是登录用户：普通角色不应在适配器的依赖层被管理员闸门 403 拦下。"""
+
+    plain_user = SimpleNamespace(uid="u-1", role="user", department_id=2)
+
+    for adapter in (
+        knowledge_router.require_knowledge_base_read,
+        knowledge_router.require_knowledge_base_manage,
+    ):
+        dependency = inspect.signature(adapter).parameters["current_user"].default
+        assert await dependency.dependency(plain_user) is plain_user
