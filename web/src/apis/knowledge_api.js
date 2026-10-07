@@ -1,5 +1,6 @@
 import {
   apiGet,
+  apiPost,
   apiAdminGet,
   apiAdminPost,
   apiAdminPut,
@@ -32,7 +33,7 @@ export const databaseApi = {
    * @returns {Promise} - 创建结果
    */
   createDatabase: async (databaseData) => {
-    return apiAdminPost('/api/knowledge/databases', databaseData)
+    return apiPost('/api/knowledge/databases', databaseData)
   },
 
   /**
@@ -580,7 +581,7 @@ export const typeApi = {
    * @returns {Promise} - 知识库类型列表
    */
   getKnowledgeBaseTypes: async () => {
-    return apiAdminGet('/api/knowledge/types')
+    return apiGet('/api/knowledge/types')
   },
 
   /**
