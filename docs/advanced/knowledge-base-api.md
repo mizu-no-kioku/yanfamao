@@ -4,18 +4,18 @@
 
 ## 权限
 
-文档管理接口要求知识库管理权限；原始文件上传接口还要求管理员身份。读取和外部查询接口要求知识库读取权限。
+接口接受任意已登录且绑定部门的用户，最终授权按知识库范围判定，不按角色判定。文档管理接口要求知识库管理权限，读取和外部查询接口要求知识库读取权限。
 
-知识库的 `share_config` 使用 version 2，分别保存 `read_scope` 和 `manage_scope`。范围的 `access_level` 可以是 `global`、`department` 或 `user`；管理范围必须包含在读取范围内。
+知识库按 `scope` 分个人库（`personal`）与共享库（`shared`，默认）。`share_config` 使用 version 2，分别保存 `read_scope` 和 `manage_scope`；范围的 `access_level` 可以是 `global`、`department` 或 `user`，管理范围必须包含在读取范围内。个人库只承认 `user` 级的 `read_scope`；共享库新建时默认 `department`（创建者所在部门，无部门时退化为仅创建者 + 超管）。
 
 | 用户 | 读取 | 管理 |
 | --- | --- | --- |
 | 创建者 | 有 | 有 |
 | `superadmin` | 有 | 有 |
 | `admin` | 命中读取范围时有 | 命中管理范围时有 |
-| `user` | 命中读取范围时有 | 无 |
+| `user`（非创建者） | 共享库命中读取范围时有；个人库只有被定向分享时才有 | 无 |
 
-前端显示和 Agent 配置只会缩小可见范围，最终授权由后端依赖和 repository/manager 查询执行。
+知识库列表、全局统计和评估数据集接口仍是管理员专属。个人库与共享库的完整边界见[知识库机制](../mechanisms/knowledge-base.md#权限)。前端显示和 Agent 配置只会缩小可见范围，最终授权由后端依赖和 repository/manager 查询执行。
 
 ## 一体化导入
 
@@ -48,7 +48,7 @@ Content-Type: application/json
 
 按状态处理整批文件时，使用 `/documents/parse-pending` 和 `/documents/index-pending`。直接提交的文件 ID 数量有限制，大批量导入应使用按状态入口。
 
-URL 导入需要管理员身份和目标知识库的管理权限。先调用 `POST /api/knowledge/files/fetch-url`，通过 URL 白名单校验并得到对象地址，再进入导入流程。白名单配置与抓取器的 SSRF 防护、重定向和大小限制由[文档处理与 OCR](./document-processing.md#从-url-导入网页)拥有。不要把 `content_type=url` 直接传给文档导入接口。
+URL 导入需要目标知识库的管理权限；未指定 `kb_id` 时仍要求管理员身份。先调用 `POST /api/knowledge/files/fetch-url`，通过 URL 白名单校验并得到对象地址，再进入导入流程。白名单配置与抓取器的 SSRF 防护、重定向和大小限制由[文档处理与 OCR](./document-processing.md#从-url-导入网页)拥有。不要把 `content_type=url` 直接传给文档导入接口。
 
 上传入口会检查内容哈希，但数据库没有内容哈希唯一约束。并发请求仍可能产生重复记录；`/documents/add` 和一体化入口会保存调用方提供的哈希，不会替调用方再次完成幂等去重。
 
