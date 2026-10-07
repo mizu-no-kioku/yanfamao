@@ -91,6 +91,7 @@ async def test_create_database_defaults_to_shared_scope(pg_pool):
             kb_type="milvus",
             # milvus 类型要求嵌入模型；这里只验证 scope 默认值，故取集成测试通用的 spec。
             embedding_model_spec="siliconflow-cn:Pro/BAAI/bge-m3",
+            created_by_role="superadmin",
         )
         kb_id = detail.kb_id
 

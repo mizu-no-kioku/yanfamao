@@ -535,7 +535,8 @@ class KnowledgeBaseManager:
         scope: str = "shared",
         created_by: str | None = None,
         created_by_department_id: int | str | None = None,
-        created_by_role: str | None = None,
+        *,
+        created_by_role: str,
         **kwargs,
     ) -> KnowledgeBaseDetail:
         """
@@ -1194,7 +1195,8 @@ class KnowledgeBaseManager:
         share_config: dict | None = None,
         operator_uid: str | None = None,
         operator_department_id: int | str | None = None,
-        operator_role: str | None = None,
+        *,
+        operator_role: str,
     ) -> KnowledgeBaseDetail:
         """更新数据库"""
         from yuxi.repositories.knowledge_base_repository import KnowledgeBaseRepository

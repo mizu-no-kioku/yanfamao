@@ -213,6 +213,7 @@ async def test_create_database_persists_allowed_record_fields(tmp_path, monkeypa
         embedding_model_spec="provider:embedding",
         share_config=share_config,
         created_by="root",
+        created_by_role="superadmin",
         auto_generate_questions=False,
     )
 

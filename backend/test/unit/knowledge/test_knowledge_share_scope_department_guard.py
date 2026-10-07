@@ -114,3 +114,14 @@ async def test_non_user_access_level_needs_no_lookup(manager, directory):
     await manager._ensure_share_scope_within_operator_department(
         share_config, operator_role="user", operator_department_id=7
     )
+
+
+async def test_create_database_requires_role_argument(manager):
+    """角色是必填的 kw-only 参数：漏传会立刻 TypeError，而不是让强制静默失效。"""
+    with pytest.raises(TypeError):
+        manager.create_database("名字", "描述", kb_type="milvus", embedding_model_spec="m")
+
+
+async def test_update_database_requires_role_argument(manager):
+    with pytest.raises(TypeError):
+        manager.update_database("kb_x", "名字", "描述")

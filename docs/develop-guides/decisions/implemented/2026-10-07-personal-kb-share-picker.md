@@ -57,8 +57,10 @@ fail-closed 的（`global` / `department` 会被静默忽略），于是创建�
 - **定向分享的服务端边界**（`backend/package/yuxi/knowledge/manager.py` 的
   `_ensure_share_scope_within_operator_department`）：只对 `role == "user"` 生效；校验**归一化
   之后**的 `user_uids`（`_normalize_share_config` 会把操作者自己并进该列表，那一定是他本部门的人）。
-  `create_database` / `update_database` 各多收一个角色参数（`created_by_role` / `operator_role`），
-  由 `knowledge_router` 从 `current_user.role` 传入；`ResourcePermissionDenied` 在两个路由映射成 403。
+  `create_database` / `update_database` 各多收一个**必填的 kw-only** 角色参数
+  （`created_by_role` / `operator_role`），由 `knowledge_router` 从 `current_user.role` 传入——
+  必填是为了让未来新增的调用点漏传时立刻 `TypeError`，而不是让强制静默失效；
+  `ResourcePermissionDenied` 在两个路由映射成 403。
 - **分工**：`get_required_user` 拥有「谁能调用」；`auth_router.read_user_access_options` 拥有
   「调用者能看谁」；`manager` 的两个写调用点拥有「普通用户能把库分享给谁」；前端只做呈现与传输，
   不是授权边界。
@@ -111,7 +113,9 @@ fail-closed 的（`global` / `department` 会被静默忽略），于是创建�
   `PUT /databases/{kb_id}` 写他部门 `user_uids` 会 403。既有能力不变：非超管管理员仍能看到
   全部部门列表（`get_departments` 未改），普通用户仍可写本部门的人。
 - **存量数据不回溯**：库里已存在的跨部门 `user_uids` 不清洗、不拒绝读取；本决定只约束写入路径。
-  取舍是「不制造破坏性变更」——若将来要收敛存量，需要单独的迁移与通知。
+  取舍是「不制造破坏性变更」——若将来要收敛存量，需要单独的迁移与通知。**代价**：存量里含跨部门 uid 的
+  **个人库**，创建者此后任何一次重存分享配置都会 403，而界面选择器只列本部门的人，既显示不出、也删不掉
+  那个外来 uid——只能直接调接口改掉它再走界面。
 
 ## 验证
 
@@ -131,15 +135,16 @@ fail-closed 的（`global` / `department` 会被静默忽略），于是创建�
 | 普通用户（有部门）经**真实 HTTP + PostgreSQL** 只拿到本部门候选 | 单元层换了内存 SQLite 与认证依赖，证明不了真实链路 | `read_user_access_options` + `get_required_user` | `test/integration/api/test_auth_router.py::test_access_options_are_department_scoped_for_plain_users`（真实登录凭证 + 真实库，由控制器执行） | 该用例断言另一部门用户的 uid **不在**结果里、且所有 `department_id` 等于调用者的部门 | **Passed**（控制器用真实登录凭证 + 真实 PostgreSQL 执行：**`1 passed in 2.27s`**） |
 | `skip` / `limit` 的非法取值被拒 | 负 `skip` 传到 Postgres 变成 `OFFSET -5` → 500 | `read_user_access_options` 的 `Query` 约束 | `test/unit/routers/test_auth_router_access_options.py::test_invalid_pagination_is_rejected` | RED（实现前实测）：`{'skip': -1} -> 200`（而非 422） | Passed |
 | 挂载后放宽为共享库时补拉部门列表 | 部门选择器永久「暂无可选项」，`validate()` 以「至少需要选择一个部门」挡住保存 | `ShareConfigForm.vue` 的 `ensureDepartmentsLoaded` | `web/test/unit/knowledge_share_picker.test.js`「挂载后放宽为共享库时补拉部门列表…」 | RED（实现前实测）：`__departmentLoadCalls` 实际为 0 | Passed |
-| 详情页传**身份稳定**的 `allowedAccessLevels` | 自动刷新不断重新赋值 `store.database`，computed 重算若产出新数组，就会让 `watch(allowedAccessLevels)` 反复触发、**丢弃尚未保存的本地选择** | `DataBaseInfoView.vue` 的 `shareAllowedAccessLevels` | 同上「详情页与 API 传输层…」的源码断言：两档数组是**模块级常量**，computed 只做选择且体内无数组字面量 | RED（实现前实测）：`const SHARE_ACCESS_LEVELS_PERSONAL = ['user']` 不存在（当时字面量写在 computed 内） | Passed |
-| 部门列表加载失败后可重试 | 首次失败即永久「暂无可选项」，`validate()` 挡住保存 | `ShareConfigForm.vue` 的 `departmentsRequested` 复位 | `knowledge_share_picker.test.js`「部门列表加载失败后会重试…」 | RED（实现前实测）：`__departmentLoadCalls` 停在 1（期望 2） | Passed |
+| 详情页传**身份稳定**的 `allowedAccessLevels` | 自动刷新不断重新赋值 `store.database`，computed 重算若产出新数组，就会让 `watch(allowedAccessLevels)` 反复触发、**丢弃尚未保存的本地选择** | `DataBaseInfoView.vue` 的 `shareAllowedAccessLevels` | 同上「详情页与 API 传输层…」的源码断言：两档数组是**组件实例内创建一次的常量**（不是跨实例共享的单例），computed 只做选择且体内无数组字面量 | RED（实现前实测）：`const SHARE_ACCESS_LEVELS_PERSONAL = ['user']` 不存在（当时字面量写在 computed 内） | Passed |
+| 部门列表加载失败后可重试 | 首次失败即永久「暂无可选项」，`validate()` 挡住保存 | `ShareConfigForm.vue` 的 `departmentsRequested` 复位 | `knowledge_share_picker.test.js`「部门列表加载失败后，切到「部门共享」会重试」 | RED（实现前实测）：`__departmentLoadCalls` 停在 1（期望 2） | Passed；真正的触发是用户**切到「部门共享」档位**——同一次弹窗会话里唯一可达的重试时机 |
 | 普通用户把本部门同事写进定向分享 → 放行 | 误伤普通用户的正常分享 | `_ensure_share_scope_within_operator_department` | `test/unit/knowledge/test_knowledge_share_scope_department_guard.py::test_plain_user_can_share_with_own_department` | 反向由同文件的拒绝用例覆盖 | Passed |
 | 普通用户写他部门用户 → 拒 | 普通账号绕过界面把库分享给外部门 | 同上 | `::test_plain_user_cannot_share_outside_own_department` | RED（临时让校验直接 return 时实测）：`DID NOT RAISE ResourcePermissionDenied` | Passed（单元）；真实 HTTP 见下一条 |
 | 普通用户写未知 uid → 拒 | 分享给不存在的账号或借此探测 uid | 同上 | `::test_plain_user_cannot_share_with_unknown_uid`（批量查返回数量对不上） | 同上 RED | Passed |
 | `manage_scope` 的 `user_uids` 同样受检 | 只查 read_scope，管理范围可越界 | 同上 | `::test_manage_scope_is_checked_too` | 同上 RED | Passed |
 | 管理员与超管不受该限制 | 只放开普通用户却误伤管理员的跨部门分享 | 同上（`operator_role != "user"` 直接返回） | `::test_admin_and_superadmin_are_not_restricted`；集成层由非超管管理员建共享库那条覆盖 | 该用例在 RED 探针下仍通过（正是不该被拦的那一侧） | Passed |
-| 真实 HTTP 上确实映射成 403 | 异常被路由的 `except Exception → 400` 兜底吞掉，状态码不是 403 | `knowledge_router` 两处 `ResourcePermissionDenied → 403` | `test/integration/api/test_knowledge_router.py::test_plain_user_share_scope_is_limited_to_own_department`（真实 HTTP + PostgreSQL，**已编写、未执行**，由控制器运行） | 该用例断言越部门与未知 uid 两次 PUT 都是 403 | Not run（已编写；运行需凭证，本次未执行） |
-| 本次改动没有破坏既有行为 | 全量回归出现新增失败 | 全部 | `pytest test/unit -m "not slow" --ignore test/unit/services/test_run_worker.py` → **2455 passed, 58 skipped, 0 failed**（相对 2441 基线 +14）；`pnpm run test:unit` → **419 passed / 0 failed**（相对 414 基线 +5）；`pnpm run lint:check` 退出 0；`pnpm run build` 成功；`python3 scripts/verify_engineering_contracts.py` 退出 0；`cd docs && node node_modules/vitepress/bin/vitepress.js build` 成功 | 基线对照即负向案例 | Passed |
+| 真实 HTTP 上确实映射成 403 | 异常被路由的 `except Exception → 400` 兜底吞掉，状态码不是 403 | `knowledge_router` 两处 `ResourcePermissionDenied → 403` | `test/integration/api/test_knowledge_router.py::test_plain_user_share_scope_is_limited_to_own_department`（真实 HTTP + PostgreSQL，由控制器执行） | 该用例断言越部门与未知 uid 两次 PUT 都是 403、非超管管理员建库放行 | **Passed**（控制器用真实登录凭证 + 真实 PostgreSQL 执行：**`1 passed in 2.92s`**） |
+| 角色参数必填，漏传立刻失败 | 未来新增调用点漏传角色会让强制静默失效、且没有测试变红 | `create_database` / `update_database` 的 kw-only 角色参数 | `::test_create_database_requires_role_argument` / `::test_update_database_requires_role_argument` | RED（把默认值放回时实测）：两条均 `DID NOT RAISE TypeError` | Passed |
+| 本次改动没有破坏既有行为 | 全量回归出现新增失败 | 全部 | `pytest test/unit -m "not slow" --ignore test/unit/services/test_run_worker.py` → **2457 passed, 58 skipped, 0 failed**（相对 2441 基线 +16）；`pnpm run test:unit` → **419 passed / 0 failed**（相对 414 基线 +5）；`pnpm run lint:check` 退出 0；`pnpm run build` 成功；`python3 scripts/verify_engineering_contracts.py` 退出 0；`cd docs && node node_modules/vitepress/bin/vitepress.js build` 成功 | 基线对照即负向案例 | Passed |
 | 真实浏览器中的可见性 | 端到端界面表现 | 前端 | `Not run` | — | Not run |
 
 `Not run` 的原因说明：
@@ -169,7 +174,12 @@ fail-closed 的（`global` / `department` 会被静默忽略），于是创建�
   请求同样返回 423「登录被锁定」，teardown 于是必然抛 `RuntimeError`。旁证：DB 中被锁的都是夹具
   现造的 `pytest_user_*`，管理员账号未被锁，锁定时长 5 分钟。BASE 对照给出完全一致的错误集合，
   因此不要把它读成本次改动引入的失败。
-- **服务端定向分享边界的集成用例尚未执行**：
-  `test/integration/api/test_knowledge_router.py::test_plain_user_share_scope_is_limited_to_own_department`
-  已编写（真实 HTTP + PostgreSQL，覆盖越部门与未知 uid 两次 PUT 都是 403、非超管管理员不受限），
-  但本次**未运行**——运行需凭证。上表该行记为 `Not run`，**不能当作通过**。
+- **服务端定向分享边界的集成用例已由控制器执行并通过**：`test_plain_user_share_scope_is_limited_to_own_department`
+  单跑 → **`1 passed in 2.92s`**；`test/integration/api/test_auth_router.py` +
+  `test/integration/api/test_knowledge_router.py` 两文件全跑 → **`60 passed, 3 errors in 17.28s`**；
+  BASE（`main` = `5ee7f10`）同一命令 → **`58 passed, 3 errors`**，三条 error 与上节同名（成因同上）。
+- **该用例首次运行失败过一次，失败在用例自身，不在功能**：helper 生成的
+  `pytest_deptadmin_{suffix}` 长 **25**，超过 `validate_username`
+  （`backend/package/yuxi/services/user_identity_service.py:11-20`：2–20 字符）的 20 上界，
+  被 400 拒绝；`4ac5a1f` 改为 `pytest_da_{suffix}`（18 字符）后通过。同一提交审计了本分支新增用例
+  生成的全部名称（用户名、部门名、知识库名、uid），未发现第二处越界。
