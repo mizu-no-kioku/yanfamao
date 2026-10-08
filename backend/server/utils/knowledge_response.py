@@ -77,3 +77,20 @@ def serialize_knowledge_base(
 def serialize_knowledge_base_list(databases: list[KnowledgeBaseSummary]) -> dict[str, list[dict[str, Any]]]:
     """转换知识库摘要列表为现有列表接口响应。"""
     return {"databases": [serialize_knowledge_base(database, row_count_fallback=True) for database in databases]}
+
+
+def serialize_accessible_knowledge_base(
+    database: KnowledgeBaseSummary,
+    *,
+    supports_documents: bool,
+) -> dict[str, Any]:
+    """转换可访问列表的列表项，供普通用户浏览与智能体选择共用。
+
+    字段与管理员列表同源（含统计与创建时间），再加一个由知识库类型决定的能力位，卡片因此
+    不缺数据。**不要在这里按权限裁剪字段**：同一份 `share_config` 在详情接口对只读调用者
+    也会返回，只在这条路径上删掉只会让两个接口对同一资源给出不同契约，买不到保密性。
+    """
+
+    item = serialize_knowledge_base(database, row_count_fallback=True)
+    item["supports_documents"] = supports_documents
+    return item

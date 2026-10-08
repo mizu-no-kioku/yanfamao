@@ -1267,6 +1267,13 @@ async def test_document_search_is_gated_by_knowledge_base_scope(
 # milvus 类型要求嵌入模型，缺少它建库会 400；这里只验证范围收敛，故取集成测试通用的 spec。
 _CREATE_EMBEDDING_SPEC = "siliconflow-cn:Pro/BAAI/bge-m3"
 
+# 任一普通用户都能读到的共享范围，用于把「可读」与「可管理」两个方向分开观察。
+_GLOBAL_READ_SCOPE = {
+    "version": 2,
+    "read_scope": {"access_level": "global", "department_ids": [], "user_uids": []},
+    "manage_scope": None,
+}
+
 
 async def _create_other_plain_user(test_client, admin_headers):
     """另建一个非超管、非创建者的普通用户，用于验证拒绝方向。"""
@@ -1303,6 +1310,85 @@ async def test_plain_user_can_create_personal_knowledge_base(test_client, standa
         items = {item["kb_id"]: item for item in listing.json()["databases"]}
         assert kb_id in items
         assert items[kb_id]["can_manage"] is True
+    finally:
+        await test_client.delete(f"/api/knowledge/databases/{kb_id}", headers=standard_user["headers"])
+
+
+async def test_accessible_list_item_carries_database_card_fields(test_client, admin_headers, standard_user):
+    """普通用户列表项要带上浏览卡片需要的统计与创建时间，与管理员列表同源。
+
+    缺陷现场：`/databases/accessible` 只回手写的 8 个字段，卡片读到的 `row_count` 恒为
+    `undefined`，于是共享库里明明有内容也显示「0 文件」，也没有创建时间前缀。
+    """
+
+    database = await _create_test_database(test_client, admin_headers, dict(_GLOBAL_READ_SCOPE))
+    kb_id = database["kb_id"]
+    try:
+        # 用同步的文件夹创建把统计落成非零值：同一个 stats 聚合与持久化路径，不需要跑解析/入库任务。
+        folder = await test_client.post(
+            f"/api/knowledge/databases/{kb_id}/folders",
+            json={"folder_name": "pytest_card_fields"},
+            headers=admin_headers,
+        )
+        assert folder.status_code == 200, folder.text
+
+        admin_response = await test_client.get("/api/knowledge/databases", headers=admin_headers)
+        assert admin_response.status_code == 200, admin_response.text
+        admin_item = next(item for item in admin_response.json()["databases"] if item["kb_id"] == kb_id)
+
+        listing = await test_client.get("/api/knowledge/databases/accessible", headers=standard_user["headers"])
+        assert listing.status_code == 200, listing.text
+        item = next(entry for entry in listing.json()["databases"] if entry["kb_id"] == kb_id)
+
+        assert admin_item["row_count"] > 0
+        assert item.get("row_count") == admin_item["row_count"]
+        assert (item.get("stats") or {}).get("row_count") == admin_item["row_count"]
+        assert item.get("created_at") == admin_item["created_at"]
+    finally:
+        await test_client.delete(f"/api/knowledge/databases/{kb_id}", headers=admin_headers)
+
+
+async def test_accessible_list_share_config_matches_database_detail(test_client, admin_headers, standard_user):
+    """列表与详情对同一个库给出同一份共享范围：不按权限裁剪，两个接口不出现契约分歧。"""
+
+    database = await _create_test_database(test_client, admin_headers, dict(_GLOBAL_READ_SCOPE))
+    kb_id = database["kb_id"]
+    try:
+        detail = await test_client.get(f"/api/knowledge/databases/{kb_id}", headers=standard_user["headers"])
+        assert detail.status_code == 200, detail.text
+
+        listing = await test_client.get("/api/knowledge/databases/accessible", headers=standard_user["headers"])
+        assert listing.status_code == 200, listing.text
+        item = next(entry for entry in listing.json()["databases"] if entry["kb_id"] == kb_id)
+
+        assert item["can_manage"] is False
+        assert item["share_config"] == detail.json()["share_config"]
+    finally:
+        await test_client.delete(f"/api/knowledge/databases/{kb_id}", headers=admin_headers)
+
+
+async def test_accessible_list_keeps_share_config_for_owned_database(test_client, standard_user):
+    """自己建的库要带上共享范围，卡片才能显示真实分享对象而不是缺数据拼出的假标签。"""
+
+    response = await test_client.post(
+        "/api/knowledge/databases",
+        json={
+            "database_name": f"pytest_own_card_{uuid.uuid4().hex[:8]}",
+            "description": "普通用户自己的个人库",
+            "embedding_model_spec": _CREATE_EMBEDDING_SPEC,
+            "kb_type": "milvus",
+        },
+        headers=standard_user["headers"],
+    )
+    assert response.status_code == 200, response.text
+    kb_id = response.json()["kb_id"]
+    try:
+        listing = await test_client.get("/api/knowledge/databases/accessible", headers=standard_user["headers"])
+        assert listing.status_code == 200, listing.text
+        item = next(entry for entry in listing.json()["databases"] if entry["kb_id"] == kb_id)
+
+        assert item["can_manage"] is True
+        assert item["share_config"]["version"] == 2
     finally:
         await test_client.delete(f"/api/knowledge/databases/{kb_id}", headers=standard_user["headers"])
 

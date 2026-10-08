@@ -138,7 +138,7 @@ import ExtensionCardGrid from '@/components/extensions/ExtensionCardGrid.vue'
 import InfoCard from '@/components/shared/InfoCard.vue'
 import dayjs, { parseToShanghai } from '@/utils/time'
 import { getKbTypeLabel, getKbTypeIcon, getKbTypeColor, kbUtils } from '@/utils/kb_utils'
-import { getShareConfigLabel } from '@/utils/shareConfig'
+import { getShareTagLabel } from '@/utils/shareConfig'
 
 const route = useRoute()
 const router = useRouter()
@@ -264,12 +264,13 @@ const cardTags = (database) => {
     {
       name: getKbTypeLabel(database.kb_type || 'milvus'),
       color: getKbTypeColor(database.kb_type || 'milvus')
-    },
-    {
-      name: getShareConfigLabel(database.share_config),
-      color: 'gray'
     }
   ]
+  // 响应带回共享范围时渲染标签；缺这份数据时不渲染，而不是拿空对象拼出「只读用户(0)」。
+  const shareTagLabel = getShareTagLabel(database)
+  if (shareTagLabel) {
+    tags.push({ name: shareTagLabel, color: 'gray' })
+  }
   if (database.embedding_model_spec) {
     tags.push({
       name: database.embedding_model_spec.split('/').slice(-1)[0],
