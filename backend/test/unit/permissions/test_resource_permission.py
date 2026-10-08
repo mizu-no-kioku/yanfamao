@@ -54,8 +54,8 @@ def test_strict_config_rejects_manage_scope_outside_read_scope():
         normalize_permission_config(
             {
                 "version": 2,
-                "read_scope": {"access_level": "department", "department_ids": [1]},
-                "manage_scope": {"access_level": "global"},
+                "read_scope": {"access_levels": ["department"], "department_ids": [1]},
+                "manage_scope": {"access_levels": ["global"]},
             },
             strict=True,
         )
@@ -68,8 +68,8 @@ def test_strict_config_rejects_user_manage_scope_under_department_read_scope():
         normalize_permission_config(
             {
                 "version": 2,
-                "read_scope": {"access_level": "department", "department_ids": [1]},
-                "manage_scope": {"access_level": "user", "user_uids": ["user-1"]},
+                "read_scope": {"access_levels": ["department"], "department_ids": [1]},
+                "manage_scope": {"access_levels": ["user"], "user_uids": ["user-1"]},
             },
             strict=True,
         )
@@ -308,3 +308,124 @@ def test_shared_knowledge_base_plain_user_creator_keeps_manage():
     assert resolve_knowledge_base_permission(owner, _kb(created_by="u-1", scope="shared")) == (
         ResourcePermission.MANAGE
     )
+
+
+def _new_scope(levels, department_ids=(), user_uids=()):
+    return {
+        "access_levels": list(levels),
+        "department_ids": list(department_ids),
+        "user_uids": list(user_uids),
+    }
+
+
+def test_union_scope_matches_department_member_and_named_user():
+    """并集：部门成员与指定用户都命中。"""
+    resource = _kb(
+        created_by="owner",
+        share_config={
+            "version": 2,
+            "read_scope": _new_scope(["department", "user"], department_ids=[3], user_uids=["u-7"]),
+            "manage_scope": None,
+        },
+    )
+
+    assert resolve_knowledge_base_permission(_user(uid="u-1", department_id=3), resource) == ResourcePermission.READ
+    assert resolve_knowledge_base_permission(_user(uid="u-7", department_id=9), resource) == ResourcePermission.READ
+    assert resolve_knowledge_base_permission(_user(uid="u-9", department_id=9), resource) == ResourcePermission.NONE
+
+
+def test_legacy_scope_normalizes_to_single_level():
+    """旧形状读时归一：判定结果与今天一致（这是存量数据的回归保护）。"""
+    from yuxi.permissions import normalize_permission_config
+
+    legacy = normalize_permission_config(
+        {
+            "version": 2,
+            "read_scope": {"access_level": "department", "department_ids": [3], "user_uids": []},
+            "manage_scope": None,
+        }
+    )
+
+    assert legacy["read_scope"] == _new_scope(["department"], department_ids=[3])
+
+
+def test_scope_matches_ignores_a_scope_that_was_never_normalized():
+    """未归一的形状（两个字段都没有）不命中任何人——fail-closed，不是默认全局。"""
+    from yuxi.permissions import scope_matches
+
+    assert scope_matches(_user(department_id=3), {}) is False
+    assert scope_matches(_user(department_id=3), {"access_level": "department", "department_ids": [3]}) is False
+
+
+@pytest.mark.parametrize(
+    "read_scope",
+    [
+        pytest.param(
+            {"access_levels": ["user"], "department_ids": [1], "user_uids": ["u-1"]},
+            id="user-with-departments",
+        ),
+        pytest.param(
+            {"access_levels": ["department"], "department_ids": [], "user_uids": []},
+            id="department-without-ids",
+        ),
+        pytest.param({"access_levels": ["user"], "department_ids": [], "user_uids": []}, id="user-without-uids"),
+        pytest.param(
+            {"access_levels": ["global", "user"], "department_ids": [], "user_uids": ["u-1"]},
+            id="global-not-alone",
+        ),
+        pytest.param({"access_levels": [], "department_ids": [], "user_uids": []}, id="empty-levels"),
+    ],
+)
+def test_scope_shape_rejects_self_contradicting_configs(read_scope):
+    """只有一种合法表达：自相矛盾的形状显式失败，不静默清空。"""
+    from yuxi.permissions import normalize_permission_config
+
+    with pytest.raises(ValueError):
+        normalize_permission_config({"version": 2, "read_scope": read_scope, "manage_scope": None})
+
+
+def test_write_path_rejects_legacy_access_level_key():
+    """写入路径（strict）只接受 access_levels；读路径仍接受旧键（存量行靠它）。
+
+    这条规则把「旧 bundle + 新后端」的静默放大挡在写入口，而不是只靠前端自觉：
+    老前端提交的 `{access_level: ...}` 会在写入时被拒，而不是被归一后落库。
+    """
+    from yuxi.permissions import normalize_permission_config
+
+    legacy = {
+        "version": 2,
+        "read_scope": {"access_level": "department", "department_ids": [1]},
+        "manage_scope": None,
+    }
+
+    assert normalize_permission_config(legacy)["read_scope"]["access_levels"] == ["department"]
+    with pytest.raises(ValueError, match="access_levels"):
+        normalize_permission_config(legacy, strict=True)
+
+
+def test_global_scope_with_member_lists_is_rejected_on_write_and_canonicalized_on_read():
+    """global 独占：写入路径拒绝携带名单的自相矛盾形状，读路径宽容为干净 global（存量行靠它）。"""
+    from yuxi.permissions import normalize_permission_config
+
+    contradictory = {
+        "version": 2,
+        "read_scope": {"access_levels": ["global"], "department_ids": [1]},
+        "manage_scope": None,
+    }
+
+    assert normalize_permission_config(contradictory)["read_scope"] == _new_scope(["global"])
+    with pytest.raises(ValueError, match="全局范围"):
+        normalize_permission_config(contradictory, strict=True)
+
+
+def test_v2_scope_validation_rejects_union_with_any_disallowed_level():
+    """并集里每一档都必须被允许：只看第一档会漏掉越权档。"""
+    from yuxi.permissions import normalize_permission_config
+
+    read_scope = {"access_levels": ["department", "user"], "department_ids": [1], "user_uids": ["u-1"]}
+
+    with pytest.raises(ValueError, match="共享范围"):
+        normalize_permission_config(
+            {"version": 2, "read_scope": read_scope, "manage_scope": None},
+            allowed_access_levels={"user"},
+        )
