@@ -100,7 +100,7 @@ export default defineConfig({
             ]
           },
           { text: 'Langfuse 集成', link: '/advanced/langfuse-integration' },
-          { text: 'API Key 外部集成', link: '/advanced/api-key-integration' },
+          { text: '对外 API 接入', link: '/advanced/api-key-integration' },
           { text: '第三方认证', link: '/advanced/third-party-auth' },
           { text: '按用户统计模型用量', link: '/advanced/model-usage-tracking' },
           { text: '品牌自定义', link: '/advanced/branding' }
