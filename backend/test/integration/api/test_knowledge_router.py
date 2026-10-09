@@ -117,7 +117,7 @@ def _scope_denied_share_config() -> dict:
 
     return {
         "version": 2,
-        "read_scope": {"access_level": "user", "department_ids": [], "user_uids": ["pytest_scope_denied_uid"]},
+        "read_scope": {"access_levels": ["user"], "department_ids": [], "user_uids": ["pytest_scope_denied_uid"]},
         "manage_scope": None,
     }
 
@@ -1015,22 +1015,22 @@ async def test_legacy_global_knowledge_base_stays_visible_to_plain_user(
         admin_headers,
         {
             "version": 2,
-            "read_scope": {"access_level": "global", "department_ids": [], "user_uids": []},
+            "read_scope": {"access_levels": ["global"], "department_ids": [], "user_uids": []},
             "manage_scope": None,
         },
     )
     try:
-        assert database["share_config"]["read_scope"]["access_level"] == "global"
+        assert database["share_config"]["read_scope"]["access_levels"] == ["global"]
         assert database["kb_id"] in await _accessible_kb_ids(test_client, standard_user["headers"])
     finally:
         await test_client.delete(f"/api/knowledge/databases/{database['kb_id']}", headers=admin_headers)
 
 
 @pytest.mark.parametrize(
-    ("access_level", "scope_key"),
+    ("level", "scope_key"),
     [("department", "department_ids"), ("user", "user_uids")],
 )
-async def test_share_config_filters_accessible_databases(test_client, admin_headers, access_level, scope_key):
+async def test_share_config_filters_accessible_databases(test_client, admin_headers, level, scope_key):
     """按 share_config 的访问范围过滤可访问知识库，department 与 user 两级同构。"""
     department_a = await _create_test_department(test_client, admin_headers, "pytest_dept_a")
     department_b = await _create_test_department(test_client, admin_headers, "pytest_dept_b")
@@ -1040,11 +1040,11 @@ async def test_share_config_filters_accessible_databases(test_client, admin_head
     try:
         user_a = await _create_test_user(test_client, admin_headers, department_a["id"])
         user_b = await _create_test_user(test_client, admin_headers, department_b["id"])
-        if access_level == "department":
-            scope = {"access_level": "department", "department_ids": [department_a["id"]], "user_uids": []}
+        if level == "department":
+            scope = {"access_levels": ["department"], "department_ids": [department_a["id"]], "user_uids": []}
             scope_target = department_a["id"]
         else:
-            scope = {"access_level": "user", "department_ids": [], "user_uids": [user_a["user"]["uid"]]}
+            scope = {"access_levels": ["user"], "department_ids": [], "user_uids": [user_a["user"]["uid"]]}
             scope_target = user_a["user"]["uid"]
         database = await _create_test_database(
             test_client,
@@ -1053,7 +1053,7 @@ async def test_share_config_filters_accessible_databases(test_client, admin_head
         )
 
         saved_config = database["share_config"]
-        assert saved_config["manage_scope"]["access_level"] == access_level
+        assert saved_config["manage_scope"]["access_levels"] == [level]
         assert scope_target in saved_config["manage_scope"][scope_key]
 
         assert database["kb_id"] in await _accessible_kb_ids(test_client, user_a["headers"])
@@ -1270,7 +1270,7 @@ _CREATE_EMBEDDING_SPEC = "siliconflow-cn:Pro/BAAI/bge-m3"
 # 任一普通用户都能读到的共享范围，用于把「可读」与「可管理」两个方向分开观察。
 _GLOBAL_READ_SCOPE = {
     "version": 2,
-    "read_scope": {"access_level": "global", "department_ids": [], "user_uids": []},
+    "read_scope": {"access_levels": ["global"], "department_ids": [], "user_uids": []},
     "manage_scope": None,
 }
 
@@ -1414,7 +1414,7 @@ def _user_share_config(uids: list[str]) -> dict:
 
     return {
         "version": 2,
-        "read_scope": {"access_level": "user", "department_ids": [], "user_uids": uids},
+        "read_scope": {"access_levels": ["user"], "department_ids": [], "user_uids": uids},
         "manage_scope": None,
     }
 
@@ -1554,7 +1554,7 @@ async def test_admin_created_shared_knowledge_base_defaults_to_own_department(te
         body = detail.json()
         assert body["scope"] == "shared"
         read_scope = body["share_config"]["read_scope"]
-        assert read_scope["access_level"] == "department"
+        assert read_scope["access_levels"] == ["department"]
         assert read_scope["department_ids"]
     finally:
         await test_client.delete(f"/api/knowledge/databases/{kb_id}", headers=admin_headers)

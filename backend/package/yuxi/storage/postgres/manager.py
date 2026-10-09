@@ -589,9 +589,9 @@ class PostgresManager(metaclass=SingletonMeta):
                 "UPDATE knowledge_bases SET share_config = jsonb_build_object("
                 "'version', 2, "
                 "'read_scope', COALESCE(NULLIF(share_config, '{}'::jsonb), "
-                '\'{"access_level": "global", "department_ids": [], "user_uids": []}\'::jsonb), '
+                '\'{"access_levels": ["global"], "department_ids": [], "user_uids": []}\'::jsonb), '
                 "'manage_scope', COALESCE(NULLIF(share_config, '{}'::jsonb), "
-                '\'{"access_level": "global", "department_ids": [], "user_uids": []}\'::jsonb)) '
+                '\'{"access_levels": ["global"], "department_ids": [], "user_uids": []}\'::jsonb)) '
                 "WHERE share_config IS NULL OR share_config->>'version' IS DISTINCT FROM '2'"
             ),
             "ALTER TABLE IF EXISTS knowledge_bases ADD COLUMN IF NOT EXISTS mindmap JSONB",
@@ -960,13 +960,13 @@ class PostgresManager(metaclass=SingletonMeta):
             "ALTER TABLE IF EXISTS skills ADD COLUMN IF NOT EXISTS source_type VARCHAR(32) NOT NULL DEFAULT 'upload'",
             (
                 "ALTER TABLE IF EXISTS skills ADD COLUMN IF NOT EXISTS share_config JSONB NOT NULL "
-                'DEFAULT \'{"access_level": "user", "department_ids": [], "user_uids": []}\'::jsonb'
+                'DEFAULT \'{"access_levels": ["user"], "department_ids": [], "user_uids": []}\'::jsonb'
             ),
             "ALTER TABLE IF EXISTS skills ALTER COLUMN share_config TYPE JSONB USING share_config::jsonb",
             (
                 "UPDATE skills SET share_config = jsonb_build_object("
                 "'version', 2, 'read_scope', CASE WHEN share_config = '{}'::jsonb THEN jsonb_build_object("
-                "'access_level', 'user', 'department_ids', '[]'::jsonb, "
+                "'access_levels', jsonb_build_array('user'), 'department_ids', '[]'::jsonb, "
                 "'user_uids', jsonb_build_array(created_by)) ELSE share_config END, "
                 "'manage_scope', NULL) "
                 "WHERE share_config IS NOT NULL AND share_config->>'version' IS DISTINCT FROM '2'"
@@ -1023,7 +1023,7 @@ class PostgresManager(metaclass=SingletonMeta):
             (
                 "UPDATE agents SET share_config = jsonb_build_object("
                 "'version', 2, 'read_scope', CASE WHEN share_config = '{}'::jsonb THEN "
-                '\'{"access_level": "global", "department_ids": [], "user_uids": []}\'::jsonb '
+                '\'{"access_levels": ["global"], "department_ids": [], "user_uids": []}\'::jsonb '
                 "ELSE share_config END, 'manage_scope', NULL) "
                 "WHERE share_config IS NOT NULL AND share_config->>'version' IS DISTINCT FROM '2'"
             ),

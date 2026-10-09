@@ -211,16 +211,12 @@ class KnowledgeBaseManager:
 
         if share_config is None:
             creator_only_scope = (
-                {"access_level": "user", "department_ids": [], "user_uids": [str(user_uid)]} if user_uid else None
+                {"access_levels": ["user"], "department_ids": [], "user_uids": [str(user_uid)]} if user_uid else None
             )
             if scope == "personal":
                 read_scope = creator_only_scope
             elif department_id is not None:
-                read_scope = {
-                    "access_level": "department",
-                    "department_ids": [int(department_id)],
-                    "user_uids": [],
-                }
+                read_scope = {"access_levels": ["department"], "department_ids": [int(department_id)], "user_uids": []}
             else:
                 read_scope = creator_only_scope
             return {"version": 2, "read_scope": read_scope, "manage_scope": None}
@@ -233,10 +229,12 @@ class KnowledgeBaseManager:
             if normalized["read_scope"] is None and (user_uid is not None or department_id is not None):
                 raise ValueError("知识库必须设置读取范围")
             read_scope = normalized["read_scope"]
-            if read_scope and read_scope["access_level"] == "department" and department_id is not None:
-                read_scope["department_ids"] = sorted({*read_scope["department_ids"], int(department_id)})
-            elif read_scope and read_scope["access_level"] == "user" and user_uid:
-                read_scope["user_uids"] = sorted({*read_scope["user_uids"], str(user_uid)})
+            if read_scope:
+                levels = read_scope["access_levels"]
+                if "department" in levels and department_id is not None:
+                    read_scope["department_ids"] = sorted({*read_scope["department_ids"], int(department_id)})
+                if "user" in levels and user_uid:
+                    read_scope["user_uids"] = sorted({*read_scope["user_uids"], str(user_uid)})
             return normalized
 
         raise ValueError("知识库共享配置必须使用 version 2")
@@ -349,7 +347,7 @@ class KnowledgeBaseManager:
         if share_config is None:
             share_config = {
                 "version": 2,
-                "read_scope": {"access_level": "global", "department_ids": [], "user_uids": []},
+                "read_scope": {"access_levels": ["global"], "department_ids": [], "user_uids": []},
                 "manage_scope": None,
             }
 

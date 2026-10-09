@@ -32,7 +32,7 @@ async def _create_restricted_database(test_client, admin_headers):
             "share_config": {
                 "version": 2,
                 "read_scope": {
-                    "access_level": "user",
+                    "access_levels": ["user"],
                     "department_ids": [],
                     "user_uids": [owner_uid],
                 },
