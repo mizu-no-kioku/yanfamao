@@ -168,7 +168,7 @@ async def query_kb(kb_id: str, query_text: str, file_name: str | None = None, ru
         return await _get_knowledge_base().retrieve(target_kb_id, query_text, **kwargs)
     except Exception as e:
         logger.error(f"检索失败: {e}")
-        return f"检索失败: {str(e)}"
+        return "检索失败，请稍后重试"
 
 
 OpenKBDocumentInput = OpenInputSchema
@@ -208,9 +208,11 @@ async def open_kb_document(
             offset=start_offset,
             limit=window_size,
         )
+    except ValueError as e:
+        return str(e)
     except Exception as e:
         logger.error(f"打开知识库文档失败: {e}")
-        return f"打开知识库文档失败: {str(e)}"
+        return "打开知识库文档失败，请稍后重试"
 
 
 FindKBDocumentInput = FindInputSchema
@@ -255,9 +257,11 @@ async def find_kb_document(
             max_windows=max_windows,
             window_size=window_size,
         )
+    except ValueError as e:
+        return str(e)
     except Exception as e:
         logger.error(f"知识库文档内检索失败: {e}")
-        return f"知识库文档内检索失败: {str(e)}"
+        return "知识库文档内检索失败，请稍后重试"
 
 
 class SearchFileInput(BaseModel):
@@ -419,10 +423,6 @@ async def _resolve_visible_knowledge_bases_for_query(runtime: ToolRuntime | None
     context = getattr(runtime, "context", None)
     if context is None:
         return []
-
-    visible_kbs = getattr(context, "_visible_knowledge_bases", None)
-    if isinstance(visible_kbs, list):
-        return visible_kbs
 
     try:
         from yuxi.agents.backends.knowledge_base_backend import resolve_visible_knowledge_bases_for_context

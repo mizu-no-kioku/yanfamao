@@ -87,6 +87,7 @@ export default defineConfig({
         text: '高级配置',
         items: [
           { text: '配置系统详解', link: '/advanced/configuration' },
+          { text: '业务数据库接入', link: '/advanced/business-database' },
           { text: '生产部署', link: '/advanced/deployment' },
           { text: 'Agent 并发容量', link: '/advanced/agent-concurrency-capacity' },
           { text: '沙盒配置与运维', link: '/advanced/sandbox-operations' },

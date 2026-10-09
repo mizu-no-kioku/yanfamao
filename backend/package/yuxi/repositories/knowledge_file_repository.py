@@ -305,6 +305,7 @@ class KnowledgeFileRepository:
                 select(KnowledgeFile.file_id, KnowledgeFile.filename, KnowledgeFile.chunk_count).where(
                     KnowledgeFile.kb_id == kb_id,
                     KnowledgeFile.file_id.in_(normalized_ids),
+                    KnowledgeFile.status == "indexed",
                 )
             )
             return {
@@ -716,18 +717,14 @@ class KnowledgeFileRepository:
             "processing_count": int(row.processing_count or 0),
         }
 
-    async def upsert(self, file_id: str, data: dict[str, Any]) -> KnowledgeFile:
+    async def create(self, file_id: str, data: dict[str, Any]) -> KnowledgeFile:
+        """创建新文件记录；身份冲突由数据库唯一约束显式拒绝。"""
         sanitized_data = self._sanitize_data(data)
         async with pg_manager.get_async_session_context() as session:
-            result = await session.execute(select(KnowledgeFile).where(KnowledgeFile.file_id == file_id))
-            existing = result.scalar_one_or_none()
-            if existing is None:
-                record = KnowledgeFile(file_id=file_id, **sanitized_data)
-                session.add(record)
-                return record
-            for key, value in sanitized_data.items():
-                setattr(existing, key, value)
-            return existing
+            record = KnowledgeFile(file_id=file_id, **sanitized_data)
+            session.add(record)
+            await session.flush()
+            return record
 
     async def update_fields(
         self,

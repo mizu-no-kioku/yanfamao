@@ -9,6 +9,7 @@ from datetime import timedelta
 
 import pytest
 from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from yuxi.knowledge.eval.service import EvaluationService, finish_dataset_generation_task
@@ -828,6 +829,45 @@ async def test_payload_lookup_finds_active_task_beyond_recent_history_window(dur
     assert any(task["id"] == target_id for task in listing["tasks"])
     assert listing["summary"]["total"] == 251
     assert listing["summary"]["status_counts"]["pending"] == 1
+
+
+async def test_task_listing_and_summary_are_scoped_by_operator(durable_task_schema) -> None:
+    repo = TaskRepository()
+    owned_id = uuid.uuid4().hex
+    foreign_id = uuid.uuid4().hex
+    await repo.create(
+        owned_id,
+        {**_task_data(), "status": "success", "payload": {"operator_id": "user-1"}},
+    )
+    await repo.create(
+        foreign_id,
+        {**_task_data(), "status": "success", "payload": {"operator_id": "user-2"}},
+    )
+
+    records = await repo.list(operator_id="user-1")
+    summary = await repo.summarize(operator_id="user-1")
+
+    assert [record.id for record in records] == [owned_id]
+    assert summary["total"] == 1
+    assert summary["status_counts"] == {"success": 1}
+    assert summary["type_counts"] == {"knowledge_parse": 1}
+
+
+async def test_knowledge_file_create_rejects_identity_collision(durable_task_schema) -> None:
+    kb_id = f"kb_{uuid.uuid4().hex[:8]}"
+    file_id = f"file_{uuid.uuid4().hex}"
+    async with durable_task_schema.get_async_session_context() as session:
+        session.add(KnowledgeBase(kb_id=kb_id, name="pytest", kb_type="milvus"))
+
+    repo = KnowledgeFileRepository()
+    await repo.create(file_id, {"kb_id": kb_id, "filename": "original.txt", "status": "uploaded"})
+
+    with pytest.raises(IntegrityError):
+        await repo.create(file_id, {"kb_id": kb_id, "filename": "replacement.txt", "status": "uploaded"})
+
+    persisted = await repo.get_by_file_id(file_id)
+    assert persisted is not None
+    assert persisted.filename == "original.txt"
 
 
 async def test_concurrent_dedupe_creates_one_active_task(durable_task_schema) -> None:

@@ -1,9 +1,9 @@
 import hashlib
-import time
+import uuid
 from urllib.parse import quote
 
 from yuxi.knowledge.chunking.ragflow_like.presets import resolve_chunk_processing_params
-from yuxi.utils import hashstr, logger
+from yuxi.utils import logger
 from yuxi.utils.datetime_utils import utc_isoformat
 
 _DROPPED_PROCESSING_PARAM_KEYS = {
@@ -14,6 +14,11 @@ _DROPPED_PROCESSING_PARAM_KEYS = {
     "enable_ocr",
     "ocr_engine_config",
 }
+
+
+def new_file_id() -> str:
+    """生成不可预测且具有充足全局空间的文件身份。"""
+    return f"file_{uuid.uuid4().hex}"
 
 
 def sanitize_processing_params(params: dict | None) -> dict | None:
@@ -85,9 +90,7 @@ async def prepare_item_metadata(item: str, content_type: str, kb_id: str, params
         item_path = pre_info["path"]  # MinIO path
         content_hash = pre_info["content_hash"]
 
-        # 使用 item(url) 生成 ID，保证同一 URL 即使多次添加 ID 也不同（配合 time）
-        # 或者我们应该基于 hash？不，基于 time 更符合上传逻辑
-        file_id = f"file_{hashstr(item + str(time.time()), 6)}"
+        file_id = new_file_id()
 
         metadata = {
             "kb_id": kb_id,
@@ -143,7 +146,7 @@ async def prepare_item_metadata(item: str, content_type: str, kb_id: str, params
         if not isinstance(file_sizes, dict):
             file_sizes = {}
         file_size = file_sizes.get(item)
-        file_id = f"file_{hashstr(str(item_path) + str(time.time()), 6)}"
+        file_id = new_file_id()
 
     else:
         raise ValueError(f"Unsupported content_type: {content_type}")
@@ -297,3 +300,27 @@ def parse_minio_url(file_path: str) -> tuple[str, str]:
     except Exception as e:
         logger.error(f"Failed to parse MinIO URL {file_path}: {e}")
         raise ValueError(f"无法解析MinIO URL: {file_path}")
+
+
+def parse_owned_kb_minio_url(
+    file_path: str,
+    kb_id: str,
+    *,
+    expected_bucket: str,
+    required_section: str | None = None,
+) -> tuple[str, str]:
+    """解析并校验知识库对象存储路径的归属边界。"""
+
+    bucket_name, object_name = parse_minio_url(file_path)
+    segments = object_name.split("/")
+    if bucket_name != expected_bucket:
+        raise ValueError("对象存储 bucket 不属于当前知识库文档")
+    if any(not segment or segment in {".", ".."} for segment in segments):
+        raise ValueError("对象存储路径不合法")
+
+    expected_prefix = [kb_id]
+    if required_section:
+        expected_prefix.append(required_section)
+    if segments[: len(expected_prefix)] != expected_prefix:
+        raise ValueError("对象存储路径不属于当前知识库")
+    return bucket_name, object_name

@@ -9,6 +9,7 @@ import pytest
 from yuxi.knowledge.graphs.extractors import (
     GraphExtractorFactory,
     LLMGraphExtractor,
+    MAX_EXTRACTION_CONCURRENCY,
     normalize_extraction_result,
 )
 from yuxi.knowledge.graphs.extractors.base import (
@@ -251,6 +252,15 @@ def test_llm_graph_extractor_rejects_custom_prompt():
     extractor = LLMGraphExtractor({"model_spec": "test/model", "prompt": "custom"})
 
     with pytest.raises(ValueError, match="不支持自定义完整 Prompt"):
+        extractor.validate_options()
+
+
+def test_llm_graph_extractor_rejects_excessive_concurrency():
+    extractor = LLMGraphExtractor(
+        {"model_spec": "test/model", "concurrency_count": MAX_EXTRACTION_CONCURRENCY + 1}
+    )
+
+    with pytest.raises(ValueError, match="concurrency_count"):
         extractor.validate_options()
 
 
@@ -993,7 +1003,11 @@ async def test_milvus_graph_service_configure_persists_updated_concurrency():
             "graph_build_config": {
                 "locked": True,
                 "extractor_type": "llm",
-                "extractor_options": {"model_spec": "test/model", "concurrency_count": 5},
+                "extractor_options": {
+                    "model_spec": "test/model",
+                    "concurrency_count": 5,
+                    "model_params": {"api_key": "secret", "temperature": 0.1},
+                },
             }
         },
     )
@@ -1024,12 +1038,18 @@ async def test_milvus_graph_service_configure_persists_updated_concurrency():
     await service.configure(
         "kb_test",
         extractor_type="llm",
-        extractor_options={"model_spec": "test/model", "concurrency_count": 9},
+        extractor_options={
+            "model_spec": "test/model",
+            "concurrency_count": 9,
+            "model_params": {"api_key": "secret", "temperature": 0.1},
+        },
         created_by="user_1",
     )
     status = await service.get_status("kb_test")
 
     assert status["config"]["extractor_options"]["concurrency_count"] == 9
+    assert "api_key" not in status["config"]["extractor_options"].get("model_params", {})
+    assert status["config"]["extractor_options"]["model_params"]["temperature"] == 0.1
     assert status["entity_count"] == 3
     assert status["relationship_count"] == 2
 
@@ -1264,6 +1284,9 @@ def test_build_subgraph_cypher_start_only_traverses_relations_from_anchor():
     assert "[:RELATION*1..2 {kb_id: $kb_id}]" in cypher
     assert "$end_id" not in cypher
     assert "all(n IN nodes(p) WHERE n = s OR n.label IN $entity_types)" in cypher
+    assert "OPTIONAL MATCH p" in cypher
+    assert "+ [s] AS nodes" in cypher
+    assert "CASE WHEN size(paths) = 0 THEN [null]" in cypher
 
 
 def test_build_subgraph_cypher_start_and_end_exempts_both_anchor_entities():
@@ -1288,6 +1311,8 @@ def test_build_subgraph_cypher_without_start_collects_seeds():
     assert "WITH seed LIMIT $max_nodes" in cypher
     assert "UNWIND seeds AS s" in cypher
     assert "+ [x IN seeds WHERE x IS NOT NULL] AS nodes" in cypher
+    assert "OPTIONAL MATCH p" in cypher
+    assert "CASE WHEN size(paths) = 0 THEN [null]" in cypher
 
 
 def test_build_subgraph_cypher_maps_types_to_set_membership():

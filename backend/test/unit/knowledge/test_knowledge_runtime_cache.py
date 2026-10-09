@@ -33,6 +33,11 @@ class _FakeKnowledgeBase:
     def get_default_query_params(_kb_id: str):
         return {"options": {}}
 
+    @staticmethod
+    def validate_query_params(_kb_id: str, params: dict, *, allowed_extra_keys=None):
+        del allowed_extra_keys
+        return dict(params)
+
 
 def _patch_supported_type(monkeypatch):
     monkeypatch.setattr(

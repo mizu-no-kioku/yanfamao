@@ -1,6 +1,20 @@
 import pytest
 
-from yuxi.knowledge.utils.kb_utils import build_kb_image_proxy_url, prepare_item_metadata
+from yuxi.knowledge.utils.kb_utils import (
+    build_kb_image_proxy_url,
+    new_file_id,
+    parse_owned_kb_minio_url,
+    prepare_item_metadata,
+)
+
+
+def test_new_file_id_has_full_uuid_entropy_and_is_unique():
+    first = new_file_id()
+    second = new_file_id()
+
+    assert first.startswith("file_")
+    assert len(first) == len("file_") + 32
+    assert first != second
 
 
 def test_build_kb_image_proxy_url_uses_private_bucket_proxy_path():
@@ -19,6 +33,33 @@ def test_build_kb_image_proxy_url_encodes_special_chars_but_keeps_slashes():
 def test_build_kb_image_proxy_url_rejects_invalid_object_name(object_name):
     with pytest.raises(ValueError, match="知识库图片对象名"):
         build_kb_image_proxy_url(object_name)
+
+
+def test_parse_owned_kb_minio_url_accepts_current_kb_upload():
+    assert parse_owned_kb_minio_url(
+        "minio://knowledgebases/kb-1/upload/a.txt",
+        "kb-1",
+        expected_bucket="knowledgebases",
+        required_section="upload",
+    ) == ("knowledgebases", "kb-1/upload/a.txt")
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "minio://knowledgebases/kb-2/upload/a.txt",
+        "minio://knowledgebases/kb-1/../kb-2/a.txt",
+        "minio://parsed/kb-1/upload/a.txt",
+    ],
+)
+def test_parse_owned_kb_minio_url_rejects_foreign_or_unsafe_object(url):
+    with pytest.raises(ValueError):
+        parse_owned_kb_minio_url(
+            url,
+            "kb-1",
+            expected_bucket="knowledgebases",
+            required_section="upload",
+        )
 
 
 async def test_prepare_item_metadata_preserves_uploaded_file_size():

@@ -202,6 +202,25 @@ async def test_notion_find_file_content_uses_page_markdown(monkeypatch, notion_k
 
 
 @pytest.mark.asyncio
+async def test_notion_page_cache_is_scoped_to_token(monkeypatch, notion_kb):
+    kb, config = notion_kb
+    seen_tokens = []
+
+    class TokenAwareClient(_FakeNotionClient):
+        async def retrieve_page(self, page_id: str) -> dict:
+            seen_tokens.append(self.token)
+            return await super().retrieve_page(page_id)
+
+    monkeypatch.setattr("yuxi.knowledge.implementations.notion._NotionClient", TokenAwareClient)
+
+    await kb.open_file_content("kb_notion", PAGE_ID, additional_params=config.additional_params)
+    rotated_params = {**config.additional_params, "notion_token": "rotated-token"}
+    await kb.open_file_content("kb_notion", PAGE_ID, additional_params=rotated_params)
+
+    assert seen_tokens == ["token", "rotated-token"]
+
+
+@pytest.mark.asyncio
 async def test_notion_open_file_content_rejects_unknown_parent(monkeypatch, notion_kb):
     kb, config = notion_kb
     monkeypatch.setattr("yuxi.knowledge.implementations.notion._NotionClient", _UnknownParentNotionClient)

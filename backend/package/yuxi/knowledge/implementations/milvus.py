@@ -20,6 +20,7 @@ from pymilvus import (
     db,
     utility,
 )
+from pymilvus.exceptions import MilvusException
 
 from yuxi.config.options import system_options
 from yuxi.knowledge.base import FileStatus, KnowledgeBase
@@ -372,17 +373,16 @@ class MilvusKB(KnowledgeBase):
                 expected_model = embedding_info.model_id
 
                 if expected_model not in description:
-                    logger.warning(
-                        f"Collection {collection_name} model mismatch: "
-                        f"expected='{expected_model}', found_in_description='{description}'"
+                    raise RuntimeError(
+                        f"Milvus collection {collection_name} 使用了不兼容的嵌入模型；"
+                        "请通过受控重建流程迁移，现有集合未被修改"
                     )
-                    utility.drop_collection(collection_name, using=self.connection_alias)
-                    return self._create_new_collection(collection_name, embedding_info, kb_id)
 
                 if not self._collection_supports_bm25(collection):
-                    logger.warning(f"Collection {collection_name} schema does not support BM25, recreating")
-                    utility.drop_collection(collection_name, using=self.connection_alias)
-                    return self._create_new_collection(collection_name, embedding_info, kb_id)
+                    raise RuntimeError(
+                        f"Milvus collection {collection_name} 缺少 BM25 schema；"
+                        "请通过受控重建流程迁移，现有集合未被修改"
+                    )
 
                 logger.info(f"Retrieved existing collection: {collection_name}")
                 return collection
@@ -390,7 +390,7 @@ class MilvusKB(KnowledgeBase):
                 logger.info(f"Collection {collection_name} not found, creating new one")
                 return self._create_new_collection(collection_name, embedding_info, kb_id)
 
-        except (connections.MilvusException, RuntimeError) as e:
+        except (MilvusException, RuntimeError) as e:
             logger.error(f"Error checking collection {collection_name}: {e}")
             raise
         except Exception as e:
@@ -772,6 +772,7 @@ class MilvusKB(KnowledgeBase):
 
         logger.debug(f"[index_file] file_id={file_id}, processing_params={params}")
 
+        chunks_replaced = False
         try:
             chunk_parser_config = dict(params.get("chunk_parser_config") or {})
             chunk_parser_config.setdefault("embed_model_id", (await system_options.get())["embed_model"])
@@ -792,6 +793,7 @@ class MilvusKB(KnowledgeBase):
 
             # Clean up existing chunks if any (for re-indexing)
             await self.delete_file_chunks_only(kb_id, file_id)
+            chunks_replaced = True
 
             if chunks:
                 await self._embed_and_store_chunks(kb_id, file_id, collection, chunks, embedding_function)
@@ -826,6 +828,11 @@ class MilvusKB(KnowledgeBase):
                     current_task.uncancel()
             error_msg = "File indexing was cancelled" if isinstance(e, asyncio.CancelledError) else str(e)
             logger.error(f"Indexing failed for {file_id}: {error_msg}")
+            if chunks_replaced:
+                try:
+                    await self.delete_file_chunks_only(kb_id, file_id)
+                except Exception as cleanup_error:  # noqa: BLE001
+                    logger.error(f"Failed to clean partial chunks for {file_id}: {cleanup_error}")
             update_data = {
                 "status": FileStatus.ERROR_INDEXING,
                 "error_message": error_msg,

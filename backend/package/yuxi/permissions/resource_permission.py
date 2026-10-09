@@ -182,7 +182,7 @@ def resolve_resource_permission(
         raw_share_config,
     )
     if str(_value(resource, "created_by", "") or "") == str(_value(user, "uid", "") or ""):
-        return ResourcePermission.MANAGE
+        granted = ResourcePermission.MANAGE
     elif scope_matches(user, config["manage_scope"]) and (
         config["read_scope"] is None or scope_matches(user, config["read_scope"])
     ):
@@ -192,7 +192,7 @@ def resolve_resource_permission(
     else:
         granted = ResourcePermission.NONE
 
-    ceiling = policy.role_ceiling.get(_value(user, "role"), ResourcePermission.READ)
+    ceiling = policy.role_ceiling.get(_value(user, "role"), ResourcePermission.NONE)
     return _minimum_permission(granted, ceiling)
 
 
@@ -214,8 +214,7 @@ def resolve_knowledge_base_permission(user: Any, resource: ShareableResource) ->
     的字面值放行，一旦个人库的 read_scope 被误设成 global 或 department，陌生人就会拿到
     READ，个人库的可见性边界会被它自己的 share_config 悄悄撑破；因此除 user 级定向分享外
     一律 NONE。超管的放行与通用路径同形，且同样早于个人库判定，否则超管也会被夹成 NONE
-    而看不到别人的个人库。共享库交回通用判定，其余行为与通用路径一致（含创建者早于角色
-    上限返回这一条）。
+    而看不到别人的个人库。共享库交回通用判定，创建者也会受当前角色上限约束。
     """
 
     if _value(user, "role") == "superadmin":

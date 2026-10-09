@@ -3,6 +3,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from yuxi.knowledge import base as knowledge_base_module
 from yuxi.knowledge.base import KnowledgeBase
 from yuxi.knowledge.chunking.ragflow_like.nlp import count_tokens
 from yuxi.knowledge.manager import KnowledgeBaseManager
@@ -40,6 +41,25 @@ class FakeKnowledgeBase(KnowledgeBase):
 
     async def get_file_info(self, slug: str, file_id: str) -> dict:
         return {}
+
+
+def test_find_file_windows_rejects_excessive_regex_patterns(tmp_path):
+    kb = make_kb(tmp_path)
+
+    with pytest.raises(ValueError, match="patterns 最多允许"):
+        kb._build_find_file_windows("text", patterns=["x"] * 21, use_regex=True)
+
+
+def test_find_file_windows_fails_when_regex_match_times_out(monkeypatch, tmp_path):
+    class TimeoutMatcher:
+        def search(self, _line, *, timeout):
+            raise TimeoutError
+
+    monkeypatch.setattr(knowledge_base_module.safe_regex, "compile", lambda *_args, **_kwargs: TimeoutMatcher())
+    kb = make_kb(tmp_path)
+
+    with pytest.raises(ValueError, match="正则表达式检索超时"):
+        kb._build_find_file_windows("text", patterns=["(x+)+$"], use_regex=True)
 
 
 def make_kb(tmp_path):
@@ -225,6 +245,13 @@ async def test_create_database_persists_allowed_record_fields(tmp_path, monkeypa
     assert "created_by" not in payload["additional_params"]
     assert result.kb_id.startswith("kb_")
     assert not hasattr(kb, "_runtime_configs")
+
+
+async def test_base_export_reports_not_implemented(tmp_path):
+    kb = FakeKnowledgeBase(str(tmp_path))
+
+    with pytest.raises(NotImplementedError, match="暂不支持导出"):
+        await kb.export_data("db", format="csv")
 
 
 async def test_manager_refresh_database_stats_persists_metadata(tmp_path, monkeypatch):

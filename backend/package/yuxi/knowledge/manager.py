@@ -176,6 +176,8 @@ class KnowledgeBaseManager:
         executor = await self._get_or_create_kb_instance(kb_type)
         additional_params = executor.normalize_additional_params(snapshot.get("additional_params"))
         additional_params.pop("stats", None)
+        if kb_type == "notion" and snapshot.get("scope") == "personal" and not additional_params.get("notion_token"):
+            raise ValueError("个人 Notion 知识库必须配置独立的 notion_token")
         return KnowledgeBaseConfig(
             kb_id=kb_id,
             kb_type=kb_type,
@@ -583,6 +585,8 @@ class KnowledgeBaseManager:
         if "reranker_config" in additional_params:
             raise ValueError("reranker_config 已移除，请在查询参数中使用 reranker_model spec")
         additional_params = kb_instance.normalize_additional_params(additional_params)
+        if kb_type == "notion" and scope == "personal" and not additional_params.get("notion_token"):
+            raise ValueError("个人 Notion 知识库必须配置独立的 notion_token")
 
         if kb_instance.requires_embedding_model:
             if not embedding_model_spec:
@@ -624,7 +628,7 @@ class KnowledgeBaseManager:
         )
         os.makedirs(os.path.join(kb_instance.work_dir, kb_id), exist_ok=True)
 
-        logger.info(f"Created {kb_type} database: {database_name} ({kb_id}) with {additional_params}")
+        logger.info(f"Created {kb_type} database: {database_name} ({kb_id})")
         database = await self.get_database_info(kb_id)
         if database is None:
             raise KBNotFoundError(f"Database {kb_id} not found after creation")
@@ -635,9 +639,14 @@ class KnowledgeBaseManager:
         from yuxi.repositories.knowledge_base_repository import KnowledgeBaseRepository
 
         try:
-            kb_instance = await self.get_kb_executor(kb_id)
+            repository = KnowledgeBaseRepository()
+            record = await repository.get_by_kb_id(kb_id)
+            if record is None:
+                return {"message": "删除成功"}
+            # 清理只需要资源类型，失效查询凭据不能阻断删除。
+            kb_instance = await self._get_or_create_kb_instance(record.kb_type or "milvus")
             result = await kb_instance.cleanup_database_resources(kb_id)
-            await KnowledgeBaseRepository().delete(kb_id)
+            await repository.delete(kb_id)
             return result
         except KBNotFoundError as e:
             logger.warning(f"Database {kb_id} not found during deletion: {e}")
@@ -727,11 +736,13 @@ class KnowledgeBaseManager:
         """异步查询知识库"""
         config = await self.get_kb_config(kb_id)
         executor = await self._get_or_create_kb_instance(config.kb_type)
+        executor.validate_query_params(kb_id, config.query_options)
+        query_options = executor.validate_query_params(kb_id, kwargs, allowed_extra_keys={"file_name"})
         return await executor.aquery(
             query_text,
             kb_id,
             config=config,
-            **kwargs,
+            **query_options,
         )
 
     async def get_kb_query_params_config(self, kb_id: str) -> dict:
@@ -749,7 +760,10 @@ class KnowledgeBaseManager:
         """合并并持久化知识库查询参数。"""
         from yuxi.repositories.knowledge_base_repository import KnowledgeBaseRepository
 
-        kb = await KnowledgeBaseRepository().merge_query_params_options(kb_id, params)
+        config = await self.get_kb_config(kb_id)
+        executor = await self._get_or_create_kb_instance(config.kb_type)
+        validated_params = executor.validate_query_params(kb_id, params)
+        kb = await KnowledgeBaseRepository().merge_query_params_options(kb_id, validated_params)
         if kb is None:
             raise KBNotFoundError(f"Database {kb_id} not found")
 
@@ -1227,6 +1241,12 @@ class KnowledgeBaseManager:
             merged_additional_params = kb_class.normalize_additional_params(
                 deep_merge(current_additional_params, additional_params)
             )
+            if (
+                kb_type == "notion"
+                and (kb.scope or "shared") == "personal"
+                and not merged_additional_params.get("notion_token")
+            ):
+                raise ValueError("个人 Notion 知识库必须配置独立的 notion_token")
             update_data["additional_params"] = merged_additional_params
 
         if share_config is not None:
@@ -1253,12 +1273,14 @@ class KnowledgeBaseManager:
         """按 kb_id 加载最新运行时元数据并执行检索。"""
         config = await self.get_kb_config(kb_id)
         executor = await self._get_or_create_kb_instance(config.kb_type)
+        executor.validate_query_params(kb_id, config.query_options)
+        query_options = executor.validate_query_params(kb_id, options, allowed_extra_keys={"file_name"})
         results = await executor.aquery(
             query,
             kb_id,
             config=config,
             agent_call=True,
-            **options,
+            **query_options,
         )
         return executor.build_search_output(kb_id, results)
 

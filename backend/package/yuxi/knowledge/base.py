@@ -1,10 +1,12 @@
 import asyncio
+import math
 import mimetypes
 import os
-import re
+import time
 from abc import ABC, abstractmethod
 from typing import Any
 
+import regex as safe_regex
 from yuxi.knowledge.chunking.ragflow_like.presets import ensure_chunk_defaults_in_additional_params
 from yuxi.knowledge.read_models import KnowledgeBaseConfig
 from yuxi.knowledge.schemas import (
@@ -29,6 +31,9 @@ class FileStatus:
 
 
 INDEXED_STATS_STATUSES = {FileStatus.INDEXED, "done"}
+MAX_FIND_PATTERNS = 20
+MAX_FIND_REGEX_PATTERN_LENGTH = 256
+FIND_REGEX_TOTAL_TIMEOUT_SECONDS = 0.5
 
 
 def _should_repair_file_stats(file_meta: dict) -> bool:
@@ -660,14 +665,31 @@ class KnowledgeBase(ABC):
         patterns = [pattern for pattern in patterns if pattern]
         if not patterns:
             raise ValueError("请提供至少一个 pattern")
+        if len(patterns) > MAX_FIND_PATTERNS:
+            raise ValueError(f"patterns 最多允许 {MAX_FIND_PATTERNS} 项")
 
         lines = content.splitlines()
-        flags = 0 if case_sensitive else re.IGNORECASE
+        flags = 0 if case_sensitive else safe_regex.IGNORECASE
         if use_regex:
-            matchers = [re.compile(pattern, flags) for pattern in patterns]
+            if any(len(pattern) > MAX_FIND_REGEX_PATTERN_LENGTH for pattern in patterns):
+                raise ValueError(f"正则表达式长度不得超过 {MAX_FIND_REGEX_PATTERN_LENGTH} 字符")
+            try:
+                matchers = [safe_regex.compile(pattern, flags) for pattern in patterns]
+            except safe_regex.error as exc:
+                raise ValueError(f"无效的正则表达式: {exc}") from exc
+            deadline = time.monotonic() + FIND_REGEX_TOTAL_TIMEOUT_SECONDS
 
             def line_matches(line: str) -> bool:
-                return any(matcher.search(line) for matcher in matchers)
+                for matcher in matchers:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise ValueError("正则表达式检索超时")
+                    try:
+                        if matcher.search(line, timeout=min(remaining, 0.05)):
+                            return True
+                    except TimeoutError as exc:
+                        raise ValueError("正则表达式检索超时") from exc
+                return False
 
         else:
             normalized_patterns = patterns if case_sensitive else [pattern.lower() for pattern in patterns]
@@ -716,13 +738,13 @@ class KnowledgeBase(ABC):
         try:
             file_meta = await self._load_file_meta(kb_id, file_id)
         except ValueError as exc:
-            raise Exception(f"文件不存在: {file_id}") from exc
+            raise ValueError(f"文件不存在: {file_id}") from exc
         if file_meta.get("is_folder"):
-            raise Exception(f"文件 {file_id} 是文件夹")
+            raise ValueError(f"文件 {file_id} 是文件夹")
 
         markdown_file = file_meta.get("markdown_file")
         if not markdown_file:
-            raise Exception(f"文件 {file_id} 没有解析后的 Markdown 内容")
+            raise ValueError(f"文件 {file_id} 没有解析后的 Markdown 内容")
 
         content = await self._read_markdown_from_minio(markdown_file)
         return self._build_open_file_window(content, offset=offset, limit=limit)
@@ -741,13 +763,13 @@ class KnowledgeBase(ABC):
         try:
             file_meta = await self._load_file_meta(kb_id, file_id)
         except ValueError as exc:
-            raise Exception(f"文件不存在: {file_id}") from exc
+            raise ValueError(f"文件不存在: {file_id}") from exc
         if file_meta.get("is_folder"):
-            raise Exception(f"文件 {file_id} 是文件夹")
+            raise ValueError(f"文件 {file_id} 是文件夹")
 
         markdown_file = file_meta.get("markdown_file")
         if not markdown_file:
-            raise Exception(f"文件 {file_id} 没有解析后的 Markdown 内容")
+            raise ValueError(f"文件 {file_id} 没有解析后的 Markdown 内容")
 
         content = await self._read_markdown_from_minio(markdown_file)
         return self._build_find_file_windows(
@@ -963,7 +985,9 @@ class KnowledgeBase(ABC):
         pass
 
     async def export_data(self, kb_id: str, format: str = "zip", **kwargs) -> str:
-        pass
+        """明确声明知识库实现尚未提供导出能力。"""
+        del kb_id, format, kwargs
+        raise NotImplementedError("当前知识库类型暂不支持导出")
 
     def get_default_query_params(self, kb_id: str) -> dict[str, Any]:
         """从 get_query_params_config 中提取所有参数的默认值，返回 {"options": {...}}"""
@@ -973,6 +997,69 @@ class KnowledgeBase(ABC):
             if "default" in opt:
                 defaults[opt["key"]] = opt["default"]
         return {"options": defaults}
+
+    def validate_query_params(
+        self,
+        kb_id: str,
+        params: dict[str, Any],
+        *,
+        allowed_extra_keys: set[str] | None = None,
+    ) -> dict[str, Any]:
+        """按实现声明的查询配置校验类型、枚举和资源上限。"""
+        if not isinstance(params, dict):
+            raise ValueError("查询参数必须是对象")
+
+        option_definitions = {
+            str(option["key"]): option
+            for option in self.get_query_params_config(kb_id).get("options", [])
+            if option.get("key")
+        }
+        allowed_extra_keys = allowed_extra_keys or set()
+        unknown_keys = set(params) - set(option_definitions) - allowed_extra_keys
+        if unknown_keys:
+            raise ValueError(f"不支持的查询参数: {', '.join(sorted(unknown_keys))}")
+
+        validated: dict[str, Any] = {}
+        for key, value in params.items():
+            if key in allowed_extra_keys:
+                if key == "file_name" and value is not None and not isinstance(value, str):
+                    raise ValueError("查询参数 file_name 必须是字符串")
+                validated[key] = value
+                continue
+
+            definition = option_definitions[key]
+            option_type = definition.get("type")
+            if option_type == "boolean":
+                if not isinstance(value, bool):
+                    raise ValueError(f"查询参数 {key} 必须是布尔值")
+            elif option_type == "number":
+                if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+                    raise ValueError(f"查询参数 {key} 必须是有限数值")
+                minimum = definition.get("min")
+                maximum = definition.get("max")
+                if minimum is not None and value < minimum:
+                    raise ValueError(f"查询参数 {key} 不能小于 {minimum}")
+                if maximum is not None and value > maximum:
+                    raise ValueError(f"查询参数 {key} 不能大于 {maximum}")
+                default = definition.get("default")
+                if isinstance(default, int) and not isinstance(default, bool):
+                    if not float(value).is_integer():
+                        raise ValueError(f"查询参数 {key} 必须是整数")
+                    value = int(value)
+            elif option_type == "select":
+                choices = {option.get("value") for option in definition.get("options", [])}
+                # 动态 options（例如「当前可用的重排序模型」）随部署变化，实现用空值或
+                # 字段自身的默认值表示“未选择”；把实现声明的默认值判成非法会让默认配置
+                # 的知识库无法检索，因此这里只对显式选了具体值的参数做枚举校验。
+                if value is None or value == "" or value == definition.get("default"):
+                    pass
+                elif choices and value not in choices:
+                    raise ValueError(f"查询参数 {key} 取值无效")
+                elif not choices and not isinstance(value, str):
+                    raise ValueError(f"查询参数 {key} 必须是字符串")
+
+            validated[key] = value
+        return validated
 
     async def repair_missing_file_stats(self, kb_id: str) -> dict:
         from yuxi.knowledge.chunking.ragflow_like.nlp import count_tokens
@@ -1227,4 +1314,4 @@ class KnowledgeBase(ABC):
         data = self._file_meta_to_record_data(meta)
         if not data.get("kb_id"):
             return
-        await KnowledgeFileRepository().upsert(file_id=file_id, data=data)
+        await KnowledgeFileRepository().create(file_id=file_id, data=data)

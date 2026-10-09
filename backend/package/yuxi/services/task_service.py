@@ -6,6 +6,7 @@ import json
 import math
 import os
 import uuid
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from functools import partial
 from typing import Any
@@ -137,6 +138,13 @@ class Tasker:
         self.default_timeout_seconds = self._validate_timeout_seconds(default_timeout_seconds)
         self._repo = TaskRepository()
 
+    @asynccontextmanager
+    async def lock_resource(self, key: str):
+        """在检查与副作用之间保持跨进程互斥。"""
+
+        async with self._repo.advisory_lock(key):
+            yield
+
     async def enqueue(
         self,
         *,
@@ -239,11 +247,17 @@ class Tasker:
         )
         return Task.from_dict(record.to_dict()) if record else None
 
-    async def list_tasks(self, status: str | None = None, limit: int = 100) -> dict[str, Any]:
-        records = await self._repo.list(status=status, limit=limit)
+    async def list_tasks(
+        self,
+        status: str | None = None,
+        limit: int = 100,
+        *,
+        operator_id: str | None = None,
+    ) -> dict[str, Any]:
+        records = await self._repo.list(status=status, limit=limit, operator_id=operator_id)
         return {
             "tasks": [record.to_summary_dict() for record in records],
-            "summary": await self._repo.summarize(status=status),
+            "summary": await self._repo.summarize(status=status, operator_id=operator_id),
         }
 
     async def get_task(self, task_id: str) -> dict[str, Any] | None:

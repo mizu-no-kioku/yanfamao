@@ -85,8 +85,10 @@ class FakeRepo:
     async def get_by_id(self, task_id: str):
         return self.record if self.record and self.record.id == task_id else None
 
-    async def list(self, status=None, limit=100):
+    async def list(self, status=None, limit=100, *, operator_id=None):
         if self.record is None or (status and self.record.status != status):
+            return []
+        if operator_id is not None and str(self.record.payload.get("operator_id") or "") != operator_id:
             return []
         return [self.record]
 

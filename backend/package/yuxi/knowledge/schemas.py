@@ -25,7 +25,7 @@ class SearchOutputSchema(BaseModel):
 class FindInputSchema(BaseModel):
     kb_id: str = Field(description="知识库资源 ID，也就是 kb_id")
     file_id: str = Field(description="要检索的文件 ID")
-    patterns: list[str] = Field(description="关键词或正则模式列表，至少提供一个")
+    patterns: list[str] = Field(min_length=1, max_length=20, description="关键词或正则模式列表")
     use_regex: bool = Field(default=False, description="是否将 patterns 作为正则表达式处理")
     case_sensitive: bool = Field(default=False, description="是否区分大小写")
     max_windows: int = Field(default=5, ge=1, le=20, description="最多返回的上下文窗口数量")

@@ -24,6 +24,8 @@ YanfaMao is built for teams that need control over their data, models, and permi
 
 ## Tech Stack
 
+Optional business database tools let agents discover authorized tables, inspect visible columns, and query an external MySQL database. Supported tables are `t_project` and `t_project_user`; the server enforces tenant, staff, project, column, and row limits. See [Business database setup (Chinese)](docs/advanced/business-database.md).
+
 | Layer | Technologies |
 | --- | --- |
 | Frontend | Vue 3 · Vite · Ant Design · G6 |
@@ -71,6 +73,8 @@ Once the returned `status` is `ready`, open [http://localhost:5173](http://local
 When upgrading from v0.7.1 or v0.7.2 to the current version, do not run `docker compose up` directly. Read the [production deployment and upgrade guide](docs/advanced/deployment.md) first, and complete the backup and migration during a maintenance window.
 
 ## Documentation
+
+- [Business database setup (Chinese)](docs/advanced/business-database.md): Configure read-only MySQL access, user identity mappings, and agent tools.
 
 - [Project overview](https://xerrors.github.io/Yuxi/intro/project-overview): Capabilities, concepts, and system boundaries.
 - [Quick start](https://xerrors.github.io/Yuxi/intro/quick-start): Set up a local environment from scratch.

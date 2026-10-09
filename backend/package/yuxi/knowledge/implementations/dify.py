@@ -1,10 +1,12 @@
 import traceback
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 
 from yuxi.knowledge.implementations.read_only_connectors import ReadOnlyConnectors
 from yuxi.knowledge.read_models import KnowledgeBaseConfig
+from yuxi.knowledge.utils.url_fetcher import SSRFGuardTransport
 from yuxi.utils import logger
 
 DIFY_REQUIRED_PARAMS = ("dify_api_url", "dify_token", "dify_dataset_id")
@@ -62,6 +64,13 @@ class DifyKB(ReadOnlyConnectors):
         params["dify_dataset_id"] = str(params.get("dify_dataset_id") or "").strip()
         if not params["dify_api_url"].endswith("/v1"):
             raise ValueError("Dify api_url 必须以 /v1 结尾")
+        parsed_url = urlsplit(params["dify_api_url"])
+        if parsed_url.scheme not in {"http", "https"} or not parsed_url.hostname:
+            raise ValueError("Dify api_url 必须是有效的 HTTP 或 HTTPS 地址")
+        if parsed_url.username or parsed_url.password:
+            raise ValueError("Dify api_url 不允许包含用户名或密码")
+        if any(separator in params["dify_dataset_id"] for separator in ("/", "?", "#")):
+            raise ValueError("Dify dataset_id 格式无效")
         return params
 
     async def aquery(
@@ -167,7 +176,11 @@ class DifyKB(ReadOnlyConnectors):
         return results
 
     async def _request_dify(self, client_payload: dict[str, Any], request_url: str, headers: dict[str, str]) -> dict:
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with httpx.AsyncClient(
+            timeout=30.0,
+            follow_redirects=False,
+            transport=SSRFGuardTransport(),
+        ) as client:
             response = await client.post(request_url, json=client_payload, headers=headers)
             try:
                 response.raise_for_status()
