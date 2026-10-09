@@ -123,19 +123,15 @@ def _normalize_scope(scope: dict | None, *, strict: bool) -> dict | None:
 
 
 def _validate_manage_scope(read_scope: dict | None, manage_scope: dict | None) -> None:
-    """确保管理范围不会超出读取范围；逐个主体判断，不做跨档推导。"""
+    """确保管理范围不会超出读取范围；逐个主体判断，不做跨档推导。
 
-    if not read_scope or not manage_scope or "global" in read_scope["access_levels"]:
+    两侧范围都可以缺省：`read_scope is None` 是既有的「只配管理范围」形状（此时读取权限由
+    管理范围派生，见 `resolve_resource_permission`），不能被当成越界。
+    """
+
+    if not read_scope or not manage_scope:
         return
-    if "global" in manage_scope["access_levels"]:
-        raise ValueError("管理范围必须包含在读取范围内")
-    if not {int(value) for value in manage_scope["department_ids"]}.issubset(
-        {int(value) for value in read_scope["department_ids"]}
-    ):
-        raise ValueError("管理范围必须包含在读取范围内")
-    if not {str(value) for value in manage_scope["user_uids"]}.issubset(
-        {str(value) for value in read_scope["user_uids"]}
-    ):
+    if not scope_contains(read_scope, manage_scope):
         raise ValueError("管理范围必须包含在读取范围内")
 
 
@@ -195,6 +191,32 @@ def scope_matches(user: Any, scope: dict | None) -> bool:
     if "user" in levels:
         return str(_value(user, "uid", "") or "") in {str(uid) for uid in scope.get("user_uids") or []}
     return False
+
+
+def scope_contains(container: dict | None, target: dict | None) -> bool:
+    """判断 container 是否完整覆盖 target。
+
+    逐个主体判断：target 的每个部门 id 必须出现在 container.department_ids 里，每个 uid 必须
+    出现在 container.user_uids 里；container 含 global 时覆盖一切，target 含 global 时除了
+    container 也是 global 之外都不覆盖。**不做**「某用户属于某部门」的推导——那要查用户表，
+    会把范围判定与用户目录耦合，且保守方向是 fail-closed。
+    """
+
+    if not target:
+        return True
+    if not container:
+        return False
+    container_levels = set(container.get("access_levels") or [])
+    target_levels = set(target.get("access_levels") or [])
+    if "global" in container_levels:
+        return True
+    if "global" in target_levels:
+        return False
+    container_departments = {int(value) for value in container.get("department_ids") or []}
+    container_uids = {str(value) for value in container.get("user_uids") or []}
+    return {int(value) for value in target.get("department_ids") or []}.issubset(container_departments) and {
+        str(value) for value in target.get("user_uids") or []
+    }.issubset(container_uids)
 
 
 def _value(source: Any, key: str, default: Any = None) -> Any:
