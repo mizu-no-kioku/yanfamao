@@ -10,6 +10,7 @@ from yuxi.agents.presets.subagents.general_purpose import PRESET as GENERAL_PURP
 from yuxi.repositories.agent_repository import (
     AgentRepository,
     DEFAULT_AGENT_DESCRIPTION,
+    DEFAULT_AGENT_SLUG,
     DEFAULT_SHARE_CONFIG,
     SUB_AGENT_BACKEND_ID,
     merge_agent_config_json,
@@ -31,8 +32,8 @@ class FakeDb:
 
 _MANAGER_USER_SCOPE = {
     "version": 2,
-    "read_scope": {"access_level": "user", "user_uids": ["manager"]},
-    "manage_scope": {"access_level": "user", "user_uids": ["manager"]},
+    "read_scope": {"access_levels": ["user"], "user_uids": ["manager"]},
+    "manage_scope": {"access_levels": ["user"], "user_uids": ["manager"]},
 }
 
 
@@ -262,7 +263,7 @@ async def test_create_agent_defaults_to_creator_read_scope_without_manage_scope(
 
     assert agent.share_config == {
         "version": 2,
-        "read_scope": {"access_level": "user", "department_ids": [], "user_uids": ["user"]},
+        "read_scope": {"access_levels": ["user"], "department_ids": [], "user_uids": ["user"]},
         "manage_scope": None,
     }
     assert db.added is agent
@@ -283,13 +284,73 @@ async def test_create_agent_allows_same_explicit_share_scope_for_normal_user(mon
         slug="personal-bot",
         share_config={
             "version": 2,
-            "read_scope": {"access_level": "global"},
+            "read_scope": {"access_levels": ["global"]},
             "manage_scope": None,
         },
         created_by="user",
     )
 
     assert agent.share_config == DEFAULT_SHARE_CONFIG
+
+
+@pytest.mark.asyncio
+async def test_set_default_rejects_non_global_scope():
+    """内置智能体设为默认前必须全局共享；非全局范围显式失败，不静默改写。"""
+    db = FakeDb()
+    db.execute = AsyncMock()
+    repo = AgentRepository(db)
+    agent = SimpleNamespace(
+        is_subagent=False,
+        slug=DEFAULT_AGENT_SLUG,
+        share_config={"version": 2, "read_scope": {"access_levels": ["user"], "user_uids": ["u-1"]}},
+    )
+
+    with pytest.raises(ValueError, match="内置智能体必须全局共享"):
+        await repo.set_default(agent=agent)
+
+
+@pytest.mark.asyncio
+async def test_set_default_accepts_global_scope():
+    """全局共享的内置智能体可以设为默认。"""
+    db = FakeDb()
+    db.execute = AsyncMock()
+    repo = AgentRepository(db)
+    agent = SimpleNamespace(
+        is_subagent=False,
+        slug=DEFAULT_AGENT_SLUG,
+        share_config={
+            "version": 2,
+            "read_scope": {"access_levels": ["global"], "department_ids": [], "user_uids": []},
+            "manage_scope": None,
+        },
+        updated_by=None,
+    )
+
+    await repo.set_default(agent=agent)
+
+    assert agent.is_default is True
+    db.commit.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_create_default_agent_requires_global_scope(monkeypatch):
+    """is_default=True 而范围非全局时拒绝创建。"""
+    db = FakeDb()
+    repo = AgentRepository(db)
+
+    async def fake_unique_slug(_slug, _name):
+        return "default-bot"
+
+    monkeypatch.setattr(repo, "_unique_slug", fake_unique_slug)
+
+    with pytest.raises(ValueError, match="默认智能体必须全局共享"):
+        await repo.create(
+            name="Default Bot",
+            backend_id="ChatbotAgent",
+            share_config={"version": 2, "read_scope": {"access_levels": ["user"], "user_uids": ["u-1"]}},
+            is_default=True,
+            created_by="u-1",
+        )
 
 
 def test_user_shared_agent_is_manageable_for_normal_user():
@@ -334,7 +395,7 @@ async def test_delegated_manager_can_update_agent_acl_with_standard_validation()
         agent,
         share_config={
             "version": 2,
-            "read_scope": {"access_level": "global"},
+            "read_scope": {"access_levels": ["global"]},
             "manage_scope": None,
         },
         updated_by="manager",
@@ -353,7 +414,7 @@ async def test_normal_user_can_update_read_scope_without_granting_manage_scope()
         agent,
         share_config={
             "version": 2,
-            "read_scope": {"access_level": "user", "user_uids": ["manager", "reader"]},
+            "read_scope": {"access_levels": ["user"], "user_uids": ["manager", "reader"]},
             "manage_scope": None,
         },
         updated_by="manager",
@@ -362,7 +423,7 @@ async def test_normal_user_can_update_read_scope_without_granting_manage_scope()
     assert agent.share_config == {
         "version": 2,
         "read_scope": {
-            "access_level": "user",
+            "access_levels": ["user"],
             "department_ids": [],
             "user_uids": ["manager", "reader"],
         },
@@ -384,12 +445,12 @@ async def test_normal_user_can_update_agent_with_equivalent_v2_share_config():
 
     assert agent.name == "Renamed Bot"
     assert agent.share_config["read_scope"] == {
-        "access_level": "user",
+        "access_levels": ["user"],
         "department_ids": [],
         "user_uids": ["manager"],
     }
     assert agent.share_config["manage_scope"] == {
-        "access_level": "user",
+        "access_levels": ["user"],
         "department_ids": [],
         "user_uids": ["manager"],
     }

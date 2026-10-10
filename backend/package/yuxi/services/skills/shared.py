@@ -30,7 +30,7 @@ from yuxi.storage.postgres.models_business import Skill, User
 
 BUILTIN_SKILL_OPERATOR = "builtin-system"
 ADMIN_ROLES = {"admin", "superadmin"}
-BUILTIN_SKILL_SHARE_CONFIG = {"access_level": "global", "department_ids": [], "user_uids": []}
+BUILTIN_SKILL_SHARE_CONFIG = {"access_levels": ["global"], "department_ids": [], "user_uids": []}
 SKILL_STORAGE_LOCK = 0x5958534B
 
 
@@ -404,7 +404,7 @@ def can_skill_depend_on(parent: Skill, dependency: Skill) -> bool:
     parent_config = normalize_permission_config(parent.share_config)
     dependency_scopes = [scope for scope in (dep_config["read_scope"], dep_config["manage_scope"]) if scope]
     parent_scopes = [scope for scope in (parent_config["read_scope"], parent_config["manage_scope"]) if scope]
-    owner_scope = {"access_level": "user", "department_ids": [], "user_uids": []}
+    owner_scope = {"access_levels": ["user"], "department_ids": [], "user_uids": []}
     if not dependency_scopes:
         dependency_scopes = [{**owner_scope, "user_uids": [str(dependency.created_by or "")]}]
     if not parent_scopes:
@@ -427,7 +427,7 @@ def normalize_skill_share_config(
         return {"version": 2, "read_scope": BUILTIN_SKILL_SHARE_CONFIG.copy(), "manage_scope": None}
 
     default_scope = {
-        "access_level": "user",
+        "access_levels": ["user"],
         "department_ids": [],
         "user_uids": [operator_uid],
     }

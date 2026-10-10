@@ -23,7 +23,7 @@ DEFAULT_AGENT_DESCRIPTION = DEFAULT_AGENT.description
 SUB_AGENT_BACKEND_ID = "SubAgentBackend"
 DEFAULT_SHARE_CONFIG = {
     "version": 2,
-    "read_scope": {"access_level": "global", "department_ids": [], "user_uids": []},
+    "read_scope": {"access_levels": ["global"], "department_ids": [], "user_uids": []},
     "manage_scope": None,
 }
 
@@ -206,8 +206,8 @@ class AgentRepository:
         if not is_builtin_agent(agent):
             raise ValueError("默认智能体已固定为内置智能助手")
         share_config = agent.share_config or DEFAULT_SHARE_CONFIG.copy()
-        read_scope = share_config.get("read_scope") or {}
-        if read_scope.get("access_level") != "global":
+        normalized_scope = normalize_permission_config(share_config)["read_scope"]
+        if not normalized_scope or normalized_scope["access_levels"] != ["global"]:
             raise ValueError("内置智能体必须全局共享")
 
         now = utc_now_naive()
@@ -257,7 +257,7 @@ class AgentRepository:
         default_share_config = {
             "version": 2,
             "read_scope": {
-                "access_level": "user",
+                "access_levels": ["user"],
                 "department_ids": [],
                 "user_uids": [owner_uid],
             },
@@ -268,7 +268,7 @@ class AgentRepository:
             share_config or default_share_config,
             allowed_access_levels=allowed_access_levels,
         )
-        if is_default and (normalized_share_config.get("read_scope") or {}).get("access_level") != "global":
+        if is_default and (normalized_share_config.get("read_scope") or {}).get("access_levels") != ["global"]:
             raise ValueError("默认智能体必须全局共享")
 
         from yuxi.agents.buildin import get_agent_backend

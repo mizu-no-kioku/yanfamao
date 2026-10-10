@@ -429,13 +429,13 @@ async def test_upload_draft_does_not_include_shared_policy(tmp_path: Path, monke
     [
         {
             "version": 2,
-            "read_scope": {"access_level": "global"},
-            "manage_scope": {"access_level": "global"},
+            "read_scope": {"access_levels": ["global"]},
+            "manage_scope": {"access_levels": ["global"]},
         },
         {
             "version": 2,
-            "read_scope": {"access_level": "department", "department_ids": [1]},
-            "manage_scope": {"access_level": "department", "department_ids": [1]},
+            "read_scope": {"access_levels": ["department"], "department_ids": [1]},
+            "manage_scope": {"access_levels": ["department"], "department_ids": [1]},
         },
     ],
 )

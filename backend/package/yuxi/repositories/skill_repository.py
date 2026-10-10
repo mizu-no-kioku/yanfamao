@@ -142,7 +142,7 @@ class SkillRepository:
         item.source_type = "builtin"
         item.share_config = {
             "version": 2,
-            "read_scope": {"access_level": "global", "department_ids": [], "user_uids": []},
+            "read_scope": {"access_levels": ["global"], "department_ids": [], "user_uids": []},
             "manage_scope": None,
         }
         item.updated_by = updated_by
