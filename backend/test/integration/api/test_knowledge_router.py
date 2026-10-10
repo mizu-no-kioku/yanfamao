@@ -5,6 +5,7 @@ Integration tests for knowledge router endpoints.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import uuid
 from pathlib import Path
@@ -1632,3 +1633,179 @@ async def test_personal_knowledge_base_owner_can_use_graph_endpoints(test_client
             await test_client.delete(f"/api/knowledge/databases/{kb_id}", headers=standard_user["headers"])
         if intruder:
             await _delete_user_by_id(test_client, admin_headers, intruder["user"]["id"])
+
+
+async def test_union_scope_grants_read_to_department_and_named_user(test_client, admin_headers):
+    """并集授权：部门成员与指定用户都能读到，两者都不命中的用户读不到。"""
+    department_a = await _create_test_department(test_client, admin_headers, "pytest_union_a")
+    department_b = await _create_test_department(test_client, admin_headers, "pytest_union_b")
+    member = await _create_test_user(test_client, admin_headers, department_a["id"])
+    named = await _create_test_user(test_client, admin_headers, department_b["id"])
+    outsider = await _create_test_user(test_client, admin_headers, department_b["id"])
+    try:
+        database = await _create_test_database(
+            test_client,
+            admin_headers,
+            {
+                "version": 2,
+                "read_scope": {
+                    "access_levels": ["department", "user"],
+                    "department_ids": [department_a["id"]],
+                    "user_uids": [named["user"]["uid"]],
+                },
+                "manage_scope": None,
+            },
+        )
+        kb_id = database["kb_id"]
+        try:
+            for user in (member, named):
+                detail = await test_client.get(f"/api/knowledge/databases/{kb_id}", headers=user["headers"])
+                assert detail.status_code == 200, detail.text
+                assert detail.json()["effective_permission"] == "read"
+
+            denied = await test_client.get(f"/api/knowledge/databases/{kb_id}", headers=outsider["headers"])
+            assert denied.status_code == 403, denied.text
+
+            listing = await test_client.get("/api/knowledge/databases/accessible", headers=member["headers"])
+            item = next(entry for entry in listing.json()["databases"] if entry["kb_id"] == kb_id)
+            assert item["share_config"]["read_scope"]["access_levels"] == ["department", "user"]
+        finally:
+            await test_client.delete(f"/api/knowledge/databases/{kb_id}", headers=admin_headers)
+    finally:
+        for user in (member, named, outsider):
+            await _delete_user_by_id(test_client, admin_headers, user["user"]["id"])
+        for department in (department_a, department_b):
+            await _delete_department_with_admin(test_client, admin_headers, department)
+
+
+async def test_plain_user_cannot_grant_department_level(test_client, standard_user):
+    """非管理员提交含部门档的范围被拒，不静默降级成只有 user 档。"""
+    created = await test_client.post(
+        "/api/knowledge/databases",
+        json={
+            "database_name": f"pytest_union_denied_{uuid.uuid4().hex[:8]}",
+            "description": "非管理员不得开部门档",
+            "embedding_model_spec": _CREATE_EMBEDDING_SPEC,
+            "kb_type": "milvus",
+        },
+        headers=standard_user["headers"],
+    )
+    assert created.status_code == 200, created.text
+    kb_id = created.json()["kb_id"]
+    try:
+        response = await test_client.put(
+            f"/api/knowledge/databases/{kb_id}",
+            json={
+                "name": created.json()["name"],
+                "description": created.json()["description"],
+                "share_config": {
+                    "version": 2,
+                    "read_scope": {"access_levels": ["department"], "department_ids": [1], "user_uids": []},
+                    "manage_scope": None,
+                },
+            },
+            headers=standard_user["headers"],
+        )
+        assert response.status_code in (400, 403), response.text
+        # 钉住拒绝的**原因**是授予上限，而不是碰巧撞上别的校验。
+        assert "无权使用该资源共享范围" in response.text, response.text
+    finally:
+        await test_client.delete(f"/api/knowledge/databases/{kb_id}", headers=standard_user["headers"])
+
+
+async def test_personal_knowledge_base_with_department_scope_stays_private(test_client, admin_headers):
+    """个人库即使被误设部门档，非创建者的同部门用户仍拿不到读取权限。"""
+    department = await _create_test_department(test_client, admin_headers, "pytest_union_personal")
+    colleague = await _create_test_user(test_client, admin_headers, department["id"])
+    try:
+        created = await test_client.post(
+            "/api/knowledge/databases",
+            json={
+                "database_name": f"pytest_union_personal_{uuid.uuid4().hex[:8]}",
+                "description": "个人库 + 部门档",
+                "embedding_model_spec": _CREATE_EMBEDDING_SPEC,
+                "kb_type": "milvus",
+                "scope": "personal",
+            },
+            headers=admin_headers,
+        )
+        assert created.status_code == 200, created.text
+        kb_id = created.json()["kb_id"]
+        try:
+            updated = await test_client.put(
+                f"/api/knowledge/databases/{kb_id}",
+                json={
+                    "name": created.json()["name"],
+                    "description": created.json()["description"],
+                    "share_config": {
+                        "version": 2,
+                        "read_scope": {
+                            "access_levels": ["department"],
+                            "department_ids": [department["id"]],
+                            "user_uids": [],
+                        },
+                        "manage_scope": None,
+                    },
+                },
+                headers=admin_headers,
+            )
+            assert updated.status_code == 200, updated.text
+
+            denied = await test_client.get(f"/api/knowledge/databases/{kb_id}", headers=colleague["headers"])
+            assert denied.status_code == 403, denied.text
+        finally:
+            await test_client.delete(f"/api/knowledge/databases/{kb_id}", headers=admin_headers)
+    finally:
+        await _delete_user_by_id(test_client, admin_headers, colleague["user"]["id"])
+        await _delete_department_with_admin(test_client, admin_headers, department)
+
+
+async def test_legacy_access_level_payload_is_rejected_on_write(test_client, admin_headers, knowledge_database):
+    """老客户端提交旧键被拒，而不是归一后落库——这是「旧 bundle + 新后端」的兜底闸门。"""
+    kb_id = knowledge_database["kb_id"]
+
+    response = await test_client.put(
+        f"/api/knowledge/databases/{kb_id}",
+        json={
+            "name": knowledge_database["name"],
+            "description": knowledge_database["description"],
+            "share_config": {
+                "version": 2,
+                "read_scope": {"access_level": "global", "department_ids": [], "user_uids": []},
+                "manage_scope": None,
+            },
+        },
+        headers=admin_headers,
+    )
+
+    assert response.status_code == 400, response.text
+    assert "access_levels" in response.json()["detail"]
+
+    # 读路径仍接受旧键：把行直接写成旧形状（迁移前的存量行只能长这样），
+    # 详情仍能正常返回，并在读取时归一为单元素数组——存量行不回溯、也不因旧键读不出来。
+    engine = create_async_engine(os.environ["POSTGRES_URL"], pool_pre_ping=True)
+    try:
+        async with engine.begin() as connection:
+            await connection.execute(
+                text("UPDATE knowledge_bases SET share_config = CAST(:cfg AS jsonb) WHERE kb_id = :kb"),
+                {
+                    "cfg": json.dumps(
+                        {
+                            "version": 2,
+                            "read_scope": {
+                                "access_level": "global",
+                                "department_ids": [],
+                                "user_uids": [],
+                            },
+                            "manage_scope": None,
+                        }
+                    ),
+                    "kb": kb_id,
+                },
+            )
+    finally:
+        await engine.dispose()
+
+    detail = await test_client.get(f"/api/knowledge/databases/{kb_id}", headers=admin_headers)
+    assert detail.status_code == 200, detail.text
+    assert detail.json()["share_config"]["read_scope"]["access_levels"] == ["global"]

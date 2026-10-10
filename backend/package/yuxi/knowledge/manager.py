@@ -35,6 +35,18 @@ from yuxi.storage.postgres.models_business import User
 from yuxi.utils import logger
 from yuxi.utils.datetime_utils import utc_isoformat
 
+_ADMIN_ROLES = {"admin", "superadmin"}
+
+
+def get_allowed_kb_access_levels(role: str | None) -> list[str]:
+    """非管理员只能把知识库共享给指定人；部门档与全局档属管理员。
+
+    与 `get_allowed_agent_access_levels` / `get_allowed_skill_access_levels` 同构：
+    授予上限由角色决定，知识库范围（personal/shared）不参与。
+    """
+    return ["global", "department", "user"] if role in _ADMIN_ROLES else ["user"]
+
+
 KB_FILE_SEARCH_SCAN_LIMIT = 5000
 
 
@@ -202,6 +214,7 @@ class KnowledgeBaseManager:
         user_uid: str | None = None,
         department_id: int | str | None = None,
         scope: str = "shared",
+        role: str | None = None,
     ) -> dict:
         """归一化共享配置；未显式给出时按知识库范围生成默认读取范围。
 
@@ -209,6 +222,10 @@ class KnowledgeBaseManager:
         fail-closed 退到“仅创建者”，绝不写 global——那会让人人可见一个本该私有的库。
         没有创建者 uid 时（种子脚本、内部调用）无法构造“仅创建者”，退到空读取范围
         （只留超管），同样不写 global——空的 user 级范围不是合法的 v2 配置。
+
+        `role` 是写入路径的操作者角色：给出时按 `get_allowed_kb_access_levels` 施加授予
+        上限，非管理员提交部门档/全局档会被显式拒绝（而不是静默降级成 user 档）。读取
+        路径不传 `role`——存量行里的档位不能因为谁来读而读不出来。
         """
 
         if share_config is None:
@@ -226,6 +243,7 @@ class KnowledgeBaseManager:
         if share_config and share_config.get("version") == 2:
             normalized = normalize_permission_config(
                 share_config,
+                allowed_access_levels=get_allowed_kb_access_levels(role) if role is not None else None,
                 strict=user_uid is not None or department_id is not None,
             )
             if normalized["read_scope"] is None and (user_uid is not None or department_id is not None):
@@ -570,6 +588,7 @@ class KnowledgeBaseManager:
             user_uid=created_by,
             department_id=created_by_department_id,
             scope=scope,
+            role=created_by_role,
         )
         await self._ensure_share_scope_within_operator_department(
             share_config,
@@ -1252,6 +1271,7 @@ class KnowledgeBaseManager:
                 share_config,
                 user_uid=operator_uid,
                 department_id=operator_department_id,
+                role=operator_role,
             )
             await self._ensure_share_scope_within_operator_department(
                 update_data["share_config"],
