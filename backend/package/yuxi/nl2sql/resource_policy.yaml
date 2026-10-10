@@ -1,0 +1,50 @@
+# backend/package/yuxi/nl2sql/resource_policy.yaml
+# 资源码 → 表/字段策略。只能取 table_policy.py 中声明的子集；
+# 载入时会与代码上限求交并拒绝越界项。首期只落地以下两项，
+# 其余资源码（HR_*、FINANCE_READ、APPLICATION_READ、RISK_READ）留空位。
+version: 1
+
+menu_binding:
+  AI: [AI_QA_USE]
+  QA: [AI_QA_USE]
+  projectManage:projectList:ai: [RD_PROJECT_READ]
+
+resources:
+  AI_QA_USE:
+    max_rows: 200
+    tables:
+      t_project:
+        - ID
+        - TENANT_ID
+        - PROJECT_NAME
+        - PROJECT_MANAGER_NAMES
+        - GENERAL_BUDGET
+        - OPERATER_STATUS
+      t_project_user:
+        - ID
+        - TENANT_ID
+        - PROJECT_ID
+        - STAFF_ID
+        - OPERATER_STATUS
+
+  RD_PROJECT_READ:
+    max_rows: 200
+    tables:
+      t_project:
+        - ID
+        - TENANT_ID
+        - PROJECT_NAME
+        - PROJECT_MANAGER_NAMES
+        - GENERAL_BUDGET
+        - OPERATER_STATUS
+      t_project_user:
+        - ID
+        - TENANT_ID
+        - PROJECT_ID
+        - STAFF_ID
+        - OPERATER_STATUS
+
+menu_ids:
+  AI: 253
+  QA: 254
+  projectManage:projectList:ai: 238
