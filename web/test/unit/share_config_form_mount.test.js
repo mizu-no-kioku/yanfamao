@@ -77,28 +77,8 @@ const stubModules = {
   '@/apis/department_api': 'export const departmentApi = { getDepartments: async () => ({ departments: [] }) }'
 }
 
-const mountForm = async (ShareConfigForm, modelValue) => {
-  const updates = []
-  const host = makeNode('root')
-  const app = renderer.createApp(() =>
-    h(ShareConfigForm, {
-      modelValue,
-      autoSelectUserDept: true,
-      requireReadScope: true,
-      allowedAccessLevels: ['global', 'department', 'user'],
-      'onUpdate:modelValue': (value) => updates.push(value)
-    })
-  )
-  app.mount(host)
-  await nextTick()
-  await nextTick()
-  return { app, host, updates }
-}
-
-const selectedCard = (host) =>
-  find(host, (node) => node.props.role === 'radio' && node.props['aria-checked'] === true)
-
-test('未交互的默认共享范围只驱动显示，挂载时 0 次 emit', async () => {
+// 每个用例各自建一个 vite server（SFC 编译结果按 server 缓存），用完必须 close。
+const createFormHarness = async () => {
   globalThis.window = { getComputedStyle: () => ({ lineHeight: '20', paddingTop: '0', paddingBottom: '0', borderTopWidth: '0', borderBottomWidth: '0' }) }
   globalThis.__shareConfigFormUser = { departmentId: 3, uid: 'creator-uid', isAdmin: true }
 
@@ -139,12 +119,79 @@ test('未交互的默认共享范围只驱动显示，挂载时 0 次 emit', asy
     ]
   })
 
+  const { default: ShareConfigForm } = await server.ssrLoadModule(
+    'virtual:share-config-form-mount-test'
+  )
+
+  return { ShareConfigForm, close: () => server.close() }
+}
+
+// 卡片是渲染成普通对象节点的：Vue 把 `@click="toggleAccessLevel(...)"` 编译成 props.onClick。
+const cardByTitle = (host, title) =>
+  find(host, (node) => node.props.role === 'radio' && textContent(node).includes(title))
+
+const clickCard = async (host, title) => {
+  const card = cardByTitle(host, title)
+  assert.ok(card, `未找到「${title}」卡片`)
+  card.props.onClick()
+  await nextTick()
+}
+
+// 共享范围开关未被解析时渲染成 a-switch 元素，@change 编译成 props.onChange。
+const toggleSwitch = async (host, index, enabled = true) => {
+  const node = findAll(host, (item) => item.type === 'a-switch')[index]
+  assert.ok(node, `未找到第 ${index} 个共享范围开关`)
+  node.props.onChange(enabled)
+  await nextTick()
+  await nextTick()
+}
+
+const mountForm = async (ShareConfigForm, modelValue, overrides = {}) => {
+  const updates = []
+  const host = makeNode('root')
+  const app = renderer.createApp(() =>
+    h(ShareConfigForm, {
+      modelValue,
+      autoSelectUserDept: true,
+      requireReadScope: true,
+      allowedAccessLevels: ['global', 'department', 'user'],
+      'onUpdate:modelValue': (value) => updates.push(value),
+      ...overrides
+    })
+  )
+  app.mount(host)
+  await nextTick()
+  await nextTick()
+  return { app, host, updates }
+}
+
+// 直接以 ShareConfigForm 为根组件挂载，好拿到它 defineExpose 出来的 validate()。
+const mountFormInstance = async (ShareConfigForm, modelValue, overrides = {}) => {
+  const updates = []
+  const host = makeNode('root')
+  const app = renderer.createApp(ShareConfigForm, {
+    modelValue,
+    autoSelectUserDept: true,
+    requireReadScope: true,
+    allowedAccessLevels: ['global', 'department', 'user'],
+    'onUpdate:modelValue': (value) => updates.push(value),
+    ...overrides
+  })
+  const instance = app.mount(host)
+  await nextTick()
+  await nextTick()
+  return { app, host, updates, instance }
+}
+
+const selectedCard = (host) =>
+  find(host, (node) => node.props.role === 'radio' && node.props['aria-checked'] === true)
+
+test('未交互的默认共享范围只驱动显示，挂载时 0 次 emit', async () => {
+  const harness = await createFormHarness()
+  const { ShareConfigForm } = harness
+
   let app
   try {
-    const { default: ShareConfigForm } = await server.ssrLoadModule(
-      'virtual:share-config-form-mount-test'
-    )
-
     // 共享库有部门：显示"部门共享"，且挂载时不能 emit（emit 会把派生权威搬到前端）。
     const sharedWithDepartment = await mountForm(
       ShareConfigForm,
@@ -176,12 +223,11 @@ test('未交互的默认共享范围只驱动显示，挂载时 0 次 emit', asy
     app.unmount()
     app = undefined
 
-    // 回归对照：若默认范围缺失 read_scope，表单会回落 global 并在挂载时 emit——
-    // 这正是本轮风险点，用它证明上面的 0 次 emit 不是空转。
+    // 回归对照：缺 read_scope 的知识库不该被改写成全局可见。旧行为是回落 global 并
+    // emit 一次；新行为是不 emit，交给 validate() 挡住保存。
     const missingReadScope = await mountForm(ShareConfigForm, { version: 2, read_scope: null, manage_scope: null })
     app = missingReadScope.app
-    assert.equal(missingReadScope.updates.length, 1)
-    assert.equal(missingReadScope.updates[0].read_scope.access_level, 'global')
+    assert.deepEqual(missingReadScope.updates, [])
     app.unmount()
     app = undefined
 
@@ -199,8 +245,185 @@ test('未交互的默认共享范围只驱动显示，挂载时 0 次 emit', asy
     assert.doesNotMatch(textContent(activeCards[0]), /全局共享/)
   } finally {
     app?.unmount()
-    await server.close()
+    await harness.close()
     delete globalThis.window
     delete globalThis.__shareConfigFormUser
+  }
+})
+
+test('切到「指定人」再切回「部门共享」，部门选择不丢', async () => {
+  const harness = await createFormHarness()
+  try {
+    const { app, host, updates } = await mountForm(harness.ShareConfigForm, {
+      version: 2,
+      read_scope: { access_levels: ['department'], department_ids: [2], user_uids: [] },
+      manage_scope: null
+    })
+
+    await clickCard(host, '指定人') // 并集：加上「指定人」档，部门名单不能被清掉
+    await clickCard(host, '部门共享') // 取消「部门共享」档
+    await clickCard(host, '部门共享') // 再选回来，原部门名单应仍在
+
+    const emitted = updates[updates.length - 1].read_scope
+    assert.deepEqual(emitted.access_levels, ['department', 'user'])
+    assert.deepEqual(emitted.department_ids, [2])
+    app.unmount()
+  } finally {
+    await harness.close()
+  }
+})
+
+test('部门 + 指定人可以同时选中并保存', async () => {
+  const harness = await createFormHarness()
+  try {
+    const { app, host, updates } = await mountForm(harness.ShareConfigForm, {
+      version: 2,
+      read_scope: { access_levels: ['department'], department_ids: [2], user_uids: [] },
+      manage_scope: null
+    })
+
+    await clickCard(host, '指定人')
+
+    const emitted = updates[updates.length - 1].read_scope
+    assert.deepEqual(emitted.access_levels, ['department', 'user'])
+    assert.deepEqual(emitted.department_ids, [2])
+    assert.deepEqual(emitted.user_uids, ['creator-uid'])
+    app.unmount()
+  } finally {
+    await harness.close()
+  }
+})
+
+test('最后一档不能被取消，选全局会清空两份名单', async () => {
+  const harness = await createFormHarness()
+  try {
+    const { app, host, updates } = await mountForm(harness.ShareConfigForm, {
+      version: 2,
+      read_scope: { access_levels: ['user'], department_ids: [], user_uids: ['creator-uid'] },
+      manage_scope: null
+    })
+
+    await clickCard(host, '指定人') // 已是唯一一档：点击应不生效——无变更即无 emit
+    assert.deepEqual(updates, [])
+
+    await clickCard(host, '全局共享')
+    assert.deepEqual(updates[updates.length - 1].read_scope, {
+      access_levels: ['global'],
+      department_ids: [],
+      user_uids: []
+    })
+    app.unmount()
+  } finally {
+    await harness.close()
+  }
+})
+
+test('拿不到档位的范围既不落库也不被默认成全局', async () => {
+  const harness = await createFormHarness()
+  try {
+    // 老 bundle 或缓存响应可能只带 department_ids/user_uids。这里钉住的是：表单不会为
+    // 缺档位的形状凭空发明一档（旧实现只在 read_scope 整个缺失时才回落 global 并 emit，
+    // 那条路径由上面「回归对照」的既有用例覆盖）。
+    const { app, updates } = await mountForm(harness.ShareConfigForm, {
+      version: 2,
+      read_scope: { department_ids: [], user_uids: [] },
+      manage_scope: null
+    })
+
+    assert.deepEqual(updates, [])
+    app.unmount()
+  } finally {
+    await harness.close()
+  }
+})
+
+test('读取范围非全局时，「共享管理权限」开关能打开且立刻是合法范围', async () => {
+  const harness = await createFormHarness()
+  try {
+    const { app, host, updates } = await mountForm(harness.ShareConfigForm, {
+      version: 2,
+      read_scope: { access_levels: ['department'], department_ids: [2], user_uids: [] },
+      manage_scope: null
+    })
+
+    // requireReadScope 为真时读取范围的开关不渲染，因此第 0 个开关就是「共享管理权限」。
+    await toggleSwitch(host, 0)
+
+    const emitted = updates[updates.length - 1].manage_scope
+    assert.ok(emitted, '管理范围应被建立，开关不能是死开关')
+    assert.ok(emitted.access_levels.length, '管理范围必须至少有一档')
+    assert.ok(
+      emitted.department_ids.length || emitted.user_uids.length,
+      '管理范围必须带名单：含某档却不带名单会被后端拒绝'
+    )
+    app.unmount()
+  } finally {
+    await harness.close()
+  }
+})
+
+test('非管理员关掉再打开读取范围，开关不会变成死开关', async () => {
+  const harness = await createFormHarness()
+  try {
+    const { app, host, updates } = await mountForm(
+      harness.ShareConfigForm,
+      {
+        version: 2,
+        read_scope: { access_levels: ['user'], department_ids: [], user_uids: ['creator-uid'] },
+        manage_scope: null
+      },
+      // requireReadScope 为假，读取范围的开关才渲染；第 0 个开关即读取范围。
+      { allowedAccessLevels: ['user'], requireReadScope: false }
+    )
+
+    await toggleSwitch(host, 0, false)
+    await toggleSwitch(host, 0, true)
+
+    const emitted = updates[updates.length - 1].read_scope
+    assert.deepEqual(emitted.access_levels, ['user'])
+    assert.deepEqual(emitted.user_uids, ['creator-uid'])
+    app.unmount()
+  } finally {
+    await harness.close()
+  }
+})
+
+test('取消一档会清掉该档名单，不产出后端拒绝的形状', async () => {
+  const harness = await createFormHarness()
+  try {
+    const { app, host, updates } = await mountForm(harness.ShareConfigForm, {
+      version: 2,
+      read_scope: { access_levels: ['department'], department_ids: [2], user_uids: [] },
+      manage_scope: null
+    })
+
+    await clickCard(host, '指定人') // 并集：加上「指定人」档
+    await clickCard(host, '部门共享') // 取消「部门共享」档
+
+    const emitted = updates[updates.length - 1].read_scope
+    assert.deepEqual(emitted.access_levels, ['user'])
+    assert.deepEqual(emitted.department_ids, [], '未声明部门档时不能残留部门名单')
+    app.unmount()
+  } finally {
+    await harness.close()
+  }
+})
+
+test('requireReadScope 而响应里没有可用的 read_scope 时，validate() 说非法', async () => {
+  const harness = await createFormHarness()
+  try {
+    const { app, instance } = await mountFormInstance(harness.ShareConfigForm, {
+      version: 2,
+      read_scope: null,
+      manage_scope: null
+    })
+
+    assert.deepEqual(instance.validate(), {
+      valid: false,
+      message: '读取权限至少选择一种共享方式'
+    })
+    app.unmount()
+  } finally {
+    await harness.close()
   }
 })

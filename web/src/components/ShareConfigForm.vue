@@ -22,7 +22,6 @@
       <template v-if="scopes[scope.key]">
         <div
           class="share-mode-cards"
-          :class="`active-${scopes[scope.key].access_level}`"
           role="radiogroup"
           :aria-label="scope.title"
         >
@@ -31,12 +30,12 @@
             :key="option.value"
             role="radio"
             class="share-mode-card"
-            :class="{ active: scopes[scope.key].access_level === option.value }"
-            :aria-checked="scopes[scope.key].access_level === option.value"
-            :tabindex="!disabled && scopes[scope.key].access_level === option.value ? 0 : -1"
-            @click="setAccessLevel(scope.key, option.value)"
-            @keydown.enter.prevent="setAccessLevel(scope.key, option.value)"
-            @keydown.space.prevent="setAccessLevel(scope.key, option.value)"
+            :class="{ active: scopes[scope.key].access_levels.includes(option.value) }"
+            :aria-checked="scopes[scope.key].access_levels.includes(option.value)"
+            :tabindex="!disabled && scopes[scope.key].access_levels.includes(option.value) ? 0 : -1"
+            @click="toggleAccessLevel(scope.key, option.value)"
+            @keydown.enter.prevent="toggleAccessLevel(scope.key, option.value)"
+            @keydown.space.prevent="toggleAccessLevel(scope.key, option.value)"
           >
             <div class="card-main">
               <div class="card-header">
@@ -46,7 +45,7 @@
                 <div class="card-title">{{ option.title }}</div>
                 <div
                   v-if="
-                    scopes[scope.key].access_level === option.value && option.value !== 'global'
+                    scopes[scope.key].access_levels.includes(option.value) && option.value !== 'global'
                   "
                   class="card-action"
                   @click.stop
@@ -171,6 +170,7 @@ import { Building2, Globe, Users, UserPlus } from '@lucide/vue'
 import { useUserStore } from '@/stores/user'
 import { authApi } from '@/apis/auth_api'
 import { departmentApi } from '@/apis/department_api'
+import { toAccessLevels } from '@/utils/shareConfig'
 
 const userStore = useUserStore()
 const departments = ref([])
@@ -183,7 +183,7 @@ const props = defineProps({
     required: true,
     default: () => ({
       version: 2,
-      read_scope: { access_level: 'global', department_ids: [], user_uids: [] },
+      read_scope: { access_levels: ['global'], department_ids: [], user_uids: [] },
       manage_scope: null
     })
   },
@@ -238,7 +238,7 @@ const shareModeOptions = computed(() =>
 )
 
 const createScope = (scope) => ({
-  access_level: scope?.access_level || 'global',
+  access_levels: toAccessLevels(scope),
   department_ids: Array.from(
     new Set((scope?.department_ids || []).map(Number).filter(Number.isFinite))
   ),
@@ -250,45 +250,55 @@ const createScope = (scope) => ({
 const normalizeScope = (scope, { includeCurrent = false } = {}) => {
   if (!scope) return null
   const normalized = createScope(scope)
-  if (!normalizedAllowedAccessLevels.value.includes(normalized.access_level)) {
-    normalized.access_level = normalizedAllowedAccessLevels.value[0]
+  const levels = normalized.access_levels.filter((level) =>
+    normalizedAllowedAccessLevels.value.includes(level)
+  )
+  if (!levels.length) return null
+  if (levels.includes('global')) {
+    return { access_levels: ['global'], department_ids: [], user_uids: [] }
   }
-  if (normalized.access_level === 'global') {
-    normalized.department_ids = []
-    normalized.user_uids = []
-  } else if (normalized.access_level === 'department') {
-    normalized.user_uids = []
-    if (
-      includeCurrent &&
-      currentDepartmentId.value &&
-      !normalized.department_ids.includes(currentDepartmentId.value)
-    ) {
-      normalized.department_ids.unshift(currentDepartmentId.value)
-    }
-  } else {
-    normalized.department_ids = []
-    if (
-      includeCurrent &&
-      currentUserUid.value &&
-      !normalized.user_uids.includes(currentUserUid.value)
-    ) {
-      normalized.user_uids.unshift(currentUserUid.value)
-    }
+  // 只在该档名单为空时补当前主体：它的作用是让范围合法，不覆盖已显式选好的名单。
+  if (
+    includeCurrent &&
+    levels.includes('department') &&
+    currentDepartmentId.value &&
+    !normalized.department_ids.length
+  ) {
+    normalized.department_ids = [currentDepartmentId.value]
   }
+  if (
+    includeCurrent &&
+    levels.includes('user') &&
+    currentUserUid.value &&
+    !normalized.user_uids.length
+  ) {
+    normalized.user_uids = [currentUserUid.value]
+  }
+  normalized.access_levels = ['department', 'user'].filter((level) => levels.includes(level))
+  if (levels.includes('department') && !normalized.department_ids.length) return null
+  if (levels.includes('user') && !normalized.user_uids.length) return null
   return normalized
 }
 
 const isManageScopeWithinRead = (manageScope, readScope = scopes.read_scope) => {
-  if (!manageScope || !readScope || readScope.access_level === 'global') return true
-  if (manageScope.access_level !== readScope.access_level) return false
-  if (readScope.access_level === 'user') {
-    return (
-      manageScope.access_level === 'user' &&
-      manageScope.user_uids.every((uid) => readScope.user_uids.includes(uid))
-    )
+  if (!manageScope || !readScope) return true
+  const readLevels = toAccessLevels(readScope)
+  if (readLevels.includes('global')) return true
+  const manageLevels = toAccessLevels(manageScope)
+  if (!manageLevels.length || !manageLevels.every((level) => readLevels.includes(level))) {
+    return false
   }
-  if (manageScope.access_level === 'department') {
-    return manageScope.department_ids.every((id) => readScope.department_ids.includes(id))
+  if (
+    manageLevels.includes('user') &&
+    !manageScope.user_uids.every((uid) => readScope.user_uids.includes(uid))
+  ) {
+    return false
+  }
+  if (
+    manageLevels.includes('department') &&
+    !manageScope.department_ids.every((id) => readScope.department_ids.includes(id))
+  ) {
+    return false
   }
   return true
 }
@@ -300,33 +310,57 @@ const initConfig = () => {
   const readScope = isV2 ? source.read_scope : source
   scopes.read_scope = normalizeScope(readScope, { includeCurrent: props.autoSelectUserDept })
   scopes.manage_scope = normalizeScope(isV2 ? source.manage_scope : null)
-  const hadMissingRequiredRead = props.requireReadScope && !scopes.read_scope
-  if (hadMissingRequiredRead) {
-    scopes.read_scope = normalizeScope({ access_level: 'global' })
-  }
+  // 响应里没有可用的 read_scope 时保持为 null，不凭空发明全局范围——那会把一个没有
+  // 读取范围的知识库改写成全局可见。由 validate() 挡住保存。
   nextTick(() => {
     syncingFromProps.value = false
-    if (hadMissingRequiredRead) emitConfig()
   })
 }
 
+// 输出前清掉「已取消档位」的残留名单：合法表达要求「不含 department ⇒ department_ids 为空」，
+// 残留会被后端严格归一拒绝。表单内部仍留着名单，用户把该档选回来时原选择还在。
+const toPayloadScope = (scope) => {
+  if (!scope) return null
+  const levels = toAccessLevels(scope)
+  return {
+    access_levels: levels,
+    department_ids: levels.includes('department') ? scope.department_ids : [],
+    user_uids: levels.includes('user') ? scope.user_uids : []
+  }
+}
+
 const emitConfig = () => {
+  const readScope = normalizeScope(scopes.read_scope)
+  const manageScope = normalizeScope(scopes.manage_scope)
+  // 归一不出合法范围时不 emit：保留表单里的非法状态与上一次已提交的值，由 validate() 说明原因。
+  if (scopes.read_scope && !readScope) return
+  if (scopes.manage_scope && !manageScope) return
   emit('update:modelValue', {
     version: 2,
-    read_scope: normalizeScope(scopes.read_scope),
-    manage_scope: normalizeScope(scopes.manage_scope)
+    read_scope: toPayloadScope(readScope),
+    manage_scope: toPayloadScope(manageScope)
   })
 }
 
 const toggleScope = (scopeKey, enabled) => {
   if (props.disabled) return
-  const defaultManageLevel = scopes.read_scope?.access_level || 'global'
-  scopes[scopeKey] = enabled
-    ? normalizeScope({ access_level: scopeKey === 'read_scope' ? 'global' : defaultManageLevel })
-    : null
+  if (!enabled) {
+    scopes[scopeKey] = null
+    return
+  }
+  const allowed = normalizedAllowedAccessLevels.value
+  const readLevels = toAccessLevels(scopes.read_scope).filter((level) => allowed.includes(level))
+  const seedLevels =
+    scopeKey === 'manage_scope' && readLevels.length
+      ? readLevels
+      : [allowed.includes('global') ? 'global' : allowed[0]]
+  // 开启时给一个合法默认：管理范围沿用读取范围的档位，读取范围取首个可用档；两种都补上
+  // 当前部门/本人——新形状要求「含某档 ⇒ 该档名单非空」，空名单的默认范围没有合法表达，
+  // 否则开关一开就被归一回 null，变成死开关。
+  scopes[scopeKey] = normalizeScope({ access_levels: seedLevels }, { includeCurrent: true })
 }
 
-const setAccessLevel = (scopeKey, accessLevel) => {
+const toggleAccessLevel = (scopeKey, accessLevel) => {
   if (
     props.disabled ||
     !scopes[scopeKey] ||
@@ -336,8 +370,17 @@ const setAccessLevel = (scopeKey, accessLevel) => {
   // 切到「部门共享」时补一次：加载失败后，这是同一次弹窗会话里唯一可达的重试时机
   //（详情页传的是实例内稳定的数组，重渲染不会再触发 allowedAccessLevels 的 watcher）。
   if (accessLevel === 'department') ensureDepartmentsLoaded()
-  scopes[scopeKey].access_level = accessLevel
-  scopes[scopeKey] = normalizeScope(scopes[scopeKey], {
+  const current = createScope(scopes[scopeKey])
+  if (accessLevel === 'global') {
+    scopes[scopeKey] = { access_levels: ['global'], department_ids: [], user_uids: [] }
+    return
+  }
+  const has = current.access_levels.includes(accessLevel)
+  if (has && current.access_levels.length === 1) return // 最后一档不取消
+  current.access_levels = has
+    ? current.access_levels.filter((level) => level !== accessLevel)
+    : [...current.access_levels, accessLevel]
+  scopes[scopeKey] = normalizeScope(current, {
     includeCurrent: scopeKey === 'read_scope' && props.autoSelectUserDept
   })
 }
@@ -447,17 +490,23 @@ watch(
 )
 
 const validateScope = (scope, title) => {
-  if (!scope || scope.access_level === 'global') return { valid: true, message: '' }
-  if (scope.access_level === 'department' && !scope.department_ids.length) {
+  if (!scope) return { valid: true, message: '' }
+  const levels = toAccessLevels(scope)
+  if (!levels.length) return { valid: false, message: `${title}至少选择一种共享方式` }
+  if (levels.includes('global')) return { valid: true, message: '' }
+  if (levels.includes('department') && !scope.department_ids.length) {
     return { valid: false, message: `${title}至少需要选择一个部门` }
   }
-  if (scope.access_level === 'user' && !scope.user_uids.length) {
+  if (levels.includes('user') && !scope.user_uids.length) {
     return { valid: false, message: `${title}至少需要选择一个用户` }
   }
   return { valid: true, message: '' }
 }
 
 const validate = () => {
+  if (props.requireReadScope && !scopes.read_scope) {
+    return { valid: false, message: '读取权限至少选择一种共享方式' }
+  }
   const readResult = validateScope(scopes.read_scope, '读取权限')
   if (!readResult.valid) return readResult
   const manageResult = validateScope(scopes.manage_scope, '管理权限')

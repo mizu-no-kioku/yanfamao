@@ -25,3 +25,15 @@ export function getShareTagLabel(database) {
   if (!config || !Object.keys(config).length) return null
   return getShareConfigLabel(config)
 }
+
+/** 读取范围档位；旧形状（单个 access_level）也接受——缓存里的响应可能是旧的。 */
+export const toAccessLevels = (scope) => {
+  if (!scope) return []
+  const raw = scope.access_levels ?? (scope.access_level ? [scope.access_level] : [])
+  return (Array.isArray(raw) ? raw : []).filter((level) =>
+    ['global', 'department', 'user'].includes(level)
+  )
+}
+
+/** 是否全局共享；只按档位数组判定，并集不是全局。 */
+export const isGlobalScope = (scope) => toAccessLevels(scope).includes('global')

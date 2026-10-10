@@ -80,6 +80,11 @@ const flush = async () => {
 
 const shareCards = (host) => findAll(host, (node) => node.props.role === 'radio')
 const checkedCard = (host) => shareCards(host).find((card) => card.props['aria-checked'] === true)
+// 并集语义下"某张卡片被选中"不再等于"只有它被选中"：按标题判断某一档是否被选中。
+const isCardChecked = (host, pattern) =>
+  shareCards(host).some(
+    (card) => card.props['aria-checked'] === true && pattern.test(textContent(card))
+  )
 
 // 包装组件：把 allowedAccessLevels 表达为一个可变的 ref / 每次渲染新建的数组字面量，
 // 以复现父组件重渲染时 prop 身份的变化。
@@ -337,13 +342,12 @@ test('（刻画）ShareConfigForm 对 allowedAccessLevels 的身份敏感', asyn
     app = stable.app
     assert.match(textContent(checkedCard(stable.host)), /部门共享/)
     await selectUserCard(stable.host)
-    assert.match(textContent(checkedCard(stable.host)), /指定人/)
+    assert.ok(isCardChecked(stable.host, /指定人/), '点击后「指定人」档应被选中')
     stable.tick.value += 1
     await nextTick()
     await nextTick()
-    assert.match(
-      textContent(checkedCard(stable.host)),
-      /指定人/,
+    assert.ok(
+      isCardChecked(stable.host, /指定人/),
       '稳定的 prop 引用不应让父组件重渲染丢弃本地选择'
     )
     app.unmount()
@@ -358,15 +362,15 @@ test('（刻画）ShareConfigForm 对 allowedAccessLevels 的身份敏感', asyn
     app = churn.app
     assert.match(textContent(checkedCard(churn.host)), /部门共享/)
     await selectUserCard(churn.host)
-    assert.match(textContent(checkedCard(churn.host)), /指定人/)
+    assert.ok(isCardChecked(churn.host, /指定人/), '点击后「指定人」档应被选中')
     churn.tick.value += 1
     await nextTick()
     await nextTick()
-    assert.match(
-      textContent(checkedCard(churn.host)),
-      /部门共享/,
+    assert.ok(
+      !isCardChecked(churn.host, /指定人/),
       '身份变化的 prop 会让表单从 modelValue 重新派生并丢弃本地选择'
     )
+    assert.ok(isCardChecked(churn.host, /部门共享/), '重新派生后应回到 modelValue 里的部门档')
     app.unmount()
     app = undefined
   } finally {
