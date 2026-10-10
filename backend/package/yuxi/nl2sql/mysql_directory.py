@@ -139,3 +139,34 @@ class MySqlBusinessDirectory:
                 return tuple(row[0] for row in cursor.fetchall())
         finally:
             connection.close()
+
+
+def business_connection_factory() -> ConnectionFactory:
+    """真实业务库连接。账号只有 SELECT，本模块只发查询，永不写入。"""
+    from yuxi.services.business_database_service import load_business_database_config
+
+    config = load_business_database_config()
+
+    def connect():
+        return pymysql.connect(
+            host=config.host,
+            port=config.port,
+            user=config.user,
+            password=config.password.get_secret_value(),
+            database=config.database,
+            charset="utf8mb4",
+            cursorclass=pymysql.cursors.Cursor,
+            connect_timeout=5,
+            read_timeout=15,
+        )
+
+    return connect
+
+
+def business_directory_from_env() -> MySqlBusinessDirectory | None:
+    """业务库配置缺失时返回 None；调用方必须据此跳过，不得回退其他库。"""
+    try:
+        factory = business_connection_factory()
+    except Exception:
+        return None
+    return MySqlBusinessDirectory(factory)
