@@ -10,7 +10,7 @@ import { getShareTagLabel } from '../../src/utils/shareConfig.js'
 
 const SHARED_TO_DEPARTMENT = {
   version: 2,
-  read_scope: { access_level: 'department', department_ids: [7], user_uids: [] },
+  read_scope: { access_levels: ['department'], department_ids: [7], user_uids: [] },
   manage_scope: null
 }
 

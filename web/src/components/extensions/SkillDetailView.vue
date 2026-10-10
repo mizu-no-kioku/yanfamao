@@ -407,6 +407,7 @@ import AgentFilePreview from '@/components/AgentFilePreview.vue'
 import ExtensionDetailLayout from '@/components/shared/ExtensionDetailLayout.vue'
 import FileTreeComponent from '@/components/FileTreeComponent.vue'
 import ShareConfigForm from '@/components/ShareConfigForm.vue'
+import { cloneScope } from '@/utils/shareConfig'
 
 const route = useRoute()
 const router = useRouter()
@@ -454,7 +455,7 @@ const enabledForm = ref(true)
 const shareConfigFormRef = ref(null)
 const shareConfigForm = ref({
   version: 2,
-  read_scope: { access_level: 'user', department_ids: [], user_uids: [] },
+  read_scope: { access_levels: ['user'], department_ids: [], user_uids: [] },
   manage_scope: null
 })
 const dependencyOptions = reactive({ tools: [], mcps: [], skills: [] })
@@ -634,24 +635,12 @@ const cloneShareConfig = (config) => ({
   read_scope:
     config?.version === 2
       ? config.read_scope
-        ? {
-            access_level: config.read_scope.access_level || 'global',
-            department_ids: [...(config.read_scope.department_ids || [])],
-            user_uids: [...(config.read_scope.user_uids || [])]
-          }
+        ? cloneScope(config.read_scope, ['global'])
         : null
-      : {
-          access_level: config?.access_level || 'user',
-          department_ids: [...(config?.department_ids || [])],
-          user_uids: [...(config?.user_uids || [])]
-        },
+      : cloneScope(config, ['user']),
   manage_scope:
     config?.version === 2 && config.manage_scope
-      ? {
-          access_level: config.manage_scope.access_level || 'global',
-          department_ids: [...(config.manage_scope.department_ids || [])],
-          user_uids: [...(config.manage_scope.user_uids || [])]
-        }
+      ? cloneScope(config.manage_scope, ['global'])
       : null
 })
 

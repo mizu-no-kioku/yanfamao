@@ -11,19 +11,19 @@ export const createDerivedShareConfig = ({ scope, departmentId, uid } = {}) => {
     return {
       version: 2,
       read_scope: {
-        access_level: 'department',
+        access_levels: ['department'],
         department_ids: [numericDepartmentId],
         user_uids: []
       },
       manage_scope: null
     }
   }
-  // 个人库、以及无部门的共享库都退到"仅创建者"。read_scope 必须非空，否则
-  // ShareConfigForm 会回落 global 并在挂载时 emit，把派生权威搬到前端。
+  // 个人库、以及无部门的共享库都退到"仅创建者"。read_scope 必须非空且带名单：缺档位或
+  // 空名单在表单里是非法状态（validate() 会挡住保存），派生默认值要与后端保持一致。
   return {
     version: 2,
     read_scope: {
-      access_level: 'user',
+      access_levels: ['user'],
       department_ids: [],
       user_uids: uid ? [String(uid)] : []
     },

@@ -7,6 +7,7 @@ import { useRouter } from 'vue-router'
 import { agentApi } from '@/apis/agent_api'
 import AgentEditModal from '@/components/model-management/AgentEditModal.vue'
 import { isBuiltinAgent, useAgentStore } from '@/stores/agent'
+import { isGlobalScope } from '@/utils/shareConfig'
 import PageShoulder from '@/components/shared/PageShoulder.vue'
 import InfoCard from '@/components/shared/InfoCard.vue'
 import FallbackAvatar from '@/components/common/FallbackAvatar.vue'
@@ -60,8 +61,8 @@ const agentStats = computed(() => ({
   total: managedAgents.value.length,
   builtin: managedAgents.value.filter(isBuiltinAgent).length,
   manageable: managedAgents.value.filter((agent) => agent.can_manage).length,
-  global: managedAgents.value.filter(
-    (agent) => (agent.share_config?.read_scope || agent.share_config)?.access_level === 'global'
+  global: managedAgents.value.filter((agent) =>
+    isGlobalScope(agent.share_config?.read_scope || agent.share_config)
   ).length
 }))
 const canManageAgent = (agent) => !!agent?.can_manage

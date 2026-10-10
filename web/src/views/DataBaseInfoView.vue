@@ -461,6 +461,7 @@ import ShareConfigForm from '@/components/ShareConfigForm.vue'
 import { databaseApi } from '@/apis/knowledge_api'
 import { departmentApi } from '@/apis/department_api'
 import { authApi } from '@/apis/auth_api'
+import { isGlobalScope, toAccessLevels } from '@/utils/shareConfig'
 import { useChunkPresetOptions } from '@/composables/useChunkPresetOptions'
 import { DEFAULT_CHUNK_PRESET_ID } from '@/utils/chunkUtils'
 import { kbUtils } from '@/utils/kb_utils'
@@ -912,7 +913,7 @@ const editFormRef = ref(null)
 const shareConfigFormRef = ref(null)
 const editShareConfig = ref({
   version: 2,
-  read_scope: { access_level: 'global', department_ids: [], user_uids: [] },
+  read_scope: { access_levels: ['global'], department_ids: [], user_uids: [] },
   manage_scope: null
 })
 const editForm = reactive({
@@ -956,15 +957,20 @@ const shareConfigDisplay = computed(() => {
   const readScope = shareConfig.version === 2 ? shareConfig.read_scope : shareConfig
   const manageScope = shareConfig.manage_scope
   const describeScope = (scope) => {
-    if (!scope) return '无'
-    if (scope.access_level === 'global') return '全局'
-    if (scope.access_level === 'department') {
+    const levels = toAccessLevels(scope)
+    if (!levels.length) return '无'
+    if (levels.includes('global')) return '全局'
+    const parts = []
+    if (levels.includes('department')) {
       const names =
         (scope.department_ids || []).map((id) => getDepartmentName(id)).join('、') || '无'
-      return `${scope.department_ids?.length || 0} 个部门：${names}`
+      parts.push(`${scope.department_ids?.length || 0} 个部门：${names}`)
     }
-    const names = (scope.user_uids || []).map((uid) => getUserName(uid)).join('、') || '无'
-    return `${scope.user_uids?.length || 0} 个用户：${names}`
+    if (levels.includes('user')) {
+      const names = (scope.user_uids || []).map((uid) => getUserName(uid)).join('、') || '无'
+      parts.push(`${scope.user_uids?.length || 0} 个用户：${names}`)
+    }
+    return parts.join('；')
   }
   if (manageScope) {
     return {
@@ -975,7 +981,7 @@ const shareConfigDisplay = computed(() => {
   }
   return {
     color: 'green',
-    label: readScope?.access_level === 'global' ? '全局只读' : '共享只读',
+    label: isGlobalScope(readScope) ? '全局只读' : '共享只读',
     detail: `读取：${describeScope(readScope)}`
   }
 })
@@ -1025,7 +1031,7 @@ const showEditModal = () => {
   editForm.notion_version = database.value.additional_params?.notion_version || '2026-03-11'
   editShareConfig.value = database.value.share_config || {
     version: 2,
-    read_scope: { access_level: 'global', department_ids: [], user_uids: [] },
+    read_scope: { access_levels: ['global'], department_ids: [], user_uids: [] },
     manage_scope: null
   }
   editModalVisible.value = true

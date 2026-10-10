@@ -105,13 +105,13 @@ test('未显式配置共享时不发送 share_config，显式配置时按用户�
     typeInfo,
     {
       version: 2,
-      read_scope: { access_level: 'department', department_ids: [7], user_uids: [] },
+      read_scope: { access_levels: ['department'], department_ids: [7], user_uids: [] },
       manage_scope: null
     },
     'fallback/model',
     'shared'
   )
-  assert.equal(configured.share_config.read_scope.access_level, 'department')
+  assert.deepEqual(configured.share_config.read_scope.access_levels, ['department'])
   assert.deepEqual(configured.share_config.read_scope.department_ids, [7])
 })
 
@@ -119,17 +119,17 @@ test('未交互时表单展示的默认共享范围与后端派生结果一致',
   // 共享库 + 有部门 → 本部门；这是「共享库默认限本部门」在界面上的呈现，
   // 必须与 backend `_normalize_share_config` 的 None 分支一致。
   const shared = createDerivedShareConfig({ scope: 'shared', departmentId: 7, uid: 'u1' })
-  assert.equal(shared.read_scope.access_level, 'department')
+  assert.deepEqual(shared.read_scope.access_levels, ['department'])
   assert.deepEqual(shared.read_scope.department_ids, [7])
 
   // 共享库 + 无部门 → 仅创建者，绝不 global。
   const sharedNoDepartment = createDerivedShareConfig({ scope: 'shared', departmentId: null, uid: 'u1' })
-  assert.equal(sharedNoDepartment.read_scope.access_level, 'user')
+  assert.deepEqual(sharedNoDepartment.read_scope.access_levels, ['user'])
   assert.deepEqual(sharedNoDepartment.read_scope.user_uids, ['u1'])
 
   // 个人库 → 仅创建者（不允许因为部门存在而放宽）。
   const personal = createDerivedShareConfig({ scope: 'personal', departmentId: 7, uid: 'u1' })
-  assert.equal(personal.read_scope.access_level, 'user')
+  assert.deepEqual(personal.read_scope.access_levels, ['user'])
   assert.deepEqual(personal.read_scope.user_uids, ['u1'])
 
   for (const config of [shared, sharedNoDepartment, personal]) {
@@ -137,7 +137,8 @@ test('未交互时表单展示的默认共享范围与后端派生结果一致',
     assert.equal(config.manage_scope, null)
     // read_scope 必须存在：否则 ShareConfigForm 会回落 global 并在挂载时 emit。
     assert.ok(config.read_scope)
-    assert.notEqual(config.read_scope.access_level, 'global')
+    // 缺 read_scope 在表单里是非法状态（validate() 会挡住保存），派生默认值绝不写入 global。
+    assert.ok(!config.read_scope.access_levels.includes('global'))
   }
 })
 

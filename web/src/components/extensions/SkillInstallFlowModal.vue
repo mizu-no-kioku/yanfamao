@@ -227,6 +227,7 @@
 import { computed, defineComponent, h, nextTick, ref, watch } from 'vue'
 import { CheckCircle2, Circle, LoaderCircle, PackageOpen, X as XIcon, XCircle } from '@lucide/vue'
 import ShareConfigForm from '@/components/ShareConfigForm.vue'
+import { cloneScope, toAccessLevels } from '@/utils/shareConfig'
 import { skillApi } from '@/apis/skill_api'
 import { useUserStore } from '@/stores/user'
 
@@ -247,7 +248,7 @@ const reviewItems = ref([])
 const installItems = ref([])
 const shareConfig = ref({
   version: 2,
-  read_scope: { access_level: 'user', department_ids: [], user_uids: [] },
+  read_scope: { access_levels: ['user'], department_ids: [], user_uids: [] },
   manage_scope: null
 })
 const installTarget = ref('personal')
@@ -304,9 +305,12 @@ const loadingSourceCount = computed(
 )
 const shareScopeLabel = computed(() => {
   const scope = shareConfig.value.read_scope || shareConfig.value.manage_scope || shareConfig.value
-  return (
-    { global: '全局共享', department: '部门共享', user: '指定人' }[scope.access_level] || '指定人'
-  )
+  const levels = toAccessLevels(scope)
+  if (levels.includes('global')) return '全局共享'
+  const labels = []
+  if (levels.includes('department')) labels.push('部门共享')
+  if (levels.includes('user')) labels.push('指定人')
+  return labels.join(' + ') || '指定人'
 })
 const installTargetLabel = computed(() =>
   installTarget.value === 'personal' ? '个人 Skill' : shareScopeLabel.value
@@ -345,24 +349,12 @@ const cloneShareConfig = (config) => ({
   read_scope:
     config?.version === 2
       ? config.read_scope
-        ? {
-            access_level: config.read_scope.access_level || 'user',
-            department_ids: [...(config.read_scope.department_ids || [])],
-            user_uids: [...(config.read_scope.user_uids || [])]
-          }
+        ? cloneScope(config.read_scope, ['user'])
         : null
-      : {
-          access_level: config?.access_level || 'user',
-          department_ids: [...(config?.department_ids || [])],
-          user_uids: [...(config?.user_uids || [])]
-        },
+      : cloneScope(config, ['user']),
   manage_scope:
     config?.version === 2 && config.manage_scope
-      ? {
-          access_level: config.manage_scope.access_level || 'global',
-          department_ids: [...(config.manage_scope.department_ids || [])],
-          user_uids: [...(config.manage_scope.user_uids || [])]
-        }
+      ? cloneScope(config.manage_scope, ['global'])
       : null
 })
 

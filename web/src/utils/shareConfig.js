@@ -4,10 +4,13 @@ export function getShareConfigLabel(shareConfig) {
   const manageScope = config.manage_scope
   if (config.version === 2 && !config.read_scope && !manageScope) return '仅所有者'
   const scopeLabel = (scope) => {
-    if (!scope) return '无'
-    if (scope.access_level === 'global') return '全局'
-    if (scope.access_level === 'department') return `部门(${scope.department_ids?.length || 0})`
-    return `用户(${scope.user_uids?.length || 0})`
+    const levels = toAccessLevels(scope)
+    if (!levels.length) return '无'
+    if (levels.includes('global')) return '全局'
+    const parts = []
+    if (levels.includes('department')) parts.push(`部门(${scope.department_ids?.length || 0})`)
+    if (levels.includes('user')) parts.push(`用户(${scope.user_uids?.length || 0})`)
+    return parts.join(' · ')
   }
   return manageScope
     ? `读${scopeLabel(readScope)} · 管${scopeLabel(manageScope)}`
@@ -30,10 +33,26 @@ export function getShareTagLabel(database) {
 export const toAccessLevels = (scope) => {
   if (!scope) return []
   const raw = scope.access_levels ?? (scope.access_level ? [scope.access_level] : [])
-  return (Array.isArray(raw) ? raw : []).filter((level) =>
-    ['global', 'department', 'user'].includes(level)
-  )
+  return [
+    ...new Set((Array.isArray(raw) ? raw : []).filter((l) => ['global', 'department', 'user'].includes(l)))
+  ]
 }
 
 /** 是否全局共享；只按档位数组判定，并集不是全局。 */
 export const isGlobalScope = (scope) => toAccessLevels(scope).includes('global')
+
+/**
+ * 克隆一份共享范围，并把形状收成合法表达：读不到档位时用 `fallbackLevels` 兜底，且
+ * 清掉不属于所保留档位的名单——「含 global 必须唯一」「不含 department ⇒ department_ids 为空」
+ * 是后端认的合法表达，前端不得产出反例。
+ */
+export const cloneScope = (scope, fallbackLevels = []) => {
+  if (!scope) return null
+  const levels = toAccessLevels(scope)
+  const resolved = levels.length ? levels : fallbackLevels
+  return {
+    access_levels: [...resolved],
+    department_ids: resolved.includes('department') ? [...(scope.department_ids || [])] : [],
+    user_uids: resolved.includes('user') ? [...(scope.user_uids || [])] : []
+  }
+}

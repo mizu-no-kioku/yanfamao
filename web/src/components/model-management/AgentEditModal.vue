@@ -20,6 +20,7 @@ import { useUserStore } from '@/stores/user'
 import { generatePixelAvatar } from '@/utils/pixelAvatar'
 import { MAX_IMAGE_UPLOAD_SIZE_BYTES, MAX_IMAGE_UPLOAD_SIZE_MB } from '@/utils/upload_limits'
 import { normalizeAgent } from '@/utils/agentConfigUtils'
+import { cloneScope, toAccessLevels } from '@/utils/shareConfig'
 
 const props = defineProps({
   backendOptions: { type: Array, default: () => [] }
@@ -43,7 +44,7 @@ const agentShareConfigFormRef = ref(null)
 const agentNameInputRef = ref(null)
 const agentShareConfig = ref({
   version: 2,
-  read_scope: { access_level: 'user', department_ids: [], user_uids: [] },
+  read_scope: { access_levels: ['user'], department_ids: [], user_uids: [] },
   manage_scope: null
 })
 const agentForm = reactive({
@@ -67,14 +68,6 @@ const snapshotAgentForm = () => ({
 
 const cloneShareConfig = (share) => {
   if (!share) return null
-  const cloneScope = (scope) =>
-    scope
-      ? {
-          access_level: scope.access_level,
-          department_ids: [...(scope.department_ids || [])],
-          user_uids: [...(scope.user_uids || [])]
-        }
-      : null
   return {
     version: share.version,
     read_scope: cloneScope(share.read_scope),
@@ -87,7 +80,7 @@ const snapshotShareConfig = () => {
   if (isBuiltinAgent({ id: editingAgentId.value })) {
     return cloneShareConfig({
       version: 2,
-      read_scope: { access_level: 'global', department_ids: [], user_uids: [] },
+      read_scope: { access_levels: ['global'], department_ids: [], user_uids: [] },
       manage_scope: null
     })
   }
@@ -100,13 +93,13 @@ const stringifyShareConfig = (share) => {
   return JSON.stringify({
     version: share.version,
     read_scope: {
-      access_level: share.read_scope?.access_level || null,
+      access_levels: sortIds(toAccessLevels(share.read_scope)),
       department_ids: sortIds(share.read_scope?.department_ids),
       user_uids: sortIds(share.read_scope?.user_uids)
     },
     manage_scope: share.manage_scope
       ? {
-          access_level: share.manage_scope.access_level,
+          access_levels: sortIds(toAccessLevels(share.manage_scope)),
           department_ids: sortIds(share.manage_scope.department_ids),
           user_uids: sortIds(share.manage_scope.user_uids)
         }
@@ -162,7 +155,7 @@ const isSubAgentBackend = (backendId) => backendId === SUB_AGENT_BACKEND_ID
 const getInitialShareConfig = () => ({
   version: 2,
   read_scope: {
-    access_level: 'user',
+    access_levels: ['user'],
     department_ids: [],
     user_uids: userStore.uid ? [userStore.uid] : []
   },
@@ -173,7 +166,7 @@ const normalizeShareConfigForPayload = () => {
   if (isBuiltinAgent({ id: editingAgentId.value })) {
     return {
       version: 2,
-      read_scope: { access_level: 'global', department_ids: [], user_uids: [] },
+      read_scope: { access_levels: ['global'], department_ids: [], user_uids: [] },
       manage_scope: null
     }
   }
@@ -273,7 +266,7 @@ const openEdit = async (agent) => {
   agentShareConfig.value = isBuiltinAgent(detail)
     ? {
         version: 2,
-        read_scope: { access_level: 'global', department_ids: [], user_uids: [] },
+        read_scope: { access_levels: ['global'], department_ids: [], user_uids: [] },
         manage_scope: null
       }
     : detail.share_config || getInitialShareConfig()
