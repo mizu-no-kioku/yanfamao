@@ -50,6 +50,20 @@ def test_rejects_table_outside_upper_bound():
     assert "不可开放的表" in str(exc.value) and "t_staff_wage" in str(exc.value)
 
 
+def test_rejects_permanently_denied_table_even_if_in_upper_bound(monkeypatch):
+    """永久拒绝表即便被加进代码上限也必须拒绝。
+
+    不能只靠「两张清单恰好互斥」这个巧合——那是个没有被表达、也没有被验证的不变量。
+    """
+    monkeypatch.setitem(
+        table_policy.TABLE_UPPER_BOUNDS, "t_user", table_policy.TABLE_UPPER_BOUNDS["t_project"]
+    )
+    payload = _payload("AI_QA_USE", {"t_user": ["ID", "TENANT_ID", "PROJECT_NAME"]})
+    with pytest.raises(resource_policy.ResourcePolicyError) as exc:
+        resource_policy.build_policy(payload)
+    assert "永久拒绝的表" in str(exc.value)
+
+
 def test_rejects_columns_outside_upper_bound():
     payload = _payload("AI_QA_USE", {"t_project": ["ID", "PROJECT_NAME", "SALARY"]})
     with pytest.raises(resource_policy.ResourcePolicyError) as exc:

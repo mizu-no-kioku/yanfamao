@@ -7,6 +7,7 @@ YAML 只能在上限内取子集。越界的表、列或永久拒绝项一律报
 from collections.abc import Collection, Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 
 import yaml
 
@@ -47,6 +48,8 @@ def build_policy(payload: dict) -> tuple[dict[str, ResourceGrant], dict[str, tup
         for table, columns in (spec.get("tables") or {}).items():
             if not table_policy.has_complete_row_rule(table):
                 raise ResourcePolicyError(f"{resource_code} 引用了不可开放的表: {table}")
+            if table in table_policy.PERMANENTLY_DENIED_TABLES:
+                raise ResourcePolicyError(f"{resource_code} 引用了永久拒绝的表: {table}")
             bound = table_policy.TABLE_UPPER_BOUNDS[table]
             requested = frozenset(str(column).upper() for column in columns)
             denied = requested & table_policy.PERMANENTLY_DENIED_COLUMNS
@@ -63,7 +66,7 @@ def build_policy(payload: dict) -> tuple[dict[str, ResourceGrant], dict[str, tup
         resources[str(resource_code)] = ResourceGrant(
             resource_code=str(resource_code),
             tables=frozenset(tables),
-            columns=tables,
+            columns=MappingProxyType(tables),
             max_rows=max_rows,
         )
     return resources, menu_binding, gate_ids
