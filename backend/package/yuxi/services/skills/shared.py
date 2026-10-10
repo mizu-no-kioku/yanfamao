@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from yuxi.agents.mcp.service import get_enabled_mcp_server_slugs
 from yuxi.agents.skills.buildin import BUILTIN_SKILLS_DIR
 from yuxi.config import get_skill_data_dir
-from yuxi.permissions import ResourcePermission, normalize_permission_config, resolve_skill_permission
+from yuxi.permissions import ResourcePermission, normalize_permission_config, resolve_skill_permission, scope_contains
 from yuxi.repositories.skill_repository import SkillRepository
 from yuxi.services.skills.draft import consume_installed_draft_items, load_and_select_draft_items
 from yuxi.services.skills.package import (
@@ -506,23 +506,9 @@ def list_builtin_skill_specs() -> list[dict[str, Any]]:
 
 
 def _scope_contains(container: dict, target: dict) -> bool:
-    """判断一个共享范围是否完整覆盖另一个范围。"""
+    """判断一个共享范围是否完整覆盖另一个范围（实现见 yuxi.permissions）。"""
 
-    container_level = container.get("access_level")
-    target_level = target.get("access_level")
-    if container_level == "global":
-        return True
-    if target_level == "global" or container_level != target_level:
-        return False
-    if target_level == "department":
-        container_ids = {int(value) for value in container.get("department_ids") or []}
-        target_ids = {int(value) for value in target.get("department_ids") or []}
-        return target_ids.issubset(container_ids)
-    if target_level == "user":
-        container_uids = {str(value) for value in container.get("user_uids") or []}
-        target_uids = {str(value) for value in target.get("user_uids") or []}
-        return target_uids.issubset(container_uids)
-    return False
+    return scope_contains(container, target)
 
 
 def _ensure_non_builtin(item: Skill) -> None:

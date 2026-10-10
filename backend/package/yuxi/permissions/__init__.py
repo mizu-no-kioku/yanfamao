@@ -13,6 +13,7 @@ from yuxi.permissions.resource_permission import (
     resolve_knowledge_base_permission,
     resolve_resource_permission,
     resolve_skill_permission,
+    scope_contains,
     scope_matches,
 )
 
@@ -29,5 +30,6 @@ __all__ = [
     "resolve_knowledge_base_permission",
     "resolve_resource_permission",
     "resolve_skill_permission",
+    "scope_contains",
     "scope_matches",
 ]
