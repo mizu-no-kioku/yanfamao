@@ -11,7 +11,8 @@ def _business_config():
 
     try:
         return load_business_database_config()
-    except Exception:
+    except PermissionError:
+        # 仅“变量缺失”可用作跳过理由；配置存在但格式错误会让 ValueError 冒泡成失败。
         return None
 
 
@@ -47,6 +48,32 @@ def test_test_database_config_is_independent_from_business_config():
     from yuxi.nl2sql.test_database import TEST_CONFIG_ENV
 
     assert TEST_CONFIG_ENV != "YUXI_BUSINESS_DATABASE_CONFIG"
+
+
+def test_malformed_business_config_fails_instead_of_skipping(monkeypatch):
+    """配置存在但非法时必须失败，不得被当作“未配置”而跳过。
+
+    否则部署管理员写错一个字符，就会得到一个绿色 skipped 套件、却从未触达生产库。
+    只有“变量缺失”（PermissionError）才允许降级为 None；格式错误（ValueError）必须冒泡。
+    """
+    from yuxi.nl2sql.mysql_directory import business_directory_from_env
+    from yuxi.services.business_database_service import load_business_database_config
+
+    monkeypatch.setenv("YUXI_BUSINESS_DATABASE_CONFIG", "{ not json")
+
+    with pytest.raises(ValueError):
+        load_business_database_config()
+    with pytest.raises(ValueError):
+        _business_config()
+    with pytest.raises(ValueError):
+        business_directory_from_env()
+
+    monkeypatch.delenv("YUXI_BUSINESS_DATABASE_CONFIG", raising=False)
+
+    with pytest.raises(PermissionError):
+        load_business_database_config()
+    assert _business_config() is None
+    assert business_directory_from_env() is None
 
 
 def test_trial_identity_chain_resolves_on_business_db(business_directory):

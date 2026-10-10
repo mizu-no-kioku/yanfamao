@@ -167,6 +167,7 @@ def business_directory_from_env() -> MySqlBusinessDirectory | None:
     """业务库配置缺失时返回 None；调用方必须据此跳过，不得回退其他库。"""
     try:
         factory = business_connection_factory()
-    except Exception:
+    except PermissionError:
+        # 仅“配置缺失”降级为 None；配置存在但非法会冒泡，避免被误当作未配置。
         return None
     return MySqlBusinessDirectory(factory)
