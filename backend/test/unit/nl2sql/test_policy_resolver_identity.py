@@ -28,7 +28,9 @@ def deny_code(exc_info):
 
 
 def test_missing_user_is_denied():
-    directory = FakeDirectory(active_users=())
+    # 租户列表必须非空：否则本用例会顺带命中「没有租户归属」分支，
+    # 删掉「用户不存在」这条守卫后测试仍然全绿，守卫等于没被验证。
+    directory = FakeDirectory(active_users=(), tenants_by_user={1001: (10,)})
     with pytest.raises(errors.PolicyDenial) as exc:
         resolve_business_subject(BusinessPrincipal(user_id=1001), directory)
     assert deny_code(exc) == errors.IDENTITY_USER_MISSING
@@ -38,7 +40,7 @@ def test_user_without_tenant_relation_is_denied():
     directory = FakeDirectory(active_users={1001}, tenants_by_user={})
     with pytest.raises(errors.PolicyDenial) as exc:
         resolve_business_subject(BusinessPrincipal(user_id=1001), directory)
-    assert deny_code(exc) == errors.IDENTITY_USER_MISSING
+    assert deny_code(exc) == errors.IDENTITY_USER_NO_TENANT
 
 
 def test_multi_tenant_user_without_explicit_tenant_is_denied():
@@ -60,7 +62,7 @@ def test_requested_tenant_not_owned_by_user_is_denied():
     directory = FakeDirectory(active_users={1001}, tenants_by_user={1001: (10,)})
     with pytest.raises(errors.PolicyDenial) as exc:
         resolve_business_subject(BusinessPrincipal(user_id=1001, tenant_id=20), directory)
-    assert deny_code(exc) == errors.IDENTITY_USER_MISSING
+    assert deny_code(exc) == errors.IDENTITY_TENANT_NOT_OWNED
 
 
 def test_single_tenant_is_inferred_without_explicit_tenant():

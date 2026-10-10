@@ -23,7 +23,7 @@ def resolve_business_subject(principal: BusinessPrincipal, directory: BusinessDi
 
     tenants = directory.find_tenants_for_user(principal.user_id)
     if not tenants:
-        raise errors.PolicyDenial(errors.IDENTITY_USER_MISSING, "业务用户没有任何租户归属")
+        raise errors.PolicyDenial(errors.IDENTITY_USER_NO_TENANT, "业务用户没有任何租户归属")
 
     if principal.tenant_id is None:
         if len(tenants) > 1:
@@ -34,7 +34,7 @@ def resolve_business_subject(principal: BusinessPrincipal, directory: BusinessDi
         tenant_id = tenants[0]
     else:
         if principal.tenant_id not in tenants:
-            raise errors.PolicyDenial(errors.IDENTITY_USER_MISSING, "指定的租户与用户归属不符")
+            raise errors.PolicyDenial(errors.IDENTITY_TENANT_NOT_OWNED, "指定的租户与用户归属不符")
         tenant_id = principal.tenant_id
 
     staff_ids = directory.find_active_staff_ids(principal.user_id, tenant_id)
