@@ -132,10 +132,14 @@ async def test_document_download_preserves_inner_http_exception(monkeypatch):
     monkeypatch.setattr(
         knowledge_router.knowledge_base,
         "get_file_basic_info",
-        AsyncMock(return_value={"meta": {"path": "http://minio:9000/documents/file.txt"}}),
+        AsyncMock(return_value={"meta": {"path": "minio://knowledgebases/kb-1/upload/file.txt"}}),
     )
     monkeypatch.setattr(knowledge_router, "is_minio_url", lambda _path: True)
-    monkeypatch.setattr(knowledge_router, "parse_minio_url", lambda _path: ("documents", "file.txt"))
+    monkeypatch.setattr(
+        knowledge_router,
+        "parse_owned_kb_minio_url",
+        lambda _path, _kb_id, **_kwargs: ("knowledgebases", "kb-1/upload/file.txt"),
+    )
     client = SimpleNamespace(adownload_response=AsyncMock(side_effect=error))
     monkeypatch.setattr(knowledge_router, "get_minio_client", lambda: client)
 

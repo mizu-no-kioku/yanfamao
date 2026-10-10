@@ -34,10 +34,19 @@ def example_tool(text: str) -> str:
 | `present_artifacts` | 展示当前用户可见的文件产物 |
 | `install_skill` | 从允许的沙盒路径或 Git 来源安装个人 Skill；子智能体不可用 |
 | `web_search` | 使用已配置的豆包或 Tavily 搜索网页 |
+| `list_business_database_tables` | 列出当前身份可查询的原业务表 |
+| `describe_business_database_table` | 读取授权表经过字段过滤的 Schema |
+| `query_business_database` | 在强制租户、员工、项目和只读限制下执行查询 |
 
 文件读写和命令执行由 Agent 的 Sandbox backend 提供。`present_artifacts` 推荐展示当前 Project 的 `outputs/` 文件；`large_tool_results` 和会话摘要等内部文件不会作为交付物展示。
 
 图片生成能力由内置 `image-gen` Skill 提供，不再作为独立的 Python 工具注册。具体依赖和文件位置由该 Skill 说明。
+
+## 内置工具：业务数据库问数
+
+配置完整时，`business_database` 工具包注册三个 `buildin` 工具。在智能体配置中选择“列出授权业务表”“查看授权业务表结构”“查询业务数据库”，Agent 即可依次发现表、读取可见字段并执行一条只读查询。SQL 生成和结果归纳由当前 Agent 完成，模型用量与工具审计沿用同一 Run 的链路。
+
+工具从 `ToolRuntime` 读取当前用户 `uid`，服务端解析对应的业务租户、员工和项目权限。工具参数只包含占位参数、表名或 SQL。管理员接入步骤、配置限制和排障见[业务数据库接入](../advanced/business-database.md)，模块职责见仓库根 `ARCHITECTURE.md` 的“业务数据库问数边界”一节。
 
 ## 知识库工具
 

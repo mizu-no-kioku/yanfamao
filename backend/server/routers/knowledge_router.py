@@ -17,7 +17,12 @@ from yuxi.knowledge.graphs.milvus_graph_service import GRAPH_TASK_TYPE, MilvusGr
 from yuxi.knowledge.read_models import KnowledgeBaseDetail
 from yuxi.knowledge.parser.capabilities import SUPPORTED_FILE_EXTENSIONS, is_supported_file_extension
 from yuxi.knowledge.runtime import knowledge_base
-from yuxi.knowledge.utils import calculate_content_hash, is_minio_url, params_for_uploaded_document, parse_minio_url
+from yuxi.knowledge.utils import (
+    calculate_content_hash,
+    is_minio_url,
+    params_for_uploaded_document,
+    parse_owned_kb_minio_url,
+)
 from yuxi.knowledge.utils.mindmap_utils import (
     batch_remove_files_from_mindmap,
     generate_database_mindmap,
@@ -144,7 +149,12 @@ async def _delete_document_storage_objects(kb_id: str, doc_id: str, file_path: s
 
     if is_minio_url(file_path):
         try:
-            bucket_name, object_name = parse_minio_url(file_path)
+            bucket_name, object_name = parse_owned_kb_minio_url(
+                file_path,
+                kb_id,
+                expected_bucket=minio_client.KB_BUCKETS["documents"],
+                required_section="upload",
+            )
             await minio_client.adelete_file(bucket_name, object_name)
         except Exception as minio_error:
             logger.warning(f"从MinIO删除原始文件失败: {minio_error}")
@@ -194,7 +204,7 @@ def _ensure_document_params(params: dict | None) -> dict:
     return params
 
 
-def _validate_uploaded_document_items(items: list[str], params: dict) -> None:
+def _validate_uploaded_document_items(kb_id: str, items: list[str], params: dict) -> None:
     if not items:
         raise HTTPException(status_code=400, detail="items must not be empty")
 
@@ -215,10 +225,28 @@ def _validate_uploaded_document_items(items: list[str], params: dict) -> None:
             raise HTTPException(status_code=400, detail="items must only contain non-empty strings")
         if not is_minio_url(item):
             raise HTTPException(status_code=400, detail="File source must be a MinIO URL")
+        try:
+            parse_owned_kb_minio_url(
+                item,
+                kb_id,
+                expected_bucket=MinIOClient.KB_BUCKETS["documents"],
+                required_section="upload",
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
         has_content_hash = isinstance(content_hashes, dict) and bool(content_hashes.get(item))
         preprocessed = preprocessed_map.get(item) if isinstance(preprocessed_map, dict) else None
         has_preprocessed_hash = isinstance(preprocessed, dict) and bool(preprocessed.get("content_hash"))
+        if isinstance(preprocessed, dict) and preprocessed.get("path"):
+            try:
+                parse_owned_kb_minio_url(
+                    preprocessed["path"],
+                    kb_id,
+                    expected_bucket=MinIOClient.KB_BUCKETS["parsed"],
+                )
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
         if not has_content_hash and not has_preprocessed_hash:
             raise HTTPException(status_code=400, detail=f"Missing content_hash for file: {item}")
 
@@ -277,8 +305,7 @@ async def create_database(
 
     logger.debug(
         f"Create database {database_name} with kb_type {kb_type}, scope {scope}, "
-        f"additional_params {additional_params}, llm_model_spec {llm_model_spec}, "
-        f"embedding_model_spec {embedding_model_spec}, share_config {share_config}"
+        f"llm_model_spec {llm_model_spec}, embedding_model_spec {embedding_model_spec}"
     )
     try:
         database_info = await knowledge_base.create_database(
@@ -439,7 +466,8 @@ async def update_database_info(
     """更新知识库信息"""
     logger.debug(
         f"[update_database_info] 接收到的参数: name={data.name}, llm_model_spec={data.llm_model_spec}, "
-        f"additional_params={data.additional_params}, share_config={data.share_config}"
+        f"updated_additional_param_keys={sorted((data.additional_params or {}).keys())}, "
+        f"updates_share_config={data.share_config is not None}"
     )
     try:
         update_llm_model_spec = "llm_model_spec" in data.model_fields_set
@@ -524,26 +552,27 @@ async def index_graph_build(
     current_user: User = Depends(require_knowledge_base_manage),
 ):
     try:
-        if await _has_running_graph_build_task(kb_id):
-            raise HTTPException(status_code=409, detail="该知识库已有正在运行的图谱构建任务")
+        async with tasker.lock_resource(f"knowledge-graph:{kb_id}"):
+            if await _has_running_graph_build_task(kb_id):
+                raise HTTPException(status_code=409, detail="该知识库已有正在运行的图谱构建任务")
 
-        database = await knowledge_base.get_database_info(kb_id)
-        if not database:
-            raise HTTPException(status_code=404, detail=f"知识库 {kb_id} 不存在")
+            database = await knowledge_base.get_database_info(kb_id)
+            if not database:
+                raise HTTPException(status_code=404, detail=f"知识库 {kb_id} 不存在")
 
-        service = MilvusGraphService()
-        graph_status = await service.get_status(kb_id)
-        if not graph_status.get("locked"):
-            raise HTTPException(status_code=400, detail="请先确认并锁定图谱抽取配置")
+            service = MilvusGraphService()
+            graph_status = await service.get_status(kb_id)
+            if not graph_status.get("locked"):
+                raise HTTPException(status_code=400, detail="请先确认并锁定图谱抽取配置")
 
-        task, created = await tasker.enqueue_unique_by_payload(
-            name=f"图谱构建 ({database.name})",
-            task_type=GRAPH_TASK_TYPE,
-            payload={"kb_id": kb_id, "action": "build"},
-            payload_match={"kb_id": kb_id},
-        )
-        if not created:
-            raise HTTPException(status_code=409, detail="该知识库已有正在运行的图谱构建任务")
+            task, created = await tasker.enqueue_unique_by_payload(
+                name=f"图谱构建 ({database.name})",
+                task_type=GRAPH_TASK_TYPE,
+                payload={"kb_id": kb_id, "action": "build", "operator_id": current_user.uid},
+                payload_match={"kb_id": kb_id},
+            )
+            if not created:
+                raise HTTPException(status_code=409, detail="该知识库已有正在运行的图谱构建任务")
         return {"message": "图谱构建任务已提交", "status": "queued", "task_id": task.id}
     except HTTPException:
         raise
@@ -579,14 +608,15 @@ async def reset_graph_build(
 ):
     data = data or {}
     try:
-        if await _has_running_graph_build_task(kb_id):
-            raise HTTPException(status_code=409, detail="该知识库存在正在运行的图谱构建任务，无法重置")
+        async with tasker.lock_resource(f"knowledge-graph:{kb_id}"):
+            if await _has_running_graph_build_task(kb_id):
+                raise HTTPException(status_code=409, detail="该知识库存在正在运行的图谱构建任务，无法重置")
 
-        return await MilvusGraphService().reset(
-            kb_id,
-            clear_extraction_result=bool(data.get("clear_extraction_result", True)),
-            clear_config=bool(data.get("clear_config", False)),
-        )
+            return await MilvusGraphService().reset(
+                kb_id,
+                clear_extraction_result=bool(data.get("clear_extraction_result", True)),
+                clear_config=bool(data.get("clear_config", False)),
+            )
     except HTTPException:
         raise
     except ValueError as e:
@@ -607,21 +637,27 @@ async def reconcile_graph_build(
     if mode not in {"failed", "all_vectors"}:
         raise HTTPException(status_code=400, detail="mode 必须是 failed 或 all_vectors")
     try:
-        if await _has_running_graph_build_task(kb_id):
-            raise HTTPException(status_code=409, detail="该知识库已有正在运行的图谱构建任务")
+        async with tasker.lock_resource(f"knowledge-graph:{kb_id}"):
+            if await _has_running_graph_build_task(kb_id):
+                raise HTTPException(status_code=409, detail="该知识库已有正在运行的图谱构建任务")
 
-        database = await knowledge_base.get_database_info(kb_id)
-        if not database:
-            raise HTTPException(status_code=404, detail=f"知识库 {kb_id} 不存在")
+            database = await knowledge_base.get_database_info(kb_id)
+            if not database:
+                raise HTTPException(status_code=404, detail=f"知识库 {kb_id} 不存在")
 
-        task, created = await tasker.enqueue_unique_by_payload(
-            name=f"图谱向量索引修复 ({database.name})",
-            task_type=GRAPH_TASK_TYPE,
-            payload={"kb_id": kb_id, "action": "reconcile", "reconcile_mode": mode},
-            payload_match={"kb_id": kb_id},
-        )
-        if not created:
-            raise HTTPException(status_code=409, detail="该知识库已有正在运行的图谱构建任务")
+            task, created = await tasker.enqueue_unique_by_payload(
+                name=f"图谱向量索引修复 ({database.name})",
+                task_type=GRAPH_TASK_TYPE,
+                payload={
+                    "kb_id": kb_id,
+                    "action": "reconcile",
+                    "reconcile_mode": mode,
+                    "operator_id": current_user.uid,
+                },
+                payload_match={"kb_id": kb_id},
+            )
+            if not created:
+                raise HTTPException(status_code=409, detail="该知识库已有正在运行的图谱构建任务")
         return {
             "message": "图谱向量索引修复任务已提交",
             "status": "queued",
@@ -643,21 +679,22 @@ async def backfill_graph_attributes(
     current_user: User = Depends(require_knowledge_base_manage),
 ):
     try:
-        if await _has_running_graph_build_task(kb_id):
-            raise HTTPException(status_code=409, detail="该知识库已有正在运行的图谱构建任务")
+        async with tasker.lock_resource(f"knowledge-graph:{kb_id}"):
+            if await _has_running_graph_build_task(kb_id):
+                raise HTTPException(status_code=409, detail="该知识库已有正在运行的图谱构建任务")
 
-        database = await knowledge_base.get_database_info(kb_id)
-        if not database:
-            raise HTTPException(status_code=404, detail=f"知识库 {kb_id} 不存在")
+            database = await knowledge_base.get_database_info(kb_id)
+            if not database:
+                raise HTTPException(status_code=404, detail=f"知识库 {kb_id} 不存在")
 
-        task, created = await tasker.enqueue_unique_by_payload(
-            name=f"图谱筛选属性回填 ({database.name})",
-            task_type=GRAPH_TASK_TYPE,
-            payload={"kb_id": kb_id, "action": "backfill_attributes"},
-            payload_match={"kb_id": kb_id},
-        )
-        if not created:
-            raise HTTPException(status_code=409, detail="该知识库已有正在运行的图谱构建任务")
+            task, created = await tasker.enqueue_unique_by_payload(
+                name=f"图谱筛选属性回填 ({database.name})",
+                task_type=GRAPH_TASK_TYPE,
+                payload={"kb_id": kb_id, "action": "backfill_attributes", "operator_id": current_user.uid},
+                payload_match={"kb_id": kb_id},
+            )
+            if not created:
+                raise HTTPException(status_code=409, detail="该知识库已有正在运行的图谱构建任务")
         return {"message": "图谱筛选属性回填任务已提交", "status": "queued", "task_id": task.id}
     except HTTPException:
         raise
@@ -791,7 +828,7 @@ async def add_documents(
     if content_type != "file":
         raise HTTPException(status_code=400, detail=f"Unsupported content_type: {content_type}")
 
-    _validate_uploaded_document_items(items, params)
+    _validate_uploaded_document_items(kb_id, items, params)
 
     try:
         database = await knowledge_base.get_database_info(kb_id)
@@ -835,7 +872,7 @@ async def add_uploaded_documents(
     if content_type != "file":
         raise HTTPException(status_code=400, detail=f"Unsupported content_type: {content_type}")
 
-    _validate_uploaded_document_items(payload.items, params)
+    _validate_uploaded_document_items(kb_id, payload.items, params)
 
     added_items: list[dict] = []
     failed_items: list[dict] = []
@@ -1241,7 +1278,12 @@ async def download_document(kb_id: str, doc_id: str, current_user: User = Depend
         logger.debug(f"Downloading from MinIO: {file_path}")
 
         try:
-            bucket_name, object_name = parse_minio_url(file_path)
+            bucket_name, object_name = parse_owned_kb_minio_url(
+                file_path,
+                kb_id,
+                expected_bucket=MinIOClient.KB_BUCKETS["documents"],
+                required_section="upload",
+            )
             logger.debug(f"Parsed bucket_name: {bucket_name}, object_name: {object_name}")
 
             minio_client = get_minio_client()
@@ -1347,11 +1389,13 @@ async def query_knowledge_base(
     try:
         result = await knowledge_base.aquery(query, kb_id=kb_id, **meta)
         return {"result": result, "status": "success"}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"知识库查询失败 {e}, {traceback.format_exc()}")
-        return {"message": f"知识库查询失败: {e}", "status": "failed"}
+        raise HTTPException(status_code=500, detail="知识库查询失败") from e
 
 
 @knowledge.post("/databases/{kb_id}/query-test")
@@ -1366,11 +1410,13 @@ async def query_test(
     try:
         result = await knowledge_base.aquery(query, kb_id=kb_id, **meta)
         return result
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"测试查询失败 {e}, {traceback.format_exc()}")
-        return {"message": f"测试查询失败: {e}", "status": "failed"}
+        raise HTTPException(status_code=500, detail="测试查询失败") from e
 
 
 @knowledge.put("/databases/{kb_id}/query-params")
@@ -1387,6 +1433,8 @@ async def update_knowledge_base_query_params(
 
     except KBNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e)) from e
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
     except HTTPException:
         raise
     except Exception as e:

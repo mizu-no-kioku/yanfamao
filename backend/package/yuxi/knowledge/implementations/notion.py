@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import os
 import time
 import traceback
@@ -178,7 +179,7 @@ class NotionKB(ReadOnlyConnectors):
     def __init__(self, work_dir: str, **kwargs):
         del kwargs
         super().__init__(work_dir)
-        self._page_markdown_cache: dict[tuple[str, str, str, str], tuple[float, str]] = {}
+        self._page_markdown_cache: dict[tuple[str, str, str, str, str], tuple[float, str]] = {}
 
     @classmethod
     def get_create_params_config(cls) -> dict[str, Any]:
@@ -416,7 +417,8 @@ class NotionKB(ReadOnlyConnectors):
 
     async def _read_page_markdown(self, kb_id: str, page_id: str, additional_params: dict[str, Any]) -> str:
         token, data_source_id, notion_version = self._get_connection_config(kb_id, additional_params)
-        cache_key = (kb_id, page_id, data_source_id, notion_version)
+        token_fingerprint = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        cache_key = (kb_id, page_id, data_source_id, notion_version, token_fingerprint)
         cached = self._get_cached_page_markdown(cache_key)
         if cached is not None:
             return cached
@@ -431,7 +433,7 @@ class NotionKB(ReadOnlyConnectors):
         self._set_cached_page_markdown(cache_key, content)
         return content
 
-    def _get_cached_page_markdown(self, cache_key: tuple[str, str, str, str]) -> str | None:
+    def _get_cached_page_markdown(self, cache_key: tuple[str, str, str, str, str]) -> str | None:
         cached = self._page_markdown_cache.get(cache_key)
         if not cached:
             return None
@@ -441,7 +443,7 @@ class NotionKB(ReadOnlyConnectors):
             return None
         return content
 
-    def _set_cached_page_markdown(self, cache_key: tuple[str, str, str, str], content: str) -> None:
+    def _set_cached_page_markdown(self, cache_key: tuple[str, str, str, str, str], content: str) -> None:
         if len(self._page_markdown_cache) >= NOTION_PAGE_CACHE_MAX_SIZE:
             oldest_key = min(self._page_markdown_cache, key=lambda key: self._page_markdown_cache[key][0])
             self._page_markdown_cache.pop(oldest_key, None)

@@ -103,7 +103,7 @@ def test_user_agent_and_skill_scope_preserves_user_management():
 def test_knowledge_base_owner_and_superadmin_can_manage():
     resource = _resource(created_by="owner", share_config={"version": 2})
 
-    assert resolve_knowledge_base_permission(_user(uid="owner"), resource) == ResourcePermission.MANAGE
+    assert resolve_knowledge_base_permission(_user(uid="owner"), resource) == ResourcePermission.READ
     assert resolve_knowledge_base_permission(_user(uid="owner", role="admin"), resource) == ResourcePermission.MANAGE
     assert resolve_knowledge_base_permission(_user(role="superadmin"), resource) == ResourcePermission.MANAGE
 
@@ -299,12 +299,23 @@ def test_shared_knowledge_base_non_owner_plain_user_with_matching_scope_gets_rea
     )
 
 
-def test_shared_knowledge_base_plain_user_creator_keeps_manage():
-    """既有行为记录（非本次目标）：创建者分支是绕过角色上限的早返回，普通用户对自己的共享库仍是 MANAGE。"""
+def test_shared_knowledge_base_plain_user_creator_is_limited_to_read():
+    """共享库创建者被降为普通用户后，不得绕过角色上限继续管理。"""
     from yuxi.permissions import resolve_knowledge_base_permission
 
     owner = _user(uid="u-1", role="user", department_id=3)
 
     assert resolve_knowledge_base_permission(owner, _kb(created_by="u-1", scope="shared")) == (
-        ResourcePermission.MANAGE
+        ResourcePermission.READ
+    )
+
+
+def test_unknown_role_is_denied_by_default():
+    """未知角色不得从共享范围意外获得读权限。"""
+    from yuxi.permissions import resolve_knowledge_base_permission
+
+    unknown = _user(uid="u-2", role="legacy-role", department_id=3)
+
+    assert resolve_knowledge_base_permission(unknown, _kb(created_by="u-1", scope="shared")) == (
+        ResourcePermission.NONE
     )

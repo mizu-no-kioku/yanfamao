@@ -32,6 +32,7 @@ SCHEMA_INSTRUCTION = """抽取 Schema 约束：
 # extractor_options.timeout_seconds 调大，默认保持历史行为不变。
 DEFAULT_EXTRACTION_TIMEOUT_SECONDS = 60.0
 MAX_EXTRACTION_TIMEOUT_SECONDS = 600.0
+MAX_EXTRACTION_CONCURRENCY = 64
 
 
 class LLMGraphExtractor(GraphExtractor):
@@ -64,8 +65,8 @@ class LLMGraphExtractor(GraphExtractor):
             concurrency_count = int(concurrency_count)
         except (TypeError, ValueError) as exc:
             raise ValueError("LLM 抽取器 concurrency_count 必须是整数") from exc
-        if concurrency_count < 1 or concurrency_count > 1000:
-            raise ValueError("LLM 抽取器 concurrency_count 必须在 1 到 1000 之间")
+        if concurrency_count < 1 or concurrency_count > MAX_EXTRACTION_CONCURRENCY:
+            raise ValueError(f"LLM 抽取器 concurrency_count 必须在 1 到 {MAX_EXTRACTION_CONCURRENCY} 之间")
         # 注意：timeout_seconds 不能通过 model_params 设置——select_model 会把显式的
         # timeout 参数覆盖到 model_params 之上，所以只能在这里读取并显式传入。
         self._resolve_timeout_seconds()

@@ -49,6 +49,7 @@ async def test_concurrent_executor_construction_is_deduplicated(tmp_path, monkey
 
 
 async def test_delete_database_cleans_resources_before_deleting_record(tmp_path, monkeypatch):
+    """无独立凭据的旧个人库仍先清理资源再删除记录。"""
     calls = []
     manager = KnowledgeBaseManager(str(tmp_path))
 
@@ -58,13 +59,17 @@ async def test_delete_database_cleans_resources_before_deleting_record(tmp_path,
             return {"message": "删除成功"}
 
     class FakeRepository:
+        async def get_by_kb_id(self, kb_id: str):
+            return SimpleNamespace(kb_type="notion", scope="personal", additional_params={})
+
         async def delete(self, kb_id: str) -> None:
             calls.append(("delete_record", kb_id))
 
-    async def get_kb_executor(_kb_id: str):
+    async def get_executor(kb_type: str):
+        assert kb_type == "notion"
         return FakeExecutor()
 
-    monkeypatch.setattr(manager, "get_kb_executor", get_kb_executor)
+    monkeypatch.setattr(manager, "_get_or_create_kb_instance", get_executor)
     monkeypatch.setattr(
         "yuxi.repositories.knowledge_base_repository.KnowledgeBaseRepository",
         FakeRepository,
@@ -115,6 +120,11 @@ async def test_update_query_params_delegates_persistence_to_manager(tmp_path, mo
     manager = KnowledgeBaseManager(str(tmp_path))
     calls = []
 
+    class FakeExecutor:
+        @staticmethod
+        def validate_query_params(_kb_id: str, params: dict):
+            return dict(params)
+
     class FakeRepository:
         async def merge_query_params_options(self, kb_id: str, params: dict):
             calls.append((kb_id, params))
@@ -124,6 +134,12 @@ async def test_update_query_params_delegates_persistence_to_manager(tmp_path, mo
         "yuxi.repositories.knowledge_base_repository.KnowledgeBaseRepository",
         FakeRepository,
     )
+    monkeypatch.setattr(
+        manager,
+        "get_kb_config",
+        AsyncMock(return_value=KnowledgeBaseConfig(kb_id="kb_1", kb_type="fake")),
+    )
+    monkeypatch.setattr(manager, "_get_or_create_kb_instance", AsyncMock(return_value=FakeExecutor()))
 
     await manager.update_kb_query_params("kb_1", {"top_k": 5})
 
@@ -157,3 +173,50 @@ async def test_consistency_check_delegates_type_resources_to_executor(tmp_path, 
     assert calls == [({"kb_1", "kb_2"}, {"kb_1"})]
     assert result["total_missing_collections"] == 0
     assert result["total_missing_files"] == 0
+
+
+@pytest.mark.parametrize("role", ["admin", "superadmin"])
+async def test_personal_notion_create_requires_token_for_admin(tmp_path, monkeypatch, role):
+    """管理员也不能创建运行时无法读取的无凭据个人库。"""
+    manager = KnowledgeBaseManager(str(tmp_path))
+    from yuxi.repositories.knowledge_base_repository import KnowledgeBaseRepository
+
+    executor = SimpleNamespace(
+        normalize_additional_params=lambda params: params,
+        requires_embedding_model=False,
+        work_dir=str(tmp_path),
+        get_default_query_params=lambda kb_id: {},
+    )
+    monkeypatch.setattr(KnowledgeBaseRepository, "get_by_kb_id", AsyncMock(return_value=None))
+    monkeypatch.setattr(KnowledgeBaseRepository, "create", AsyncMock())
+    monkeypatch.setattr(manager, "get_database_info", AsyncMock(return_value=object()))
+    monkeypatch.setattr("yuxi.knowledge.manager.KnowledgeBaseFactory.is_type_supported", lambda kind: True)
+    monkeypatch.setattr(manager, "database_name_exists", AsyncMock(return_value=False))
+    monkeypatch.setattr(manager, "_get_or_create_kb_instance", AsyncMock(return_value=executor))
+    with pytest.raises(ValueError, match="个人 Notion 知识库必须配置独立"):
+        await manager.create_database(
+            "test", "", kb_type="notion", scope="personal", created_by="test-user", created_by_role=role
+        )
+
+
+@pytest.mark.parametrize("role", ["admin", "superadmin"])
+async def test_personal_notion_update_cannot_remove_token_for_admin(tmp_path, monkeypatch, role):
+    """管理员清空个人库凭据时在写入前拒绝。"""
+    from yuxi.repositories.knowledge_base_repository import KnowledgeBaseRepository
+
+    manager = KnowledgeBaseManager(str(tmp_path))
+    monkeypatch.setattr("yuxi.knowledge.manager.KnowledgeBaseFactory.is_type_supported", lambda kind: True)
+    monkeypatch.setattr(
+        "yuxi.knowledge.manager.KnowledgeBaseFactory.get_kb_class",
+        lambda kind: SimpleNamespace(normalize_additional_params=lambda params: params),
+    )
+    record = SimpleNamespace(
+        kb_type="notion",
+        scope="personal",
+        additional_params={"notion_token": "test-token", "notion_data_source_id": "test-source"},
+    )
+    monkeypatch.setattr(KnowledgeBaseRepository, "get_by_kb_id", AsyncMock(return_value=record))
+    monkeypatch.setattr(KnowledgeBaseRepository, "update", AsyncMock())
+    monkeypatch.setattr(manager, "get_database_info", AsyncMock(return_value=record))
+    with pytest.raises(ValueError, match="个人 Notion 知识库必须配置独立"):
+        await manager.update_database("test-kb", "test", "", additional_params={"notion_token": ""}, operator_role=role)

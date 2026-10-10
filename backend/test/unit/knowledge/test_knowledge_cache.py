@@ -63,17 +63,30 @@ async def test_cache_round_trip(monkeypatch):
     snapshot = await cache_module.get_cached_kb_config("kb_1")
 
     assert set(snapshot) == {
+        "version",
         "kb_id",
         "kb_type",
+        "scope",
         "embedding_model_spec",
         "query_params",
         "additional_params",
     }
     assert snapshot["query_params"] == {"options": {"top_k": 5}}
+    assert snapshot["scope"] == "shared"
     assert "stats" not in snapshot["additional_params"]
     key = f"{cache_module.KNOWLEDGE_BASE_CACHE_KEY_PREFIX}kb_1"
     assert json.loads(redis.data[key])["kb_type"] == "milvus"
     assert redis.expires == (key, cache_module.KNOWLEDGE_BASE_CACHE_TTL_SECONDS)
+
+
+@pytest.mark.asyncio
+async def test_cache_rejects_legacy_snapshot_without_scope_version(monkeypatch):
+    redis = _FakeRedis()
+    key = f"{cache_module.KNOWLEDGE_BASE_CACHE_KEY_PREFIX}kb_1"
+    redis.data[key] = json.dumps({"kb_id": "kb_1", "kb_type": "notion"})
+    monkeypatch.setattr(cache_module, "get_async_redis_client", lambda: _async_value(redis))
+
+    assert await cache_module.get_cached_kb_config("kb_1") is None
 
 
 @pytest.mark.asyncio

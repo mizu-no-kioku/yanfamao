@@ -1,3 +1,4 @@
+from contextlib import asynccontextmanager
 from io import BytesIO
 from types import SimpleNamespace
 
@@ -10,6 +11,17 @@ from yuxi.services import knowledge_task_service
 from yuxi.services.task_registry import get_task_definition
 
 pytestmark = pytest.mark.asyncio
+
+
+@pytest.fixture(autouse=True)
+def _avoid_database_advisory_lock(monkeypatch):
+    """路由单元测试只校验业务编排，不连接 PostgreSQL advisory lock。"""
+
+    @asynccontextmanager
+    async def unlocked(_key: str):
+        yield
+
+    monkeypatch.setattr(knowledge_router.tasker, "lock_resource", unlocked)
 
 
 def _database_detail(**stats) -> KnowledgeBaseDetail:
@@ -27,6 +39,39 @@ def _database_detail(**stats) -> KnowledgeBaseDetail:
         created_at=None,
         **stats,
     )
+
+
+async def test_uploaded_document_validation_rejects_foreign_kb_object():
+    item = "minio://knowledgebases/kb_other/upload/demo.txt"
+
+    with pytest.raises(HTTPException) as exc_info:
+        knowledge_router._validate_uploaded_document_items(
+            "kb_1",
+            [item],
+            {"content_hashes": {item: "hash"}},
+        )
+
+    assert exc_info.value.status_code == 400
+    assert "不属于当前知识库" in exc_info.value.detail
+
+
+async def test_query_knowledge_base_returns_500_without_internal_error(monkeypatch):
+    async def fail_query(*_args, **_kwargs):
+        raise RuntimeError("secret backend detail")
+
+    monkeypatch.setattr(knowledge_router.knowledge_base, "aquery", fail_query)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await knowledge_router.query_knowledge_base(
+            "kb_1",
+            query="hello",
+            meta={},
+            current_user=SimpleNamespace(uid="uid-user"),
+        )
+
+    assert exc_info.value.status_code == 500
+    assert exc_info.value.detail == "知识库查询失败"
+    assert "secret" not in exc_info.value.detail
 
 
 class FakeTaskContext:
@@ -357,6 +402,50 @@ async def test_reconcile_graph_build_mutates_state_only_after_unique_task_is_cre
     assert captured["build"] == "kb_1"
     assert task_result["reconcile"]["reset_records"] == 2
     assert context.result == task_result
+
+
+async def test_graph_build_check_and_enqueue_run_inside_resource_lock(monkeypatch):
+    events = []
+
+    @asynccontextmanager
+    async def tracked_lock(key: str):
+        events.append(("lock-enter", key))
+        yield
+        events.append(("lock-exit", key))
+
+    async def fake_has_running_graph_build_task(_kb_id: str) -> bool:
+        events.append(("running-check", None))
+        return False
+
+    async def fake_get_database_info(kb_id: str):
+        return SimpleNamespace(kb_id=kb_id, name="测试知识库")
+
+    class FakeGraphService:
+        async def get_status(self, _kb_id: str):
+            return {"locked": True}
+
+    async def fake_enqueue_unique_by_payload(**kwargs):
+        events.append(("enqueue", kwargs["payload"]))
+        return SimpleNamespace(id="task_graph_1"), True
+
+    monkeypatch.setattr(knowledge_router.tasker, "lock_resource", tracked_lock)
+    monkeypatch.setattr(knowledge_router, "_has_running_graph_build_task", fake_has_running_graph_build_task)
+    monkeypatch.setattr(knowledge_router.knowledge_base, "get_database_info", fake_get_database_info)
+    monkeypatch.setattr(knowledge_router, "MilvusGraphService", FakeGraphService)
+    monkeypatch.setattr(knowledge_router.tasker, "enqueue_unique_by_payload", fake_enqueue_unique_by_payload)
+
+    result = await knowledge_router.index_graph_build(
+        "kb_1",
+        current_user=SimpleNamespace(uid="uid-user"),
+    )
+
+    assert result["task_id"] == "task_graph_1"
+    assert events == [
+        ("lock-enter", "knowledge-graph:kb_1"),
+        ("running-check", None),
+        ("enqueue", {"kb_id": "kb_1", "action": "build", "operator_id": "uid-user"}),
+        ("lock-exit", "knowledge-graph:kb_1"),
+    ]
 
 
 async def test_index_pending_documents_uses_pending_statuses_and_params(monkeypatch):
@@ -722,7 +811,7 @@ async def test_graph_attribute_backfill_uses_registered_graph_handler(monkeypatc
     assert captured["enqueue"] == {
         "name": "图谱筛选属性回填 (测试知识库)",
         "task_type": knowledge_router.GRAPH_TASK_TYPE,
-        "payload": {"kb_id": "kb_1", "action": "backfill_attributes"},
+        "payload": {"kb_id": "kb_1", "action": "backfill_attributes", "operator_id": "uid-user"},
         "payload_match": {"kb_id": "kb_1"},
     }
 
@@ -730,7 +819,10 @@ async def test_graph_attribute_backfill_uses_registered_graph_handler(monkeypatc
     result = await definition.load_handler()(FakeTaskContext(captured["enqueue"]["payload"]))
 
     assert result == {"kb_id": "kb_1", "scanned": 2, "updated": 2}
-    assert captured["backfill"] == ("kb_1", {"kb_id": "kb_1", "action": "backfill_attributes"})
+    assert captured["backfill"] == (
+        "kb_1",
+        {"kb_id": "kb_1", "action": "backfill_attributes", "operator_id": "uid-user"},
+    )
 
 
 async def test_parse_documents_accepts_payload_with_params(monkeypatch):

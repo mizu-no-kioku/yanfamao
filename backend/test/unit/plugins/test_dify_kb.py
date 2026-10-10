@@ -4,6 +4,7 @@ import pytest
 
 from yuxi.knowledge.implementations.dify import DifyKB
 from yuxi.knowledge.read_models import KnowledgeBaseConfig
+from yuxi.knowledge.utils.url_fetcher import SSRFGuardTransport
 
 
 class _FakeResponse:
@@ -83,6 +84,55 @@ def test_dify_validation_rejects_missing_or_invalid_params():
                 "dify_dataset_id": "dataset-123",
             }
         )
+
+    for invalid_url in ("file:///tmp/v1", "https://user:pass@example.com/v1"):
+        with pytest.raises(ValueError, match="Dify api_url"):
+            DifyKB.normalize_additional_params(
+                {
+                    "dify_api_url": invalid_url,
+                    "dify_token": "token",
+                    "dify_dataset_id": "dataset-123",
+                }
+            )
+
+    with pytest.raises(ValueError, match="dataset_id"):
+        DifyKB.normalize_additional_params(
+            {
+                "dify_api_url": "https://api.dify.ai/v1",
+                "dify_token": "token",
+                "dify_dataset_id": "../admin",
+            }
+        )
+
+
+@pytest.mark.asyncio
+async def test_dify_request_uses_ssrf_guard_transport(monkeypatch, tmp_path):
+    captured = {}
+
+    def client_factory(**kwargs):
+        captured.update(kwargs)
+        return _FakeAsyncClient(response_payload={"records": []})
+
+    monkeypatch.setattr("yuxi.knowledge.implementations.dify.httpx.AsyncClient", client_factory)
+    kb = DifyKB(str(tmp_path))
+
+    await kb._request_dify(
+        {
+            "query": "test",
+            "retrieval_model": {
+                "search_method": "semantic_search",
+                "top_k": 5,
+                "reranking_enable": False,
+                "score_threshold_enabled": True,
+                "score_threshold": 0.3,
+            },
+        },
+        "https://api.dify.ai/v1/datasets/dataset/retrieve",
+        {"Authorization": "Bearer token"},
+    )
+
+    assert captured["follow_redirects"] is False
+    assert isinstance(captured["transport"], SSRFGuardTransport)
 
 
 @pytest.mark.asyncio

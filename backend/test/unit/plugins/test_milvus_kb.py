@@ -142,7 +142,9 @@ class FakeKnowledgeFileRepository:
         return {
             file_id: {"source": record.filename, "chunk_count": record.chunk_count}
             for file_id in file_ids
-            if (record := self.records.get(file_id)) is not None and record.kb_id == kb_id
+            if (record := self.records.get(file_id)) is not None
+            and record.kb_id == kb_id
+            and record.status == FileStatus.INDEXED
         }
 
     async def list_file_ids_by_filename_contains(self, *, kb_id: str, filename_pattern: str, limit: int = 10_000):
@@ -377,6 +379,40 @@ async def test_index_file_persists_chunk_stats(monkeypatch):
     assert file_repo.records["file-1"].chunk_count == result["chunk_count"]
     assert file_repo.conditional_update_calls[0][3]["status"] == FileStatus.INDEXING
     assert file_repo.conditional_update_calls[-1][3]["status"] == FileStatus.INDEXED
+
+
+async def test_index_file_failure_cleans_partial_chunks(monkeypatch):
+    kb = MilvusKB.__new__(MilvusKB)
+    file_repo = FakeKnowledgeFileRepository({"file-1": make_file_record()})
+    patch_file_repository(monkeypatch, file_repo)
+    cleanup_calls = []
+
+    kb._get_or_create_milvus_collection = AsyncMock(return_value=FakeCollection())
+    kb._get_embedding_function = lambda _spec: AsyncMock(return_value=[])
+    kb._read_markdown_from_minio = AsyncMock(return_value="# demo")
+    kb._split_text_into_chunks = lambda *_args, **_kwargs: [make_chunk(0), make_chunk(1)]
+
+    async def delete_file_chunks_only(kb_id, file_id):
+        cleanup_calls.append((kb_id, file_id))
+
+    kb.delete_file_chunks_only = delete_file_chunks_only
+    kb._embed_and_store_chunks = AsyncMock(side_effect=RuntimeError("second batch failed"))
+
+    async def get_system_options(_option, _db=None):
+        return {"embed_model": EMBEDDING_MODEL_SPEC}
+
+    monkeypatch.setattr(type(milvus_module.system_options), "get", get_system_options)
+
+    with pytest.raises(RuntimeError, match="second batch failed"):
+        await kb.index_file(
+            "db",
+            "file-1",
+            embedding_model_spec=EMBEDDING_MODEL_SPEC,
+            additional_params={},
+        )
+
+    assert cleanup_calls == [("db", "file-1"), ("db", "file-1")]
+    assert file_repo.records["file-1"].status == FileStatus.ERROR_INDEXING
 
 
 @pytest.mark.parametrize(
@@ -897,12 +933,42 @@ def test_collection_supports_bm25_requires_analyzed_content_sparse_field_and_fun
     assert kb._collection_supports_bm25(collection)
 
 
+@pytest.mark.parametrize("incompatibility", ["model", "schema"])
+def test_incompatible_collection_is_not_dropped(monkeypatch, incompatibility):
+    kb = MilvusKB.__new__(MilvusKB)
+    kb.connection_alias = "test-alias"
+    collection = types.SimpleNamespace(description="expected-model", schema=types.SimpleNamespace())
+    if incompatibility == "model":
+        collection.description = "other-model"
+
+    monkeypatch.setattr(milvus_module.utility, "has_collection", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(milvus_module, "Collection", lambda **_kwargs: collection)
+    monkeypatch.setattr(
+        milvus_module.model_cache,
+        "get_model_info",
+        lambda _spec: types.SimpleNamespace(model_type="embedding", model_id="expected-model"),
+    )
+    monkeypatch.setattr(kb, "_collection_supports_bm25", lambda _collection: incompatibility != "schema")
+    drop_collection = Mock()
+    monkeypatch.setattr(milvus_module.utility, "drop_collection", drop_collection)
+
+    with pytest.raises(RuntimeError, match="受控重建流程"):
+        kb._create_kb_instance_sync("db", EMBEDDING_MODEL_SPEC)
+
+    drop_collection.assert_not_called()
+
+
 @pytest.mark.parametrize("chunk_count", [0, 1, 4])
 async def test_hydrate_chunk_sources_filters_orphaned_file_chunks(monkeypatch, chunk_count):
     """已从 PG 删除的文件（孤儿向量）不能出现在检索结果中。"""
     file_repo = FakeKnowledgeFileRepository(
         {
-            "file-live": make_file_record(file_id="file-live", filename="live.md", chunk_count=chunk_count),
+            "file-live": make_file_record(
+                file_id="file-live",
+                filename="live.md",
+                chunk_count=chunk_count,
+                status=FileStatus.INDEXED,
+            ),
         }
     )
     patch_file_repository(monkeypatch, file_repo)
@@ -926,8 +992,8 @@ async def test_hydrate_chunk_sources_returns_all_chunks_when_no_orphans(monkeypa
     """所有 file_id 都在 PG 中时行为不变，只补充 source 字段。"""
     file_repo = FakeKnowledgeFileRepository(
         {
-            "file-a": make_file_record(file_id="file-a", filename="a.md"),
-            "file-b": make_file_record(file_id="file-b", filename="b.md"),
+            "file-a": make_file_record(file_id="file-a", filename="a.md", status=FileStatus.INDEXED),
+            "file-b": make_file_record(file_id="file-b", filename="b.md", status=FileStatus.INDEXED),
         }
     )
     patch_file_repository(monkeypatch, file_repo)
@@ -945,11 +1011,31 @@ async def test_hydrate_chunk_sources_returns_all_chunks_when_no_orphans(monkeypa
     assert result[1]["metadata"]["source"] == "b.md"
 
 
+async def test_hydrate_chunk_sources_filters_failed_indexing_file(monkeypatch):
+    file_repo = FakeKnowledgeFileRepository(
+        {
+            "file-failed": make_file_record(
+                file_id="file-failed",
+                status=FileStatus.ERROR_INDEXING,
+            )
+        }
+    )
+    patch_file_repository(monkeypatch, file_repo)
+    kb = MilvusKB.__new__(MilvusKB)
+
+    result = await kb._hydrate_chunk_sources(
+        "db",
+        [{"metadata": {"file_id": "file-failed"}, "content": "partial", "score": 0.9}],
+    )
+
+    assert result == []
+
+
 async def test_query_filters_orphaned_chunks_from_search_results(monkeypatch):
     """端到端：Milvus 返回孤儿向量时，aquery 最终结果不包含已删除文件的内容。"""
     file_repo = FakeKnowledgeFileRepository(
         {
-            "file-live": make_file_record(file_id="file-live", filename="live.md"),
+            "file-live": make_file_record(file_id="file-live", filename="live.md", status=FileStatus.INDEXED),
         }
     )
     patch_file_repository(monkeypatch, file_repo)

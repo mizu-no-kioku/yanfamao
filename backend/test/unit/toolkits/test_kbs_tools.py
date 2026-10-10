@@ -451,7 +451,7 @@ async def test_open_kb_document_requires_markdown_content(monkeypatch) -> None:
 
     async def _fake_open_file_content(kb_id: str, file_id: str, offset: int = 0, limit: int = 1800):
         del kb_id, file_id, offset, limit
-        raise Exception("文件 file-1 没有解析后的 Markdown 内容")
+        raise ValueError("文件 file-1 没有解析后的 Markdown 内容")
 
     monkeypatch.setattr(tools.knowledge_base, "open_file_content", _fake_open_file_content)
 
@@ -894,6 +894,26 @@ def test_resolve_download_output_path_appends_suffix_on_conflict() -> None:
     )
 
     assert path == "/home/gem/user-data/projects/11111111-1111-4111-8111-111111111111/outputs/report_2.pdf"
+
+
+@pytest.mark.asyncio
+async def test_visible_knowledge_bases_refreshes_cached_permissions(monkeypatch):
+    context = SimpleNamespace(uid="user-1", _visible_knowledge_bases=[{"kb_id": "revoked"}])
+    runtime = SimpleNamespace(context=context)
+    calls = []
+
+    async def refresh(current_context):
+        calls.append(current_context.uid)
+        current_context._visible_knowledge_bases = []
+        return []
+
+    monkeypatch.setattr(
+        "yuxi.agents.backends.knowledge_base_backend.resolve_visible_knowledge_bases_for_context",
+        refresh,
+    )
+
+    assert await tools._resolve_visible_knowledge_bases_for_query(runtime) == []
+    assert calls == ["user-1"]
 
 
 def _async_get_file_download(content: bytes, filename: str):

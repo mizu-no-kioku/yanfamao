@@ -6,7 +6,12 @@ import time
 import weakref
 from typing import Any
 
-from yuxi.knowledge.graphs.extractors import GraphExtractor, GraphExtractorFactory, normalize_extraction_result
+from yuxi.knowledge.graphs.extractors import (
+    MAX_EXTRACTION_CONCURRENCY,
+    GraphExtractor,
+    GraphExtractorFactory,
+    normalize_extraction_result,
+)
 from yuxi.knowledge.graphs.graph_utils import (
     build_graph_payload,
     compute_entity_id,
@@ -17,6 +22,7 @@ from yuxi.knowledge.graphs.graph_utils import (
     normalize_entity_name,
 )
 from yuxi.knowledge.graphs.milvus_graph_vector_store import MilvusGraphVectorStore
+from yuxi.knowledge.utils.security import redact_sensitive_params
 from yuxi.repositories.knowledge_base_repository import KnowledgeBaseRepository
 from yuxi.repositories.knowledge_chunk_repository import KnowledgeChunkRepository
 from yuxi.repositories.knowledge_graph_repository import KnowledgeGraphRepository
@@ -44,11 +50,16 @@ GRAPH_VECTOR_LEASE_SECONDS = 300
 GRAPH_VECTOR_FLUSH_INTERVAL_SECONDS = 0.2
 GRAPH_EXTRACTION_MAX_ATTEMPTS = 3
 GRAPH_EXTRACTION_RETRY_DELAYS_SECONDS = (2.0, 10.0)
+GRAPH_PROCESS_LLM_CONCURRENCY_LIMIT = 16
 # 子图路径查询的最大跳数上限：变量长度路径的开销随节点度数增长很快，前后端共用这一个上限。
 MAX_SUBGRAPH_DEPTH = 3
 # 关系属性中允许筛选的属性名；text 是自由描述，extractor_type 是枚举。
 RELATION_ATTRIBUTE_NAMES = ("text", "extractor_type")
 _neo4j_query_offload_semaphore_refs: dict[
+    int,
+    tuple[weakref.ReferenceType[asyncio.AbstractEventLoop], weakref.ReferenceType[asyncio.Semaphore]],
+] = {}
+_graph_llm_semaphore_refs: dict[
     int,
     tuple[weakref.ReferenceType[asyncio.AbstractEventLoop], weakref.ReferenceType[asyncio.Semaphore]],
 ] = {}
@@ -72,6 +83,28 @@ def _get_neo4j_query_offload_semaphore() -> asyncio.Semaphore:
             _neo4j_query_offload_semaphore_refs.pop(stale_loop_id, None)
 
     _neo4j_query_offload_semaphore_refs[loop_id] = (weakref.ref(loop), weakref.ref(semaphore, cleanup))
+    return semaphore
+
+
+def _get_graph_llm_semaphore() -> asyncio.Semaphore:
+    """返回绑定当前事件循环的图谱 LLM 全局并发闸门。"""
+    loop = asyncio.get_running_loop()
+    loop_id = id(loop)
+    entry = _graph_llm_semaphore_refs.get(loop_id)
+    if entry is not None:
+        loop_ref, semaphore_ref = entry
+        semaphore = semaphore_ref()
+        if loop_ref() is loop and semaphore is not None:
+            return semaphore
+
+    semaphore = asyncio.Semaphore(GRAPH_PROCESS_LLM_CONCURRENCY_LIMIT)
+
+    def cleanup(ref, stale_loop_id=loop_id):
+        current_entry = _graph_llm_semaphore_refs.get(stale_loop_id)
+        if current_entry is not None and ref in current_entry:
+            _graph_llm_semaphore_refs.pop(stale_loop_id, None)
+
+    _graph_llm_semaphore_refs[loop_id] = (weakref.ref(loop, cleanup), weakref.ref(semaphore, cleanup))
     return semaphore
 
 
@@ -524,7 +557,7 @@ class MilvusGraphService:
             worker_count = int((config.get("extractor_options") or {}).get("concurrency_count") or 1)
         except (TypeError, ValueError):
             return 1
-        return max(1, min(worker_count, 1000))
+        return max(1, min(worker_count, MAX_EXTRACTION_CONCURRENCY))
 
     @staticmethod
     def _runtime_extractor_options(config: dict[str, Any]) -> dict[str, Any]:
@@ -549,7 +582,8 @@ class MilvusGraphService:
         }
         for attempt in range(1, GRAPH_EXTRACTION_MAX_ATTEMPTS + 1):
             try:
-                extraction_result = await extractor.extract(chunk.content, chunk_metadata=metadata)
+                async with _get_graph_llm_semaphore():
+                    extraction_result = await extractor.extract(chunk.content, chunk_metadata=metadata)
                 normalized_result = normalize_extraction_result(extraction_result, extractor_type)
                 await self.chunk_repo.update_extraction_result(chunk.chunk_id, normalized_result, attempt)
                 return normalized_result
@@ -1294,7 +1328,7 @@ class MilvusGraphService:
         return {
             "locked": bool(config.get("locked")),
             "extractor_type": config.get("extractor_type"),
-            "extractor_options": self._runtime_extractor_options(config),
+            "extractor_options": redact_sensitive_params(self._runtime_extractor_options(config)),
             "created_at": config.get("created_at"),
             "created_by": config.get("created_by"),
             "updated_at": config.get("updated_at"),
@@ -1389,21 +1423,36 @@ MATCH p = (s)-{rel_pattern}-(e){where}
 {path_tail}"""
 
         if start_id:
+            optional_where = f"\nWHERE p IS NULL OR ({' AND '.join(clauses)})" if clauses else ""
+            start_tail = """WITH s, collect(p) AS paths
+UNWIND CASE WHEN size(paths) = 0 THEN [null] ELSE paths END AS node_path
+UNWIND CASE WHEN node_path IS NULL THEN [null] ELSE nodes(node_path) END AS node
+WITH s, paths, collect(DISTINCT node) AS graph_nodes
+UNWIND CASE WHEN size(paths) = 0 THEN [null] ELSE paths END AS rel_path
+UNWIND CASE WHEN rel_path IS NULL THEN [null] ELSE relationships(rel_path) END AS rel
+WITH s, paths, graph_nodes, collect(DISTINCT rel) AS edges
+RETURN [x IN graph_nodes WHERE x IS NOT NULL] + [s] AS nodes,
+       [x IN edges WHERE x IS NOT NULL] AS edges,
+       size(graph_nodes) > $max_nodes
+         OR size(paths) >= $path_limit
+         OR size(edges) > $max_nodes * 2 AS truncated"""
             return f"""MATCH (s:Entity:MilvusKB:`{label}` {{entity_id: $start_id}})
-MATCH p = (s)-{rel_pattern}-(m){where}
-{path_tail}"""
+OPTIONAL MATCH p = (s)-{rel_pattern}-(m){optional_where}
+WITH s, p LIMIT $path_limit
+{start_tail}"""
 
         # 概览模式：种子是全部实体。`seeds` 必须逐段带下去并并回节点集合，
         # 否则没有任何 RELATION 的孤立实体会从结果里消失。
+        optional_where = f"\nWHERE p IS NULL OR ({' AND '.join(clauses)})" if clauses else ""
         overview_tail = """WITH seeds, collect(p) AS paths
-UNWIND paths AS node_path
-UNWIND nodes(node_path) AS node
+UNWIND CASE WHEN size(paths) = 0 THEN [null] ELSE paths END AS node_path
+UNWIND CASE WHEN node_path IS NULL THEN [null] ELSE nodes(node_path) END AS node
 WITH seeds, paths, collect(DISTINCT node) AS graph_nodes
-UNWIND paths AS rel_path
-UNWIND relationships(rel_path) AS rel
+UNWIND CASE WHEN size(paths) = 0 THEN [null] ELSE paths END AS rel_path
+UNWIND CASE WHEN rel_path IS NULL THEN [null] ELSE relationships(rel_path) END AS rel
 WITH seeds, paths, graph_nodes, collect(DISTINCT rel) AS edges
 RETURN [x IN graph_nodes WHERE x IS NOT NULL] + [x IN seeds WHERE x IS NOT NULL] AS nodes,
-       edges,
+       [x IN edges WHERE x IS NOT NULL] AS edges,
        size(graph_nodes) > $max_nodes
          OR size(paths) >= $path_limit
          OR size(edges) > $max_nodes * 2 AS truncated"""
@@ -1412,7 +1461,7 @@ RETURN [x IN graph_nodes WHERE x IS NOT NULL] + [x IN seeds WHERE x IS NOT NULL]
 WITH seed LIMIT $max_nodes
 WITH collect(seed) AS seeds
 UNWIND seeds AS s
-MATCH p = (s)-{rel_pattern}-(m){where}
+OPTIONAL MATCH p = (s)-{rel_pattern}-(m){optional_where}
 {overview_tail}"""
 
     def _process_subgraph_record(self, record: Any, limit: int, kb_id: str) -> dict[str, Any]:

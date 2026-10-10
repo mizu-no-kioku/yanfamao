@@ -14,6 +14,7 @@ KNOWLEDGE_BASE_CACHE_KEY_PREFIX = "yuxi:knowledge_base:"
 KNOWLEDGE_BASE_CACHE_TTL_SECONDS = 3600
 KNOWLEDGE_BASE_CACHE_LOCK_TIMEOUT_SECONDS = 30
 KNOWLEDGE_BASE_CACHE_LOCK_WAIT_SECONDS = 10
+KNOWLEDGE_BASE_CACHE_SCHEMA_VERSION = 2
 
 
 def _cache_key(kb_id: str) -> str:
@@ -42,8 +43,10 @@ def serialize_kb_config(row: Any) -> dict[str, Any]:
     additional_params = dict(row.additional_params or {})
     additional_params.pop("stats", None)
     return {
+        "version": KNOWLEDGE_BASE_CACHE_SCHEMA_VERSION,
         "kb_id": row.kb_id,
         "kb_type": row.kb_type or "milvus",
+        "scope": getattr(row, "scope", None) or "shared",
         "embedding_model_spec": row.embedding_model_spec,
         "query_params": row.query_params,
         "additional_params": additional_params,
@@ -58,7 +61,11 @@ async def get_cached_kb_config(kb_id: str) -> dict[str, Any] | None:
         if not raw:
             return None
         snapshot = json.loads(raw)
-        if not isinstance(snapshot, dict) or snapshot.get("kb_id") != kb_id:
+        if (
+            not isinstance(snapshot, dict)
+            or snapshot.get("version") != KNOWLEDGE_BASE_CACHE_SCHEMA_VERSION
+            or snapshot.get("kb_id") != kb_id
+        ):
             logger.warning(f"Invalid knowledge base cache snapshot: kb_id={kb_id}")
             return None
         return snapshot

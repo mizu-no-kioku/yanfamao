@@ -52,6 +52,10 @@
 - `config` 区分系统级配置和用户级配置。PostgreSQL 持久化系统配置和用户配置；Redis 只保存带版本失效的短缓存，旧 `base.toml` 只作为一次性迁移来源。
 - `utils` 只放跨领域且足够通用的日志、时间、SSE 和轻量工具；`filepreview.py` 提供不依赖存储、领域或 HTTP 的格式识别、文本渲染和 Office 转换原语。
 
+### 业务数据库问数边界
+
+可选的 `agents/toolkits/business_database` 工具包在连接参数和身份映射环境变量完整时注册三个内置工具，使用 `ToolRuntime` 中的当前用户 `uid` 调用 `services/business_database_service.py`。该 service 解析服务端身份映射，校验有效员工和授权项目；`services/business_database_security.py` 使用 SQL AST 校验并注入查询范围；`repositories/business_database_repository.py` 拥有外部 MySQL 的 Schema、员工、项目查询和只读会话执行。当前授权业务表为 `t_project` 与 `t_project_user`，`t_staff` 供 repository 内部验证身份。外部 MySQL 提供业务查询数据，平台业务状态与 LangGraph checkpoint 继续由 PostgreSQL 持久化。配置与使用方式见[业务数据库接入](docs/advanced/business-database.md)。
+
 ### 后台任务
 
 项目中存在三套领域状态不同、但共享 PostgreSQL 事实与 Redis/ARQ 投递模式的后台机制，不应合并状态模型：

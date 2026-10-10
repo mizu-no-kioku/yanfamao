@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta
 from typing import Any
@@ -15,26 +16,62 @@ _UNSET = object()
 
 
 class TaskRepository:
+    @asynccontextmanager
+    async def advisory_lock(self, key: str):
+        """使用 PostgreSQL session advisory lock 串行化跨进程领域操作。"""
+
+        if not key.strip():
+            raise ValueError("锁键不能为空")
+        async with pg_manager.get_async_session_context() as session:
+            await session.execute(select(func.pg_advisory_lock(func.hashtext(key))))
+            try:
+                yield
+            finally:
+                await session.execute(select(func.pg_advisory_unlock(func.hashtext(key))))
+
     async def get_by_id(self, task_id: str) -> TaskRecord | None:
         async with pg_manager.get_async_session_context() as session:
             return await session.get(TaskRecord, task_id)
 
-    async def list(self, status: str | None = None, limit: int = 100) -> list[TaskRecord]:
+    async def list(
+        self,
+        status: str | None = None,
+        limit: int = 100,
+        *,
+        operator_id: str | None = None,
+    ) -> list[TaskRecord]:
         async with pg_manager.get_async_session_context() as session:
             stmt = select(TaskRecord)
             if status:
                 stmt = stmt.where(TaskRecord.status == status)
+            if operator_id is not None:
+                stmt = stmt.where(TaskRecord.payload["operator_id"].as_string() == operator_id)
             active_first = case((TaskRecord.status.in_({"pending", "running"}), 0), else_=1)
             stmt = stmt.order_by(active_first, TaskRecord.created_at.desc()).limit(max(limit, 0))
             return list((await session.execute(stmt)).scalars().all())
 
-    async def summarize(self, *, status: str | None = None) -> dict[str, Any]:
+    async def summarize(
+        self,
+        *,
+        status: str | None = None,
+        operator_id: str | None = None,
+    ) -> dict[str, Any]:
         """从完整 Task 表计算列表摘要，不受返回 limit 影响。"""
         async with pg_manager.get_async_session_context() as session:
+            ownership_filter = (
+                (TaskRecord.payload["operator_id"].as_string() == operator_id)
+                if operator_id is not None
+                else None
+            )
+            status_stmt = select(TaskRecord.status, func.count()).group_by(TaskRecord.status)
+            type_stmt = select(TaskRecord.type, func.count()).group_by(TaskRecord.type)
+            if ownership_filter is not None:
+                status_stmt = status_stmt.where(ownership_filter)
+                type_stmt = type_stmt.where(ownership_filter)
             status_rows = (
-                await session.execute(select(TaskRecord.status, func.count()).group_by(TaskRecord.status))
+                await session.execute(status_stmt)
             ).all()
-            type_rows = (await session.execute(select(TaskRecord.type, func.count()).group_by(TaskRecord.type))).all()
+            type_rows = (await session.execute(type_stmt)).all()
             total = sum(int(count) for _value, count in status_rows)
             filtered_total = total
             if status is not None:

@@ -1409,6 +1409,28 @@ async def test_plain_user_cannot_create_shared_knowledge_base(test_client, stand
     assert response.status_code in (400, 403), response.text
 
 
+async def test_plain_user_personal_notion_database_requires_own_token(
+    test_client,
+    standard_user,
+    monkeypatch,
+):
+    monkeypatch.setenv("NOTION_TOKEN", "server-wide-token")
+
+    response = await test_client.post(
+        "/api/knowledge/databases",
+        json={
+            "database_name": f"pytest_notion_denied_{uuid.uuid4().hex[:8]}",
+            "description": "普通用户不能借用服务端 Notion token",
+            "kb_type": "notion",
+            "additional_params": {"notion_data_source_id": "ds-1"},
+        },
+        headers=standard_user["headers"],
+    )
+
+    assert response.status_code == 400, response.text
+    assert "独立的 notion_token" in response.text
+
+
 def _user_share_config(uids: list[str]) -> dict:
     """构造只定向分享给给定 uid 的 v2 读取范围。"""
 

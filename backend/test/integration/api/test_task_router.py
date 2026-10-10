@@ -9,21 +9,55 @@ import uuid
 
 import pytest
 
+from yuxi.repositories.task_repository import TaskRepository
+
 pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
 
 
-async def test_task_routes_require_admin(test_client, standard_user):
-    """Non-admin users should be blocked from accessing task APIs."""
+async def test_standard_user_can_list_only_owned_tasks(test_client, standard_user):
+    """Non-admin users can open the task centre without seeing other users' tasks."""
     headers = standard_user["headers"]
+    repo = TaskRepository()
+    owned_id = uuid.uuid4().hex
+    foreign_id = uuid.uuid4().hex
+    task_data = {
+        "name": "task visibility test",
+        "type": "test_visibility",
+        "status": "success",
+        "progress": 100.0,
+        "message": "done",
+    }
 
-    list_response = await test_client.get("/api/tasks", headers=headers)
-    assert list_response.status_code == 403
+    try:
+        await repo.create(
+            owned_id,
+            {**task_data, "payload": {"operator_id": str(standard_user["user"]["uid"])}},
+        )
+        await repo.create(
+            foreign_id,
+            {**task_data, "payload": {"operator_id": "another-user"}},
+        )
+
+        list_response = await test_client.get("/api/tasks", headers=headers)
+        assert list_response.status_code == 200
+        visible_ids = {task["id"] for task in list_response.json()["tasks"]}
+        assert owned_id in visible_ids
+        assert foreign_id not in visible_ids
+
+        owned_response = await test_client.get(f"/api/tasks/{owned_id}", headers=headers)
+        assert owned_response.status_code == 200
+
+        foreign_response = await test_client.get(f"/api/tasks/{foreign_id}", headers=headers)
+        assert foreign_response.status_code == 404
+    finally:
+        await repo.delete_terminal(owned_id)
+        await repo.delete_terminal(foreign_id)
 
     detail_response = await test_client.get("/api/tasks/some-task", headers=headers)
-    assert detail_response.status_code == 403
+    assert detail_response.status_code == 404
 
     cancel_response = await test_client.post("/api/tasks/some-task/cancel", headers=headers)
-    assert cancel_response.status_code == 403
+    assert cancel_response.status_code == 404
 
 
 async def test_admin_can_list_tasks(test_client, admin_headers):

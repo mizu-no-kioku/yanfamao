@@ -34,6 +34,8 @@
 
 ## 快速启动
 
+业务数据库问数是可选能力：Agent 通过三个内置工具发现授权表、查看表结构并查询外部业务 MySQL。目前支持项目表 `t_project` 和项目成员表 `t_project_user`，服务端限制租户、员工、项目、字段和返回行数。接入步骤见[业务数据库接入](docs/advanced/business-database.md)。
+
 研发猫（YanfaMao）完全基于 Docker 启动，服务和中间件主要包括：LangGraph、Vue、FastAPI、Milvus、Neo4j、PostgreSQL、MinerU、PaddleOCR。
 
 ### 前置条件
@@ -73,6 +75,8 @@ curl --fail http://localhost:5050/api/system/ready
 从 v0.7.1 或 v0.7.2 升级到当前版本时，不能直接执行 `docker compose up`。请先阅读[生产部署与升级](docs/advanced/deployment.md)，在停机窗口完成备份和迁移。
 
 ## 文档导航
+
+- [业务数据库接入](docs/advanced/business-database.md)：配置只读 MySQL、用户身份映射和 Agent 工具，核对授权查询结果。
 
 - [项目介绍](https://xerrors.github.io/Yuxi/intro/project-overview)：了解能力、概念和系统边界。
 - [快速开始](https://xerrors.github.io/Yuxi/intro/quick-start)：从零启动本地环境。
