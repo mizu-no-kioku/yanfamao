@@ -248,13 +248,9 @@ class KnowledgeBaseManager:
             )
             if normalized["read_scope"] is None and (user_uid is not None or department_id is not None):
                 raise ValueError("知识库必须设置读取范围")
-            read_scope = normalized["read_scope"]
-            if read_scope:
-                levels = read_scope["access_levels"]
-                if "department" in levels and department_id is not None:
-                    read_scope["department_ids"] = sorted({*read_scope["department_ids"], int(department_id)})
-                if "user" in levels and user_uid:
-                    read_scope["user_uids"] = sorted({*read_scope["user_uids"], str(user_uid)})
+            # 显式声明的名单照单保存：不把操作者自己的部门/uid 并进去。并入会使用户无法
+            # 主动排除自己所在部门（是一次静默放大授权）；操作者对自己库的访问来自所有权
+            # 判定里的所有者早返回，不依赖出现在名单里。
             return normalized
 
         raise ValueError("知识库共享配置必须使用 version 2")
@@ -269,7 +265,7 @@ class KnowledgeBaseManager:
         """普通用户只能把知识库定向分享给本部门的用户。
 
         只约束 role == "user"：管理员与超管不受影响。校验的是**归一化之后**的 user_uids
-        （`_normalize_share_config` 会把操作者自己并进该列表，那一定是他本部门的人）。
+        （操作者本人若出现在名单里，他一定属于自己所在部门）。
         未知 uid（批量查不到用户）一律拒绝，否则能把库"分享"给不存在的账号。存量数据不回溯，
         这里只管写入路径。
         """

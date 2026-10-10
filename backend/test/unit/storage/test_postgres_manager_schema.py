@@ -316,6 +316,17 @@ async def test_share_config_migration_wraps_legacy_scopes_as_read_only():
     assert "ALTER TABLE IF EXISTS agents ALTER COLUMN share_config DROP DEFAULT" in statements
     assert "ALTER TABLE IF EXISTS skills ALTER COLUMN share_config DROP DEFAULT" in statements
 
+    # 迁移语句必须产出**新形状**：`access_level` 只允许留在归一器里做读时归一，
+    # 不能由迁移再写出来——否则新写入路径会拒绝自己造的行。
+    assert '"access_levels": ["global"]' in statements
+    assert '"access_levels": ["user"]' in statements
+    assert "jsonb_build_array('user')" in statements
+    assert "jsonb_build_array(created_by)" in statements
+    assert '"access_level"' not in statements
+
+    # 幂等：三条 UPDATE 都跳过已是 version 2 的行，再跑一次不改动任何已合规行。
+    assert statements.count("share_config->>'version' IS DISTINCT FROM '2'") == 3
+
 
 @pytest.mark.asyncio
 async def test_ensure_knowledge_schema_rebuilds_vectors_for_incomplete_legacy_chunks():

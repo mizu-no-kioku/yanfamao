@@ -67,6 +67,11 @@ Owner：backend/package/yuxi/permissions/resource_permission.py
 - 前端 `validate()` 用同一套规则（哪一档缺名单就报哪一档），并在 `requireReadScope` 为真而响应里没有
   可用的 `read_scope` 时判非法——挡住保存，而不是回落到 `global`。
 
+**实现期收紧**：知识库写入路径原本会把操作者自己的部门/uid **无条件并进已声明的名单**
+（`_normalize_share_config`），于是用户显式把自己所在部门从多部门名单里去掉后，保存又会被加回来——
+一次静默放大授权，且与前端「只在该档名单为空时才自动补」的行为矛盾。现改为**照单保存**：操作者对自己
+库的访问来自所有权判定里的所有者早返回（`resolve_resource_permission`），不依赖出现在名单里。
+
 **前端**（`web/src/components/ShareConfigForm.vue` 及其消费者）
 
 - 三张卡片从「单选」改成「全局独占 + 部门/指定人可多选」：点全局 ⇒ `access_levels: ['global']` 并清空
@@ -123,6 +128,8 @@ Owner：backend/package/yuxi/permissions/resource_permission.py
 |---|---|---|---|---|---|
 | 并集命中：部门成员可读、指定用户可读 | 只按其中一档判定，另一档的人拿不到 | `scope_matches` | 单元 `test/unit/permissions/test_resource_permission.py`；真实 HTTP `test/integration/api/test_knowledge_router.py::test_union_scope_grants_read_to_department_and_named_user`（含 `accessible` 清单回读 `access_levels`） | 同一用例断言既不在该部门、也不是指定人者得 403 / `NONE` | Passed |
 | 旧形状读取归一后判定与今天完全一致 | 归一漏了某条路径，存量行可见性变化 | `normalize_permission_config` + `scope_matches` | 单元对 `{access_level: "department", department_ids:[2]}` 与归一后形状跑同一组断言；真实 HTTP `...::test_legacy_access_level_payload_is_rejected_on_write` 把行直接写成旧形状后详情仍 200 且 `access_levels == ["global"]` | 把归一改成默认 global 时，部门外用户用例变红 | Passed |
+| 迁移 SQL 对 `version != 2` 的存量行产出新形状且幂等 | 迁移写回旧键，新写入路径会拒绝自己造出的行；或重复执行改写已合规行 | `storage/postgres/manager.py` | 单元 `test/unit/storage/test_postgres_manager_schema.py::test_share_config_migration_wraps_legacy_scopes_as_read_only`：断言三条 UPDATE 都写 `"access_levels"`、skills 分支用 `jsonb_build_array('user')`/`jsonb_build_array(created_by)`，且 `"access_level"` 字面量不再出现；三条 WHERE 均跳过 `version = 2`（计数 == 3） | 把任一字面量改回旧键时该用例变红（已实测变异） | Passed |
+| 显式声明的名单不被操作者身份撑大 | 用户去掉自己所在部门后保存又被加回，等于一次静默放大授权 | `knowledge/manager.py` | 单元 `test/unit/knowledge/test_knowledge_share_config_shape.py::test_explicit_list_is_not_widened_by_operator_identity` 与 `test_union_round_trips_through_normalization` | 改回无条件并入时两条用例变红（已实测 RED） | Passed |
 | 个人库含部门档仍不放开 | 个人库被自己的 `share_config` 撑大，陌生人拿到 READ | `resolve_knowledge_base_permission` | `...::test_personal_knowledge_base_with_department_scope_stays_private`：管理员可写入部门档（200），非创建者同部门用户仍 403 | 非创建者同部门用户读到内容即为失败 | Passed |
 | 非管理员提交含部门档的范围被拒，不静默降级 | 静默降级成只有 `user` 档，或直接放行 | `knowledge/manager.py` 的 `get_allowed_kb_access_levels` | `...::test_plain_user_cannot_grant_department_level`：400，且断言拒绝原因是授予上限（`无权使用该资源共享范围`） | 放行或降级成 `["user"]` 即为失败 | Passed |
 | manage 主体必须落在 read 内 | 管理范围超出读取范围，出现"能管却不能读" | `_validate_manage_scope` / `scope_contains` | 单元：`manage={["department"],[3]}`、`read={["department"],[2]}` → 拒绝；并集下 `read={["department","user"],[2],["u7"]}` 覆盖 `manage={["user"],["u7"]}` → 放行 | 把子集判定改成"档位相同即放行"时用例变红 | Passed |
@@ -136,10 +143,11 @@ Owner：backend/package/yuxi/permissions/resource_permission.py
 | 回归：既有 KB / Skill / Agent 授权行为不变 | 改动放宽或收紧了任何一处既有可见性 | 全部 | `python3 scripts/verify_engineering_contracts.py` → 0；`pytest test/unit -m "not slow" --ignore test/unit/services/test_run_worker.py` → **2565 passed / 0 failed**；`pytest test/integration/api`（带凭证）→ 229 passed / 7 failed / 6 errors（失败项**全部为既存**，见下）；`ruff check --no-cache package server test`（排除未跟踪的本地数据集目录）→ `All checks passed`；`pnpm run lint:check` → 0；`pnpm run test:unit` → **436 passed / 0 failed**；`pnpm run build` → 0；vitepress build → 0 | 与改动前基线逐项对照 | Passed（既有失败见下） |
 
 **基线对照**：本特性开始前（`e96d166`）单元为 **2533 passed / 0 failed**（`58 skipped`）。当前为
-**2565 passed / 0 failed**，净增 32 条：其中 24 条来自本特性 Shapes/判定/知识库路径的新用例（Task 1–3），
-8 条来自 Agent 与 Skill 写入路径的用例（Task 4）。并集线合并进分支后的**中途**快照曾是 `2542 passed /
-15 failed`——那 15 条是形状已改而 Agent/Skill 写入路径未跟上导致的既有用例失败，随 Task 4 修好，因此
-不构成新增回归。web 侧从 `426 passed` 变为 `436 passed`（Task 5 新增 4 条、Task 6 新增 6 条）。
+**2566 passed / 0 failed**，净增 33 条：其中 24 条来自本特性的形状/判定/知识库路径用例（Task 1–3），
+8 条来自 Agent 与 Skill 写入路径的用例（Task 4），1 条钉住「显式名单不被操作者身份撑大」。并集线合并
+进分支后的**中途**快照曾是 `2542 passed / 15 failed`——那 15 条是形状已改而 Agent/Skill 写入路径未跟上
+导致的既有用例失败，随 Task 4 修好，因此不构成新增回归。web 侧从 `426 passed` 变为 `436 passed`
+（Task 5 新增 4 条、Task 6 新增 6 条）。
 
 **已知既存失败（与本次无关）**：这些失败所在的文件与用例在 `e96d166`（本特性开始前）上**逐字节未变**，
 且在同一环境逐文件运行得到**完全相同的失败集合**——不是"总数接近"，是同一批失败项。
