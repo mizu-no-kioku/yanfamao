@@ -342,3 +342,37 @@ async def test_ensure_knowledge_schema_rebuilds_vectors_for_incomplete_legacy_ch
     assert "mention.entity_id = entity.entity_id AND chunk.graph_indexed IS NOT TRUE" in statements
     assert "mention.triple_id = triple.triple_id AND chunk.graph_indexed IS NOT TRUE" in statements
     assert "THEN 'pending' ELSE 'indexed'" in statements
+
+
+@pytest.mark.asyncio
+async def test_tenant_schema_creates_table_and_identity_constraint():
+    """tenants 表与 (issuer, external_tenant_id) 唯一约束必须由迁移产出。"""
+    async with _recording_manager() as (manager, connection):
+        await manager.ensure_tenant_schema()
+
+    create_table = next(
+        statement for statement in connection.statements if "CREATE TABLE IF NOT EXISTS tenants" in statement
+    )
+    for column in ("id", "external_tenant_id", "issuer", "name", "code", "default_department_id", "created_at"):
+        assert column in create_table, column
+
+    statements = "\n".join(connection.statements)
+    assert "uq_tenants_issuer_external" in statements
+    # 约束必须走存在性判断，否则重复迁移会炸。
+    assert "pg_constraint" in statements
+
+
+def test_business_schema_version_is_ten():
+    """版本号是迁移门禁的唯一真相；后续任务依赖它为 10。"""
+    from yuxi.storage.postgres import manager as manager_module
+
+    assert manager_module.BUSINESS_SCHEMA_VERSION == 10
+
+
+def test_default_tenant_constants_are_stable():
+    """默认租户常量是认证计划接入前的唯一租户来源，取值不能被随手改动。"""
+    from yuxi.storage.postgres import manager as manager_module
+
+    assert manager_module.DEFAULT_TENANT_ID == 1
+    assert manager_module.DEFAULT_TENANT_EXTERNAL_ID == "default"
+    assert manager_module.DEFAULT_TENANT_ISSUER == "local"

@@ -282,7 +282,52 @@ async def test_v072_business_converges_current_schema_idempotently() -> None:
             "ix_scheduled_agent_runs_job_created",
             "ix_scheduled_agent_runs_dispatching",
         }.issubset(scheduled_indexes)
-        assert BUSINESS_SCHEMA_VERSION == 9
+        assert BUSINESS_SCHEMA_VERSION == 10
+    finally:
+        await _drop_isolated_schema(schema, admin_engine, scoped_engine)
+
+
+async def test_tenant_schema_creates_table_and_identity_constraint_on_postgres() -> None:
+    """ensure_tenant_schema 在真实 PostgreSQL 上建出 tenants 与 (issuer, external_tenant_id) 唯一约束，且可重放。"""
+    schema, admin_engine, scoped_engine, manager = await _create_isolated_manager("pytest_tenant_schema")
+    try:
+        await manager.ensure_tenant_schema()
+        await manager.ensure_tenant_schema()
+
+        async with scoped_engine.begin() as connection:
+            columns = set(
+                (
+                    await connection.execute(
+                        text(
+                            "SELECT column_name FROM information_schema.columns "
+                            "WHERE table_schema = :schema AND table_name = 'tenants'"
+                        ),
+                        {"schema": schema},
+                    )
+                ).scalars()
+            )
+            constraint = (
+                await connection.execute(
+                    text(
+                        "SELECT pg_get_constraintdef(con.oid) FROM pg_constraint con "
+                        "JOIN pg_class rel ON rel.oid = con.conrelid "
+                        "JOIN pg_namespace ns ON ns.oid = rel.relnamespace "
+                        "WHERE ns.nspname = :schema AND con.conname = 'uq_tenants_issuer_external'"
+                    ),
+                    {"schema": schema},
+                )
+            ).scalar()
+
+        assert {
+            "id",
+            "external_tenant_id",
+            "issuer",
+            "name",
+            "code",
+            "default_department_id",
+            "created_at",
+        } <= columns
+        assert constraint == "UNIQUE (issuer, external_tenant_id)"
     finally:
         await _drop_isolated_schema(schema, admin_engine, scoped_engine)
 

@@ -125,7 +125,7 @@ async def main() -> None:
                 "business",
                 business_version,
                 BUSINESS_SCHEMA_VERSION,
-                upgrade_from=(2, 7, 8),
+                upgrade_from=(2, 7, 8, 9),
             )
             knowledge_version = versions.get("knowledge")
             _require_supported_version(
@@ -151,6 +151,12 @@ async def main() -> None:
                     await pg_manager.setup_langgraph_checkpointer()
             if business_version in {None, 2, 7, 8}:
                 await pg_manager.upgrade_agent_resource_selection()
+            # 租户模型：独立于上面的历史收敛，对所有落后于当前版本的库都要跑一遍。
+            # `business_version` 是进入本轮时读到的快照，上面的收敛可能已把库里写成 9，
+            # 因此这里用快照比较，不重读。
+            if business_version != BUSINESS_SCHEMA_VERSION:
+                await pg_manager.ensure_tenant_schema()
+                await pg_manager.record_schema_version("business", BUSINESS_SCHEMA_VERSION)
 
             if knowledge_version is None:
                 await pg_manager.create_knowledge_tables()

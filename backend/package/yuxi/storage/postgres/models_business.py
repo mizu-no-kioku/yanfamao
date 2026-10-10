@@ -140,6 +140,25 @@ class Project(Base):
         }
 
 
+class Tenant(Base):
+    """宿主平台租户。Yuxi 内部主键稳定，外部标识由 (issuer, external_tenant_id) 共同确定。
+
+    `default_department_id` 刻意不加 ForeignKey：tenants 与 departments 互相引用，
+    加了 FK 会让建表顺序与插入顺序都变脆。租户开通在事务内分步建立再回填。
+    """
+
+    __tablename__ = "tenants"
+    __table_args__ = (UniqueConstraint("issuer", "external_tenant_id", name="uq_tenants_issuer_external"),)
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    external_tenant_id = Column(String(128), nullable=False)
+    issuer = Column(String(255), nullable=False)
+    name = Column(String(255), nullable=False)
+    code = Column(String(64), nullable=True)
+    default_department_id = Column(Integer, nullable=True)
+    created_at = Column(DateTime, default=utc_now_naive, nullable=False, server_default=func.now())
+
+
 class Department(Base):
     """部门模型"""
 
