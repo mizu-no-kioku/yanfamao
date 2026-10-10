@@ -56,9 +56,7 @@ def build_policy(payload: dict) -> tuple[dict[str, ResourceGrant], dict[str, tup
             if denied:
                 raise ResourcePolicyError(f"{resource_code}.{table} 含永久拒绝字段: {sorted(denied)}")
             if not requested <= bound.columns:
-                raise ResourcePolicyError(
-                    f"{resource_code}.{table} 超出代码上限: {sorted(requested - bound.columns)}"
-                )
+                raise ResourcePolicyError(f"{resource_code}.{table} 超出代码上限: {sorted(requested - bound.columns)}")
             tables[table] = requested
         max_rows = int(spec.get("max_rows", 200))
         if max_rows > 200:
