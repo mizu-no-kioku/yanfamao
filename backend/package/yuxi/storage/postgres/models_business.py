@@ -196,6 +196,11 @@ class User(Base):
     password_hash = Column(String, nullable=False)
     role = Column(String, nullable=False, default="user")  # 角色: superadmin, admin, user
     department_id = Column(Integer, ForeignKey("departments.id"), nullable=True)  # 部门ID
+    # 宿主身份：JIT 落库时写入。uid 保持内部语义不变——它参与 Workspace 路径派生
+    # （md5(uid || ':' || owner_thread_id)）与既有外键，改成宿主 subject 会破坏这些链路。
+    external_issuer = Column(String(255), nullable=True)
+    external_subject = Column(String(255), nullable=True)
+    identity_source = Column(String(32), nullable=False, default="local", server_default="local")
     created_at = Column(DateTime, default=utc_now_naive)
     last_login = Column(DateTime, nullable=True)
 

@@ -93,6 +93,21 @@ def _tenant_index_statement(table: str) -> str:
 TENANT_COLUMN_SCHEMA_STATEMENTS: tuple[str, ...] = tuple(
     f"ALTER TABLE IF EXISTS {table} ADD COLUMN IF NOT EXISTS tenant_id INTEGER" for table in TENANT_ROOT_TABLES
 ) + tuple(_tenant_index_statement(table) for table in TENANT_ROOT_TABLES)
+USER_IDENTITY_SCHEMA_STATEMENTS: tuple[str, ...] = (
+    "ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS external_issuer VARCHAR(255)",
+    "ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS external_subject VARCHAR(255)",
+    "ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS identity_source VARCHAR(32)",
+    "ALTER TABLE IF EXISTS users ALTER COLUMN identity_source SET DEFAULT 'local'",
+    # users 可能还不存在（该域尚未建表），回填必须自己判断表是否存在。
+    (
+        "DO $$\n"
+        "BEGIN\n"
+        "    IF to_regclass('users') IS NOT NULL THEN\n"
+        "        UPDATE users SET identity_source = 'local' WHERE identity_source IS NULL;\n"
+        "    END IF;\n"
+        "END $$\n"
+    ),
+)
 AGENT_RUN_LEASE_SCHEMA_STATEMENTS = (
     "ALTER TABLE IF EXISTS agent_runs ADD COLUMN IF NOT EXISTS worker_id VARCHAR(128)",
     "ALTER TABLE IF EXISTS agent_runs ADD COLUMN IF NOT EXISTS heartbeat_at TIMESTAMP WITHOUT TIME ZONE",
@@ -631,7 +646,11 @@ class PostgresManager(metaclass=SingletonMeta):
 
         self._check_initialized()
         async with self.async_engine.begin() as conn:
-            for statement in (*TENANT_SCHEMA_STATEMENTS, *TENANT_COLUMN_SCHEMA_STATEMENTS):
+            for statement in (
+                *TENANT_SCHEMA_STATEMENTS,
+                *TENANT_COLUMN_SCHEMA_STATEMENTS,
+                *USER_IDENTITY_SCHEMA_STATEMENTS,
+            ):
                 await conn.execute(text(statement))
 
     async def upgrade_knowledge_schema_v1_to_v2(self) -> None:

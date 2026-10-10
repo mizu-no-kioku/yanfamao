@@ -12,7 +12,7 @@ from yuxi.storage.postgres.manager import (
     KnowledgeBase,
     PostgresManager,
 )
-from yuxi.storage.postgres.models_business import AgentRun
+from yuxi.storage.postgres.models_business import AgentRun, User
 
 
 def test_business_and_knowledge_metadata_are_disjoint():
@@ -396,3 +396,26 @@ def test_ownership_roots_are_declared_on_the_orm_models():
     for table in TENANT_ROOT_TABLES:
         metadata = KnowledgeBase.metadata if table == "knowledge_bases" else BusinessBase.metadata
         assert "tenant_id" in metadata.tables[table].c, table
+
+
+@pytest.mark.asyncio
+async def test_user_identity_columns_are_added_by_migration():
+    """宿主身份三列由迁移补上，老库没有它们也要能补齐。"""
+    async with _recording_manager() as (manager, connection):
+        await manager.ensure_tenant_schema()
+
+    statements = "\n".join(connection.statements)
+    assert "ADD COLUMN IF NOT EXISTS external_issuer VARCHAR(255)" in statements
+    assert "ADD COLUMN IF NOT EXISTS external_subject VARCHAR(255)" in statements
+    assert "ADD COLUMN IF NOT EXISTS identity_source VARCHAR(32)" in statements
+    assert "SET DEFAULT 'local'" in statements
+    # users 在当前库里可能还不存在（知识域先行迁移、或该域未启用），回填必须自己判断。
+    assert "to_regclass('users')" in statements
+
+
+def test_user_model_keeps_uid_meaning_and_adds_external_identity():
+    """uid 仍是内部身份：它参与 Workspace 路径派生与既有外键，不能改成宿主 subject。"""
+    assert "uid" in User.__table__.c
+    for column in ("external_issuer", "external_subject", "identity_source"):
+        assert column in User.__table__.c, column
+    assert User.__table__.c.identity_source.default.arg == "local"
