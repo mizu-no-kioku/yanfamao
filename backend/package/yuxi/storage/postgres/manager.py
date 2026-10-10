@@ -19,17 +19,21 @@ from yuxi.storage.postgres.models_business import (
 )
 from yuxi.storage.postgres.models_business import Base as BusinessBase
 from yuxi.storage.postgres.models_knowledge import Base as KnowledgeBase
+from yuxi.storage.postgres.tenant_context import (
+    DEFAULT_TENANT_EXTERNAL_ID as DEFAULT_TENANT_EXTERNAL_ID,
+    DEFAULT_TENANT_ID as DEFAULT_TENANT_ID,
+    DEFAULT_TENANT_ISSUER as DEFAULT_TENANT_ISSUER,
+    current_tenant_id as current_tenant_id,
+    use_tenant as use_tenant,
+)
 from yuxi.utils import logger
 from yuxi.utils.singleton import SingletonMeta
 
 AGENT_RUN_TERMINAL_STATUS_SQL = ", ".join(f"'{status}'" for status in AGENT_RUN_TERMINAL_STATUSES)
-BUSINESS_SCHEMA_VERSION = 10
+BUSINESS_SCHEMA_VERSION = 11
 KNOWLEDGE_SCHEMA_VERSION = 2
 SCHEMA_VERSION_TABLE = "yuxi_schema_migrations"
-# 默认租户：单租户部署与全部存量数据都归属它。认证计划接入宿主 Claim 之前，所有会话都用它。
-DEFAULT_TENANT_ID = 1
-DEFAULT_TENANT_EXTERNAL_ID = "default"
-DEFAULT_TENANT_ISSUER = "local"
+# 默认租户常量从 tenant_context 再导出：models_* 与 manager 都要用，来源只此一处。
 TENANT_SCHEMA_STATEMENTS: tuple[str, ...] = (
     """
     CREATE TABLE IF NOT EXISTS tenants (
@@ -72,22 +76,28 @@ TENANT_ROOT_TABLES: tuple[str, ...] = (
     "scheduled_agent_jobs",
     "operation_logs",
 )
-def _tenant_index_statement(table: str) -> str:
-    """仅在表存在时给 tenant_id 建索引。
+def _guarded_statement(table: str, sql: str) -> str:
+    """仅在表存在时执行语句。
 
-    `CREATE INDEX IF NOT EXISTS` 的 `IF NOT EXISTS` 只守索引名、不守表：对不存在的表
-    直接抛 UndefinedTable。迁移要在"该域尚未建表"或"该域未启用"的库上也能跑完，
-    所以索引创建必须自己判断表是否存在。
+    `CREATE INDEX IF NOT EXISTS` 的 `IF NOT EXISTS` 只守索引名、不守表，对不存在的表
+    直接抛 UndefinedTable；`UPDATE` 更是完全没有守卫。迁移要在"该域尚未建表"或
+    "该域未启用"的库上也能跑完，所以这类语句必须自己判断表是否存在。
     """
 
     return (
         "DO $$\n"
         "BEGIN\n"
         f"    IF to_regclass('{table}') IS NOT NULL THEN\n"
-        f"        CREATE INDEX IF NOT EXISTS ix_{table}_tenant_id ON {table}(tenant_id);\n"
+        f"        {sql}\n"
         "    END IF;\n"
         "END $$\n"
     )
+
+
+def _tenant_index_statement(table: str) -> str:
+    """仅在表存在时给 tenant_id 建索引。"""
+
+    return _guarded_statement(table, f"CREATE INDEX IF NOT EXISTS ix_{table}_tenant_id ON {table}(tenant_id);")
 
 
 TENANT_COLUMN_SCHEMA_STATEMENTS: tuple[str, ...] = tuple(
@@ -99,14 +109,30 @@ USER_IDENTITY_SCHEMA_STATEMENTS: tuple[str, ...] = (
     "ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS identity_source VARCHAR(32)",
     "ALTER TABLE IF EXISTS users ALTER COLUMN identity_source SET DEFAULT 'local'",
     # users 可能还不存在（该域尚未建表），回填必须自己判断表是否存在。
-    (
-        "DO $$\n"
-        "BEGIN\n"
-        "    IF to_regclass('users') IS NOT NULL THEN\n"
-        "        UPDATE users SET identity_source = 'local' WHERE identity_source IS NULL;\n"
-        "    END IF;\n"
-        "END $$\n"
-    ),
+    _guarded_statement("users", "UPDATE users SET identity_source = 'local' WHERE identity_source IS NULL;"),
+)
+TENANT_BACKFILL_SCHEMA_STATEMENTS: tuple[str, ...] = (
+    # 默认租户：单租户部署与全部存量数据的归属。ON CONFLICT 让重放安全。
+    """
+    INSERT INTO tenants (id, external_tenant_id, issuer, name, code)
+    VALUES (1, 'default', 'local', '默认租户', 'default')
+    ON CONFLICT (id) DO NOTHING
+    """,
+    # tenants.id 是 IDENTITY，手工插入 id=1 不推进序列；不校准会让第一个真实租户撞主键。
+    "SELECT setval(pg_get_serial_sequence('tenants', 'id'), GREATEST((SELECT MAX(id) FROM tenants), 1))",
+) + tuple(
+    _guarded_statement(table, f"UPDATE {table} SET tenant_id = 1 WHERE tenant_id IS NULL;")
+    for table in TENANT_ROOT_TABLES
+) + tuple(
+    f"ALTER TABLE IF EXISTS {table} ALTER COLUMN tenant_id SET NOT NULL" for table in TENANT_ROOT_TABLES
+) + tuple(
+    # 列必须有数据库默认值，否则任何不带 tenant_id 的裸 SQL 插入都会被 NOT NULL 挡住——
+    # 迁移刚上线而进程还在跑旧代码时，那等于让全部写入失败。
+    # 默认值读会话设置；取不到就回落默认租户。RLS 上线后没有上下文的会话会被 WITH CHECK
+    # 拦下，所以这条回落不会变成跨租户误写。
+    f"ALTER TABLE IF EXISTS {table} ALTER COLUMN tenant_id SET DEFAULT "
+    f"COALESCE(NULLIF(current_setting('app.tenant_id', true), '')::int, {DEFAULT_TENANT_ID})"
+    for table in TENANT_ROOT_TABLES
 )
 AGENT_RUN_LEASE_SCHEMA_STATEMENTS = (
     "ALTER TABLE IF EXISTS agent_runs ADD COLUMN IF NOT EXISTS worker_id VARCHAR(128)",
@@ -650,6 +676,7 @@ class PostgresManager(metaclass=SingletonMeta):
                 *TENANT_SCHEMA_STATEMENTS,
                 *TENANT_COLUMN_SCHEMA_STATEMENTS,
                 *USER_IDENTITY_SCHEMA_STATEMENTS,
+                *TENANT_BACKFILL_SCHEMA_STATEMENTS,
             ):
                 await conn.execute(text(statement))
 

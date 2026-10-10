@@ -13,9 +13,11 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import declarative_base
+from yuxi.storage.postgres.tenant_context import DEFAULT_TENANT_ID, current_tenant_id
 from yuxi.utils.datetime_utils import utc_now
 
 Base = declarative_base()
@@ -26,7 +28,16 @@ class KnowledgeBase(Base):
     """知识库模型"""
 
     __tablename__ = "knowledge_bases"
-    tenant_id = Column(Integer, nullable=True, index=True)
+    tenant_id = Column(
+        Integer,
+        nullable=False,
+        default=current_tenant_id,
+        # create_all 出来的 schema 必须自带默认值，否则任何不带 tenant_id 的插入都会撞
+        # NOT NULL。这里用字面量是为了在 SQLite（unit 测试）上也可用；PostgreSQL 上
+        # 迁移会把它改成读会话设置的表达式。
+        server_default=text(str(DEFAULT_TENANT_ID)),
+        index=True,
+    )
     __table_args__ = (UniqueConstraint("kb_id", name="uq_knowledge_bases_kb_id"),)
 
     id = Column(Integer, primary_key=True, autoincrement=True)

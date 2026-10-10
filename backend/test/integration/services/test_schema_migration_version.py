@@ -282,7 +282,7 @@ async def test_v072_business_converges_current_schema_idempotently() -> None:
             "ix_scheduled_agent_runs_job_created",
             "ix_scheduled_agent_runs_dispatching",
         }.issubset(scheduled_indexes)
-        assert BUSINESS_SCHEMA_VERSION == 10
+        assert BUSINESS_SCHEMA_VERSION == 11
     finally:
         await _drop_isolated_schema(schema, admin_engine, scoped_engine)
 
