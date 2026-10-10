@@ -7,7 +7,6 @@
 import json
 import os
 
-import pytest
 from pydantic import BaseModel, ConfigDict, SecretStr, ValidationError
 
 TEST_CONFIG_ENV = "YUXI_NL2SQL_TEST_DATABASE_CONFIG"
@@ -34,10 +33,12 @@ def load_test_database_config() -> TestDatabaseConfig | None:
     try:
         return TestDatabaseConfig.model_validate(json.loads(raw))
     except (json.JSONDecodeError, ValidationError):
-        return None
+        raise ValueError("Invalid isolated test database configuration") from None
 
 
 def require_test_database() -> TestDatabaseConfig:
+    import pytest
+
     config = load_test_database_config()
     if config is None:
         pytest.skip(f"未配置 {TEST_CONFIG_ENV}，跳过需要隔离测试库的用例")

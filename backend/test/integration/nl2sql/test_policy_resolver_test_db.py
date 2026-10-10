@@ -50,7 +50,7 @@ def test_inactive_user_is_denied(directory):
 
 def test_resolved_policy_blocks_cross_tenant_sql(directory):
     """解析器产出的策略交给既有 SQLSecurityGuard：跨租户条件应返回空。"""
-    from yuxi.permissions.sql_security import SQLSecurityGuard
+    from yuxi.services.business_database_security import SQLSecurityGuard
 
     resolved = resolve_query_policy(BusinessPrincipal(user_id=1001), directory)
     secured = SQLSecurityGuard(resolved.policy).secure("SELECT ID FROM t_project WHERE TENANT_ID = 99")
@@ -63,7 +63,7 @@ def test_resolved_policy_blocks_cross_tenant_sql(directory):
 
 
 def test_resolved_policy_rejects_permanently_denied_table(directory):
-    from yuxi.permissions.sql_security import PolicyViolation, SQLSecurityGuard
+    from yuxi.services.business_database_security import PolicyViolation, SQLSecurityGuard
 
     resolved = resolve_query_policy(BusinessPrincipal(user_id=1001), directory)
     with pytest.raises(PolicyViolation) as exc:

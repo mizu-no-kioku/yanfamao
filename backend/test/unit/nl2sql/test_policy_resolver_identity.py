@@ -51,9 +51,7 @@ def test_multi_tenant_user_without_explicit_tenant_is_denied():
 
 
 def test_multi_tenant_user_with_explicit_tenant_resolves():
-    directory = FakeDirectory(
-        active_users={1001}, tenants_by_user={1001: (10, 20)}, staff_by_key={(1001, 20): (2005,)}
-    )
+    directory = FakeDirectory(active_users={1001}, tenants_by_user={1001: (10, 20)}, staff_by_key={(1001, 20): (2005,)})
     subject = resolve_business_subject(BusinessPrincipal(user_id=1001, tenant_id=20), directory)
     assert (subject.user_id, subject.tenant_id, subject.staff_id) == (1001, 20, 2005)
 

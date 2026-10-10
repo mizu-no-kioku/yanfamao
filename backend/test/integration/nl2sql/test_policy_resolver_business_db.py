@@ -6,26 +6,15 @@
 import pytest
 
 
-def _business_config():
-    from yuxi.services.business_database_service import load_business_database_config
-
-    try:
-        return load_business_database_config()
-    except PermissionError:
-        # 仅“变量缺失”可用作跳过理由；配置存在但格式错误会让 ValueError 冒泡成失败。
-        return None
-
-
 @pytest.fixture
 def business_directory():
-    config = _business_config()
-    if config is None:
-        pytest.skip("未配置 YUXI_BUSINESS_DATABASE_CONFIG")
+    import os
+
+    if os.environ.get("YUXI_NL2SQL_BUSINESS_TEST") != "1":
+        pytest.skip("Set YUXI_NL2SQL_BUSINESS_TEST=1 for read-only business verification")
     from yuxi.nl2sql.mysql_directory import business_directory_from_env
 
-    directory = business_directory_from_env()
-    assert directory is not None
-    return directory
+    return business_directory_from_env()
 
 
 def test_business_account_cannot_write(business_directory):
@@ -51,29 +40,17 @@ def test_test_database_config_is_independent_from_business_config():
 
 
 def test_malformed_business_config_fails_instead_of_skipping(monkeypatch):
-    """配置存在但非法时必须失败，不得被当作“未配置”而跳过。
-
-    否则部署管理员写错一个字符，就会得到一个绿色 skipped 套件、却从未触达生产库。
-    只有“变量缺失”（PermissionError）才允许降级为 None；格式错误（ValueError）必须冒泡。
-    """
     from yuxi.nl2sql.mysql_directory import business_directory_from_env
-    from yuxi.services.business_database_service import load_business_database_config
+    from yuxi.services.business_database_service import BusinessDatabaseConfigurationError
 
-    monkeypatch.setenv("YUXI_BUSINESS_DATABASE_CONFIG", "{ not json")
-
-    with pytest.raises(ValueError):
-        load_business_database_config()
-    with pytest.raises(ValueError):
-        _business_config()
-    with pytest.raises(ValueError):
+    for name in ("HOST", "USER", "PASSWORD", "NAME"):
+        monkeypatch.setenv("YUXI_BUSINESS_DB_" + name, "test")
+    monkeypatch.setenv("YUXI_BUSINESS_DB_PORT", "invalid")
+    with pytest.raises(BusinessDatabaseConfigurationError):
         business_directory_from_env()
-
-    monkeypatch.delenv("YUXI_BUSINESS_DATABASE_CONFIG", raising=False)
-
-    with pytest.raises(PermissionError):
-        load_business_database_config()
-    assert _business_config() is None
-    assert business_directory_from_env() is None
+    monkeypatch.delenv("YUXI_BUSINESS_DB_HOST")
+    with pytest.raises(BusinessDatabaseConfigurationError):
+        business_directory_from_env()
 
 
 def test_trial_identity_chain_resolves_on_business_db(business_directory):

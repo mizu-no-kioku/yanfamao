@@ -166,16 +166,16 @@ class MySqlBusinessDirectory:
 
 def business_connection_factory() -> ConnectionFactory:
     """真实业务库连接。账号只有 SELECT，本模块只发查询，永不写入。"""
-    from yuxi.services.business_database_service import load_business_database_config
+    from yuxi.services.business_database_service import BusinessDatabaseSettings
 
-    config = load_business_database_config()
+    config = BusinessDatabaseSettings.from_env().connection
 
     def connect():
         return pymysql.connect(
             host=config.host,
             port=config.port,
             user=config.user,
-            password=config.password.get_secret_value(),
+            password=config.password,
             database=config.database,
             charset="utf8mb4",
             cursorclass=pymysql.cursors.Cursor,
@@ -186,11 +186,6 @@ def business_connection_factory() -> ConnectionFactory:
     return connect
 
 
-def business_directory_from_env() -> MySqlBusinessDirectory | None:
-    """业务库配置缺失时返回 None；调用方必须据此跳过，不得回退其他库。"""
-    try:
-        factory = business_connection_factory()
-    except PermissionError:
-        # 仅“配置缺失”降级为 None；配置存在但非法会冒泡，避免被误当作未配置。
-        return None
-    return MySqlBusinessDirectory(factory)
+def business_directory_from_env() -> MySqlBusinessDirectory:
+    """Build a read-only directory using the existing deployment configuration."""
+    return MySqlBusinessDirectory(business_connection_factory())

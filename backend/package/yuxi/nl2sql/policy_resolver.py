@@ -8,7 +8,7 @@ from yuxi.nl2sql.directory import BusinessDirectory
 from yuxi.nl2sql.principal import BusinessPrincipal
 from yuxi.nl2sql.resource_policy import AI_GATE_MENU_IDS, MENU_TO_RESOURCES, resolve_grants
 from yuxi.nl2sql.table_policy import PERMANENTLY_DENIED_COLUMNS, PERMANENTLY_DENIED_TABLES, TABLE_UPPER_BOUNDS
-from yuxi.permissions.sql_security import QueryPolicy
+from yuxi.services.business_database_security import QueryPolicy
 
 
 @dataclass(frozen=True)

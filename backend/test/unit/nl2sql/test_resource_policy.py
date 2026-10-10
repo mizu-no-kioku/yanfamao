@@ -55,9 +55,7 @@ def test_rejects_permanently_denied_table_even_if_in_upper_bound(monkeypatch):
 
     不能只靠「两张清单恰好互斥」这个巧合——那是个没有被表达、也没有被验证的不变量。
     """
-    monkeypatch.setitem(
-        table_policy.TABLE_UPPER_BOUNDS, "t_user", table_policy.TABLE_UPPER_BOUNDS["t_project"]
-    )
+    monkeypatch.setitem(table_policy.TABLE_UPPER_BOUNDS, "t_user", table_policy.TABLE_UPPER_BOUNDS["t_project"])
     payload = _payload("AI_QA_USE", {"t_user": ["ID", "TENANT_ID", "PROJECT_NAME"]})
     with pytest.raises(resource_policy.ResourcePolicyError) as exc:
         resource_policy.build_policy(payload)
