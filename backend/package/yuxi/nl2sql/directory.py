@@ -1,0 +1,23 @@
+"""解析器依赖的只读目录查询。
+
+真实实现查业务库；测试实现查隔离测试库或内存数据。
+解析器只依赖这个协议，因此不随 Yuxi 或数据库结构变化而改动。
+"""
+
+from typing import Protocol
+
+
+class BusinessDirectory(Protocol):
+    def find_active_user(self, user_id: int) -> bool: ...
+
+    def find_tenants_for_user(self, user_id: int) -> tuple[int, ...]: ...
+
+    def find_active_staff_ids(self, user_id: int, tenant_id: int) -> tuple[int, ...]: ...
+
+    def find_role_relation_ids(self, user_id: int, tenant_id: int) -> tuple[int, ...]: ...
+
+    def find_active_role_ids(self, role_ids: tuple[int, ...]) -> tuple[int, ...]: ...
+
+    def find_menu_codes(self, role_ids: tuple[int, ...], tenant_id: int) -> frozenset[str]: ...
+
+    def find_authorized_project_ids(self, tenant_id: int, staff_id: int) -> tuple[int, ...]: ...
