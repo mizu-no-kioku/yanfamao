@@ -463,6 +463,29 @@ services:
       - app-network
     restart: unless-stopped
 
+  # 隔离的 NL2SQL 权限测试库：仅在显式指定 profile 时启动。
+  # 应用账号只读（复现生产 GRANT SELECT 约束），控制账号可写（用于提交撤权）。
+  mysql-test:
+    image: mysql:8.4
+    profiles:
+      - nl2sql-test
+    command: ["mysqld", "--character-set-server=utf8mb4", "--collation-server=utf8mb4_general_ci"]
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: nl2sql_test
+    ports:
+      - "127.0.0.1:${YUXI_NL2SQL_TEST_PORT:-3399}:3306"
+    volumes:
+      - ./docker/nl2sql-test/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-proot"]
+      interval: 5s
+      timeout: 3s
+      retries: 40
+    networks:
+      - app-network
+    restart: "no"
+
   # lastest version: wget https://gcore.jsdelivr.net/gh/opendatalab/MinerU@master/docker/compose.yaml
   mineru-api:
     build:
