@@ -1,7 +1,5 @@
 """测试库配置只从专用环境变量读取；缺失时跳过，绝不回退业务库。"""
 
-import importlib
-
 import pytest
 
 from yuxi.nl2sql import test_database
