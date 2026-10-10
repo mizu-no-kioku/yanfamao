@@ -1,4 +1,4 @@
-"""把业务身份解析成完整的 QueryPolicy。本任务只实现身份链部分。"""
+"""把业务身份解析成完整的 QueryPolicy：身份 → 功能门 → 资源 → 行权限 → 策略。"""
 
 from collections.abc import Collection
 from dataclasses import dataclass
@@ -6,7 +6,9 @@ from dataclasses import dataclass
 from yuxi.nl2sql import errors
 from yuxi.nl2sql.directory import BusinessDirectory
 from yuxi.nl2sql.principal import BusinessPrincipal
-from yuxi.nl2sql.resource_policy import MENU_TO_RESOURCES
+from yuxi.nl2sql.resource_policy import MENU_TO_RESOURCES, resolve_grants
+from yuxi.nl2sql.table_policy import PERMANENTLY_DENIED_COLUMNS, PERMANENTLY_DENIED_TABLES, TABLE_UPPER_BOUNDS
+from yuxi.permissions.sql_security import QueryPolicy
 
 # 功能门菜单 CODE，与 resource_policy.yaml 的 menu_ids 对应；
 # 单元测试 test_gate_menu_codes_match_gate_menu_ids 守卫两边一致。
@@ -92,3 +94,54 @@ def resolve_resource_codes(
     for menu_code in menu_codes:
         codes.update(MENU_TO_RESOURCES.get(menu_code, ()))
     return frozenset(codes)
+
+
+@dataclass(frozen=True)
+class ResolvedPolicy:
+    subject: BusinessSubject
+    resource_codes: frozenset[str]
+    policy: QueryPolicy
+
+
+def resolve_query_policy(principal: BusinessPrincipal, directory: BusinessDirectory) -> ResolvedPolicy:
+    """完整解析：身份 → 功能门 → 资源 → 行权限 → QueryPolicy。"""
+    subject = resolve_business_subject(principal, directory)
+    role_ids = resolve_function_gate(subject, directory)
+    resource_codes = resolve_resource_codes(subject, role_ids, directory)
+
+    grants = resolve_grants(resource_codes)
+    allowed_tables: set[str] = set()
+    table_columns: dict[str, frozenset[str]] = {}
+    max_rows = 200
+    for grant in grants:
+        allowed_tables |= grant.tables
+        for table, columns in grant.columns.items():
+            table_columns[table] = table_columns.get(table, frozenset()) | columns
+        max_rows = min(max_rows, grant.max_rows)
+
+    if not allowed_tables:
+        raise errors.PolicyDenial(errors.FUNCTION_GATE_DENIED, "当前角色没有可用的数据资源")
+
+    project_ids = directory.find_authorized_project_ids(subject.tenant_id, subject.staff_id)
+    if not project_ids:
+        raise errors.PolicyDenial(errors.NO_PROJECT_ACCESS, "当前员工没有可访问的业务项目")
+
+    project_scope_columns = {
+        table: TABLE_UPPER_BOUNDS[table].project_column
+        for table in allowed_tables
+        if TABLE_UPPER_BOUNDS[table].project_column
+    }
+
+    policy = QueryPolicy(
+        tenant_id=subject.tenant_id,
+        staff_id=subject.staff_id,
+        allowed_tables=frozenset(allowed_tables),
+        table_columns=table_columns,
+        allowed_project_ids=tuple(project_ids),
+        project_scope_columns=project_scope_columns,
+        global_tables=frozenset(),
+        denied_tables=PERMANENTLY_DENIED_TABLES,
+        denied_columns=PERMANENTLY_DENIED_COLUMNS,
+        max_rows=max_rows,
+    )
+    return ResolvedPolicy(subject=subject, resource_codes=resource_codes, policy=policy)
