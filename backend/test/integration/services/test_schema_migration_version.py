@@ -332,6 +332,49 @@ async def test_tenant_schema_creates_table_and_identity_constraint_on_postgres()
         await _drop_isolated_schema(schema, admin_engine, scoped_engine)
 
 
+async def test_tenant_schema_restores_tenant_id_on_a_legacy_table() -> None:
+    """老库没有 tenant_id：ensure_tenant_schema 必须把它加回来，而不是只依赖 create_all。
+
+    这条是"归属根加列"的真实证据——`ALTER TABLE ... ADD COLUMN IF NOT EXISTS` 走的是
+    老库演进路径，全新库由 ORM create_all 建出，两者都不覆盖对方。
+    """
+    schema, admin_engine, scoped_engine, manager = await _create_isolated_manager("pytest_tenant_column")
+    try:
+        await manager.create_business_tables()
+        async with scoped_engine.begin() as connection:
+            await connection.execute(text("ALTER TABLE users DROP COLUMN tenant_id"))
+            await connection.execute(text("DROP INDEX IF EXISTS ix_users_tenant_id"))
+
+        await manager.ensure_tenant_schema()
+
+        async with scoped_engine.begin() as connection:
+            restored = (
+                await connection.execute(
+                    text(
+                        "SELECT column_name FROM information_schema.columns "
+                        "WHERE table_schema = :schema AND table_name = 'users' AND column_name = 'tenant_id'"
+                    ),
+                    {"schema": schema},
+                )
+            ).scalar()
+            index_names = set(
+                (
+                    await connection.execute(
+                        text(
+                            "SELECT indexname FROM pg_indexes "
+                            "WHERE schemaname = :schema AND tablename = 'users'"
+                        ),
+                        {"schema": schema},
+                    )
+                ).scalars()
+            )
+
+        assert restored == "tenant_id"
+        assert "ix_users_tenant_id" in index_names
+    finally:
+        await _drop_isolated_schema(schema, admin_engine, scoped_engine)
+
+
 async def test_release_upgrade_adds_audit_columns_idempotently() -> None:
     """发布版缺失的 Trace 与 Message 审计列由完整升级补齐，且可安全重放。"""
     schema, admin_engine, scoped_engine, manager = await _create_isolated_manager("pytest_audit_schema")

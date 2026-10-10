@@ -26,6 +26,7 @@ class KnowledgeBase(Base):
     """知识库模型"""
 
     __tablename__ = "knowledge_bases"
+    tenant_id = Column(Integer, nullable=True, index=True)
     __table_args__ = (UniqueConstraint("kb_id", name="uq_knowledge_bases_kb_id"),)
 
     id = Column(Integer, primary_key=True, autoincrement=True)

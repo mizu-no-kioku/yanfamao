@@ -57,6 +57,42 @@ TENANT_SCHEMA_STATEMENTS: tuple[str, ...] = (
     END $$
     """,
 )
+# 归属根：可被独立检索、排队、调度或授权的实体。派生表靠外键链归属，不在此列。
+TENANT_ROOT_TABLES: tuple[str, ...] = (
+    "users",
+    "departments",
+    "api_keys",
+    "knowledge_bases",
+    "agents",
+    "skills",
+    "tasks",
+    "cli_auth_sessions",
+    "agent_run_requests",
+    "agent_runs",
+    "scheduled_agent_jobs",
+    "operation_logs",
+)
+def _tenant_index_statement(table: str) -> str:
+    """仅在表存在时给 tenant_id 建索引。
+
+    `CREATE INDEX IF NOT EXISTS` 的 `IF NOT EXISTS` 只守索引名、不守表：对不存在的表
+    直接抛 UndefinedTable。迁移要在"该域尚未建表"或"该域未启用"的库上也能跑完，
+    所以索引创建必须自己判断表是否存在。
+    """
+
+    return (
+        "DO $$\n"
+        "BEGIN\n"
+        f"    IF to_regclass('{table}') IS NOT NULL THEN\n"
+        f"        CREATE INDEX IF NOT EXISTS ix_{table}_tenant_id ON {table}(tenant_id);\n"
+        "    END IF;\n"
+        "END $$\n"
+    )
+
+
+TENANT_COLUMN_SCHEMA_STATEMENTS: tuple[str, ...] = tuple(
+    f"ALTER TABLE IF EXISTS {table} ADD COLUMN IF NOT EXISTS tenant_id INTEGER" for table in TENANT_ROOT_TABLES
+) + tuple(_tenant_index_statement(table) for table in TENANT_ROOT_TABLES)
 AGENT_RUN_LEASE_SCHEMA_STATEMENTS = (
     "ALTER TABLE IF EXISTS agent_runs ADD COLUMN IF NOT EXISTS worker_id VARCHAR(128)",
     "ALTER TABLE IF EXISTS agent_runs ADD COLUMN IF NOT EXISTS heartbeat_at TIMESTAMP WITHOUT TIME ZONE",
@@ -595,7 +631,7 @@ class PostgresManager(metaclass=SingletonMeta):
 
         self._check_initialized()
         async with self.async_engine.begin() as conn:
-            for statement in TENANT_SCHEMA_STATEMENTS:
+            for statement in (*TENANT_SCHEMA_STATEMENTS, *TENANT_COLUMN_SCHEMA_STATEMENTS):
                 await conn.execute(text(statement))
 
     async def upgrade_knowledge_schema_v1_to_v2(self) -> None:

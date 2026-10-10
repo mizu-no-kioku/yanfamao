@@ -7,6 +7,7 @@ import pytest
 from yuxi.storage.postgres.manager import (
     BUSINESS_SCHEMA_VERSION,
     KNOWLEDGE_SCHEMA_VERSION,
+    TENANT_ROOT_TABLES,
     BusinessBase,
     KnowledgeBase,
     PostgresManager,
@@ -376,3 +377,22 @@ def test_default_tenant_constants_are_stable():
     assert manager_module.DEFAULT_TENANT_ID == 1
     assert manager_module.DEFAULT_TENANT_EXTERNAL_ID == "default"
     assert manager_module.DEFAULT_TENANT_ISSUER == "local"
+
+
+@pytest.mark.asyncio
+async def test_every_ownership_root_gets_a_tenant_id_column():
+    """归属根由迁移加可空 tenant_id；派生表靠外键链，不在此列。"""
+    async with _recording_manager() as (manager, connection):
+        await manager.ensure_tenant_schema()
+
+    statements = "\n".join(connection.statements)
+    for table in TENANT_ROOT_TABLES:
+        assert f"ALTER TABLE IF EXISTS {table} ADD COLUMN IF NOT EXISTS tenant_id INTEGER" in statements, table
+        assert f"CREATE INDEX IF NOT EXISTS ix_{table}_tenant_id ON {table}(tenant_id)" in statements, table
+
+
+def test_ownership_roots_are_declared_on_the_orm_models():
+    """ORM 侧与 DDL 侧必须同时有列，否则全新库（create_all）会缺列。"""
+    for table in TENANT_ROOT_TABLES:
+        metadata = KnowledgeBase.metadata if table == "knowledge_bases" else BusinessBase.metadata
+        assert "tenant_id" in metadata.tables[table].c, table

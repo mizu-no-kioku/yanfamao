@@ -163,6 +163,7 @@ class Department(Base):
     """部门模型"""
 
     __tablename__ = "departments"
+    tenant_id = Column(Integer, nullable=True, index=True)
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     name = Column(String(50), nullable=False, unique=True, index=True)
@@ -185,6 +186,7 @@ class User(Base):
     """用户模型"""
 
     __tablename__ = "users"
+    tenant_id = Column(Integer, nullable=True, index=True)
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     username = Column(String, nullable=False, unique=True, index=True)  # 显示名称
@@ -314,6 +316,7 @@ class Agent(Base):
     """用户可管理、可授权、可切换的智能体。"""
 
     __tablename__ = "agents"
+    tenant_id = Column(Integer, nullable=True, index=True)
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     slug = Column(String(80), nullable=False, unique=True, index=True)
@@ -370,6 +373,7 @@ class Skill(Base):
     """Skill 元数据模型（内容存文件系统，索引存数据库）"""
 
     __tablename__ = "skills"
+    tenant_id = Column(Integer, nullable=True, index=True)
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     slug = Column(String(128), nullable=False, unique=True, index=True, comment="技能唯一标识（目录名）")
@@ -659,6 +663,7 @@ class OperationLog(Base):
     """操作日志模型"""
 
     __tablename__ = "operation_logs"
+    tenant_id = Column(Integer, nullable=True, index=True)
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
@@ -879,6 +884,7 @@ class ConfigOption(Base):
 
 class TaskRecord(Base):
     __tablename__ = "tasks"
+    tenant_id = Column(Integer, nullable=True, index=True)
     __table_args__ = (
         UniqueConstraint("type", "dedupe_key", name="uq_tasks_active_dedupe"),
         Index("ix_tasks_status_lease_expires", "status", "lease_expires_at"),
@@ -942,6 +948,7 @@ class ScheduledAgentJob(Base):
     """用户自建 Agent 定时任务。"""
 
     __tablename__ = "scheduled_agent_jobs"
+    tenant_id = Column(Integer, nullable=True, index=True)
     __table_args__ = (
         UniqueConstraint(
             "uid",
@@ -1051,6 +1058,7 @@ class APIKey(Base):
     """API Key 模型"""
 
     __tablename__ = "api_keys"
+    tenant_id = Column(Integer, nullable=True, index=True)
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     key_hash = Column(String(64), nullable=False, unique=True, index=True)
@@ -1103,6 +1111,7 @@ class CLIAuthSession(Base):
     """CLI 浏览器授权会话。"""
 
     __tablename__ = "cli_auth_sessions"
+    tenant_id = Column(Integer, nullable=True, index=True)
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     device_code_hash = Column(String(64), nullable=False, unique=True, index=True)
@@ -1140,6 +1149,7 @@ class AgentRun(Base):
     """AgentRun table - 运行任务表"""
 
     __tablename__ = "agent_runs"
+    tenant_id = Column(Integer, nullable=True, index=True)
 
     id = Column(String(64), primary_key=True, comment="Run ID (UUID)")
     conversation_thread_id = Column(String(64), index=True, nullable=False, comment="Conversation thread ID snapshot")
@@ -1336,6 +1346,7 @@ class AgentRunRequest(Base):
     """
 
     __tablename__ = "agent_run_requests"
+    tenant_id = Column(Integer, nullable=True, index=True)
 
     id = Column(Integer, primary_key=True, autoincrement=True, comment="Primary key")
     request_id = Column(String(64), unique=True, index=True, nullable=False, comment="幂等请求 ID")
