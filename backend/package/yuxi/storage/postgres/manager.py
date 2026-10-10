@@ -30,7 +30,7 @@ from yuxi.utils import logger
 from yuxi.utils.singleton import SingletonMeta
 
 AGENT_RUN_TERMINAL_STATUS_SQL = ", ".join(f"'{status}'" for status in AGENT_RUN_TERMINAL_STATUSES)
-BUSINESS_SCHEMA_VERSION = 11
+BUSINESS_SCHEMA_VERSION = 12
 KNOWLEDGE_SCHEMA_VERSION = 2
 SCHEMA_VERSION_TABLE = "yuxi_schema_migrations"
 # 默认租户常量从 tenant_context 再导出：models_* 与 manager 都要用，来源只此一处。
@@ -133,6 +133,28 @@ TENANT_BACKFILL_SCHEMA_STATEMENTS: tuple[str, ...] = (
     f"ALTER TABLE IF EXISTS {table} ALTER COLUMN tenant_id SET DEFAULT "
     f"COALESCE(NULLIF(current_setting('app.tenant_id', true), '')::int, {DEFAULT_TENANT_ID})"
     for table in TENANT_ROOT_TABLES
+)
+TENANT_CONSTRAINT_SCHEMA_STATEMENTS: tuple[str, ...] = (
+    # 旧的全局唯一性以**索引**形式存在（ORM 的 unique=True + index=True），
+    # 不是约束；不显式删掉的话，跨租户同名部门 / 同 request_id 仍会被拒。
+    "DROP INDEX IF EXISTS ix_departments_name",
+    _guarded_statement(
+        "departments",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_departments_tenant_name ON departments(tenant_id, name);",
+    ),
+    "DROP INDEX IF EXISTS ix_api_keys_request_id",
+    _guarded_statement(
+        "api_keys",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_api_keys_tenant_request_id "
+        "ON api_keys(tenant_id, request_id) WHERE request_id IS NOT NULL;",
+    ),
+    # 宿主身份：只有真的有宿主主体时才要求 (租户, issuer, subject) 唯一，
+    # 存量本地用户的 external_subject 是 NULL。
+    _guarded_statement(
+        "users",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_users_tenant_external_identity "
+        "ON users(tenant_id, external_issuer, external_subject) WHERE external_subject IS NOT NULL;",
+    ),
 )
 AGENT_RUN_LEASE_SCHEMA_STATEMENTS = (
     "ALTER TABLE IF EXISTS agent_runs ADD COLUMN IF NOT EXISTS worker_id VARCHAR(128)",
@@ -677,6 +699,7 @@ class PostgresManager(metaclass=SingletonMeta):
                 *TENANT_COLUMN_SCHEMA_STATEMENTS,
                 *USER_IDENTITY_SCHEMA_STATEMENTS,
                 *TENANT_BACKFILL_SCHEMA_STATEMENTS,
+                *TENANT_CONSTRAINT_SCHEMA_STATEMENTS,
             ):
                 await conn.execute(text(statement))
 

@@ -91,7 +91,7 @@ async def create_department(
     user_repo = UserRepository(db)
 
     # 检查部门名称是否已存在
-    if await dept_repo.exists_by_name(department_data.name):
+    if await dept_repo.exists_by_name(department_data.name, tenant_id=current_user.tenant_id):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="部门名称已存在")
 
     # 验证管理员 uid 格式
@@ -161,7 +161,7 @@ async def update_department(
     updates = {}
     # 如果要修改名称，检查新名称是否已存在
     if department_data.name and department_data.name != department.name:
-        existing = await repository.get_by_name(department_data.name)
+        existing = await repository.get_by_name(department_data.name, tenant_id=current_user.tenant_id)
         if existing:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="部门名称已存在")
         updates["name"] = department_data.name

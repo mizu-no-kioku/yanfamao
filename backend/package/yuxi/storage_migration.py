@@ -125,7 +125,7 @@ async def main() -> None:
                 "business",
                 business_version,
                 BUSINESS_SCHEMA_VERSION,
-                upgrade_from=(2, 7, 8, 9, 10),
+                upgrade_from=(2, 7, 8, 9, 10, 11),
             )
             knowledge_version = versions.get("knowledge")
             _require_supported_version(

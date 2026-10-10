@@ -363,11 +363,11 @@ async def test_tenant_schema_creates_table_and_identity_constraint():
     assert "pg_constraint" in statements
 
 
-def test_business_schema_version_is_eleven():
+def test_business_schema_version_is_twelve():
     """版本号是迁移门禁的唯一真相；语句改动后必须推版本，否则已升级的库拿不到新语句。"""
     from yuxi.storage.postgres import manager as manager_module
 
-    assert manager_module.BUSINESS_SCHEMA_VERSION == 11
+    assert manager_module.BUSINESS_SCHEMA_VERSION == 12
 
 
 def test_default_tenant_constants_are_stable():

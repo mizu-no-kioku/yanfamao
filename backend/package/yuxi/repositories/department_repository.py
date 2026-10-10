@@ -60,10 +60,13 @@ class DepartmentRepository:
             )
             return {**department.to_dict(), "user_count": count_result.scalar() or 0}
 
-    async def get_by_name(self, name: str) -> Department | None:
-        """根据名称获取部门"""
+    async def get_by_name(self, name: str, *, tenant_id: int | None = None) -> Department | None:
+        """根据名称获取部门；给了 tenant_id 就按租户判定。"""
         async with self._session() as session:
-            result = await session.execute(select(Department).where(Department.name == name))
+            statement = select(Department).where(Department.name == name)
+            if tenant_id is not None:
+                statement = statement.where(Department.tenant_id == tenant_id)
+            result = await session.execute(statement)
             return result.scalar_one_or_none()
 
     async def list_departments(self) -> list[Department]:
@@ -156,8 +159,11 @@ class DepartmentRepository:
             )
             return result.scalar() or 0
 
-    async def exists_by_name(self, name: str) -> bool:
-        """检查部门名称是否存在"""
+    async def exists_by_name(self, name: str, *, tenant_id: int | None = None) -> bool:
+        """检查部门名称是否存在；给了 tenant_id 就按租户判定。"""
         async with self._session() as session:
-            result = await session.execute(select(Department.id).where(Department.name == name))
+            statement = select(Department.id).where(Department.name == name)
+            if tenant_id is not None:
+                statement = statement.where(Department.tenant_id == tenant_id)
+            result = await session.execute(statement)
             return result.scalar_one_or_none() is not None

@@ -164,6 +164,7 @@ class Department(Base):
     """部门模型"""
 
     __tablename__ = "departments"
+    __table_args__ = (UniqueConstraint("tenant_id", "name", name="uq_departments_tenant_name"),)
     tenant_id = Column(
         Integer,
         nullable=False,
@@ -176,7 +177,7 @@ class Department(Base):
     )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    name = Column(String(50), nullable=False, unique=True, index=True)
+    name = Column(String(50), nullable=False, index=True)
     description = Column(String(255), nullable=True)
     created_at = Column(DateTime, default=utc_now_naive)
 
@@ -196,6 +197,17 @@ class User(Base):
     """用户模型"""
 
     __tablename__ = "users"
+    __table_args__ = (
+        # 宿主身份的唯一性按租户判定；本地用户的 external_subject 是 NULL，不参与约束。
+        Index(
+            "uq_users_tenant_external_identity",
+            "tenant_id",
+            "external_issuer",
+            "external_subject",
+            unique=True,
+            postgresql_where=text("external_subject IS NOT NULL"),
+        ),
+    )
     tenant_id = Column(
         Integer,
         nullable=False,

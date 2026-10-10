@@ -70,3 +70,27 @@ async def test_delete_department_migrates_users_and_revokes_department_keys(depa
     assert persisted_key.is_enabled is False
     assert persisted_key.revoked_at is not None
     assert persisted_key.department_id is None
+
+
+async def test_exists_by_name_is_scoped_to_tenant():
+    """同名部门可以存在于不同租户——多租户下最容易被忽略的唯一性回归。"""
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with factory() as session:
+            session.add_all(
+                [
+                    Department(name="财务部", tenant_id=1),
+                    Department(name="财务部", tenant_id=2),
+                ]
+            )
+            await session.commit()
+
+            repository = DepartmentRepository(session)
+            assert await repository.exists_by_name("财务部", tenant_id=1) is True
+            assert await repository.exists_by_name("财务部", tenant_id=2) is True
+            assert await repository.exists_by_name("财务部", tenant_id=3) is False
+    finally:
+        await engine.dispose()
