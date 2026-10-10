@@ -54,12 +54,21 @@ def test_resolved_policy_blocks_cross_tenant_sql(directory):
 
     resolved = resolve_query_policy(BusinessPrincipal(user_id=1001), directory)
     secured = SQLSecurityGuard(resolved.policy).secure("SELECT ID FROM t_project WHERE TENANT_ID = 99")
-    assert "tenant_id = 10" in secured.final_sql.lower()
+    normalized = " ".join(secured.final_sql.lower().split())
+    assert "tenant_id = 10" in normalized
+    # 项目范围必须真正落到改写后的 SQL：两个授权项目（5001/5002）以 IN 列表限制
+    # t_project.ID。若 project_scope_columns 意外为空，强制层会跳过该项目谓词，
+    # 本断言随即变红——这正是本条负向控制的目的。
+    assert "in (5001, 5002)" in normalized, secured.final_sql
 
 
 def test_resolved_policy_rejects_permanently_denied_table(directory):
     from yuxi.permissions.sql_security import PolicyViolation, SQLSecurityGuard
 
     resolved = resolve_query_policy(BusinessPrincipal(user_id=1001), directory)
-    with pytest.raises(PolicyViolation):
+    with pytest.raises(PolicyViolation) as exc:
         SQLSecurityGuard(resolved.policy).secure("SELECT PASSWORD FROM t_user")
+    # 必须钉住具体违规码：t_user 因永久拒绝表先被拦，不能靠其他分支（如 DENIED_COLUMN）
+    # 偶然变绿。首期两表的字段上限里没有永久拒绝字段，DENIED_COLUMN 路径
+    # 无法用现表集端到端触发。
+    assert exc.value.code == "DENIED_TABLE"

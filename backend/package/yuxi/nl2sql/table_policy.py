@@ -14,7 +14,7 @@ class TableBound:
     columns: frozenset[str]
     tenant_column: str | None
     project_column: str | None
-    status_predicate: str | None
+    status_column: str | None
 
 
 TABLE_UPPER_BOUNDS: dict[str, TableBound] = {
@@ -24,13 +24,13 @@ TABLE_UPPER_BOUNDS: dict[str, TableBound] = {
         ),
         tenant_column="TENANT_ID",
         project_column="ID",
-        status_predicate="OPERATER_STATUS > 0",
+        status_column="OPERATER_STATUS",
     ),
     "t_project_user": TableBound(
         columns=frozenset({"ID", "TENANT_ID", "PROJECT_ID", "STAFF_ID", "OPERATER_STATUS"}),
         tenant_column="TENANT_ID",
         project_column="PROJECT_ID",
-        status_predicate="OPERATER_STATUS > 0",
+        status_column="OPERATER_STATUS",
     ),
 }
 
@@ -53,8 +53,8 @@ PERMANENTLY_DENIED_COLUMNS: frozenset[str] = frozenset(
 
 
 def has_complete_row_rule(table: str) -> bool:
-    """租户列、项目列、状态规则齐全才可开放。"""
+    """租户列、项目列、状态列齐全才可开放。"""
     bound = TABLE_UPPER_BOUNDS.get(table)
     if bound is None:
         return False
-    return bool(bound.tenant_column and bound.project_column and bound.status_predicate)
+    return bool(bound.tenant_column and bound.project_column and bound.status_column)

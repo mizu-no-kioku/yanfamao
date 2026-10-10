@@ -1,4 +1,8 @@
-"""BusinessDirectory 的 MySQL 实现。会话以只读事务运行。
+"""BusinessDirectory 的 MySQL 实现。
+
+每次查询各自开一条新连接、用完即关；一次 resolve_query_policy 的多步读取
+来自不同时刻，不存在共享快照。解析内部的单事务一致性需 Plan 2 替换本接口，
+本层不得声称以只读事务运行。
 
 关键：角色基数走 tb_user_enterprise_role_tenant 的原始行，
 不 JOIN 角色—菜单表——否则一个多菜单角色会被放大成上百行。
@@ -122,6 +126,25 @@ class MySqlBusinessDirectory:
                     (tenant_id, *role_ids),
                 )
                 return frozenset(row[0] for row in cursor.fetchall() if row[0])
+        finally:
+            connection.close()
+
+    def find_menu_ids(self, role_ids: Sequence[int], tenant_id: int) -> frozenset[int]:
+        """与 find_menu_codes 同一 JOIN 与租户范围，取菜单 ID 供功能门判 ID。"""
+        if not role_ids:
+            return frozenset()
+        placeholders = ", ".join(["%s"] * len(role_ids))
+        connection = self._open()
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT DISTINCT m.ID FROM tb_enterprise_role_menu_tenant rm "
+                    "JOIN t_enterprise_menu m ON m.ID = rm.ENTERPRISE_MENU_ID "
+                    f"WHERE rm.TENANT_ID = %s AND rm.ENTERPRISE_ROLE_ID IN ({placeholders}) "
+                    "AND m.OPERATER_STATUS > 0",
+                    (tenant_id, *role_ids),
+                )
+                return frozenset(row[0] for row in cursor.fetchall() if row[0] is not None)
         finally:
             connection.close()
 

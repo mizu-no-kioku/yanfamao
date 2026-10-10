@@ -29,6 +29,9 @@ class FakeDirectory:
     def find_menu_codes(self, role_ids, tenant_id):
         return frozenset({"AI"})
 
+    def find_menu_ids(self, role_ids, tenant_id):
+        return frozenset({253})
+
     def find_authorized_project_ids(self, tenant_id, staff_id):
         return self.projects
 

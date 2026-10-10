@@ -83,3 +83,31 @@ def test_rejects_menu_ids_that_drift_from_the_agreed_gate():
     with pytest.raises(resource_policy.ResourcePolicyError) as exc:
         resource_policy.build_policy(payload)
     assert "功能门菜单 ID" in str(exc.value)
+
+
+def test_rejects_grant_that_drops_status_column():
+    """授权丢掉 OPERATER_STATUS 会让状态行规则静默消失，必须报错。"""
+    payload = _payload("AI_QA_USE", {"t_project": ["ID", "TENANT_ID", "PROJECT_NAME"]})
+    with pytest.raises(resource_policy.ResourcePolicyError) as exc:
+        resource_policy.build_policy(payload)
+    message = str(exc.value)
+    assert "缺少行权限必需列" in message and "OPERATER_STATUS" in message
+
+
+def test_rejects_grant_that_drops_tenant_column():
+    """授权丢掉 TENANT_ID 同样必须报错，而不是交给强制层兜底。"""
+    payload = _payload("AI_QA_USE", {"t_project": ["ID", "PROJECT_NAME", "OPERATER_STATUS"]})
+    with pytest.raises(resource_policy.ResourcePolicyError) as exc:
+        resource_policy.build_policy(payload)
+    message = str(exc.value)
+    assert "缺少行权限必需列" in message and "TENANT_ID" in message
+
+
+def test_shipped_policy_keeps_required_row_rule_columns():
+    """随包 YAML 必须仍带着租户列与状态列，否则状态行规则会消失。"""
+    assert resource_policy.RESOURCE_POLICY, "随包资源策略不应为空"
+    for resource_code, grant in resource_policy.RESOURCE_POLICY.items():
+        for table, columns in grant.columns.items():
+            bound = table_policy.TABLE_UPPER_BOUNDS[table]
+            assert bound.tenant_column in columns, f"{resource_code}.{table} 缺少 {bound.tenant_column}"
+            assert bound.status_column in columns, f"{resource_code}.{table} 缺少 {bound.status_column}"

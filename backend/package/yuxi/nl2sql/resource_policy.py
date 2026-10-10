@@ -57,6 +57,10 @@ def build_policy(payload: dict) -> tuple[dict[str, ResourceGrant], dict[str, tup
                 raise ResourcePolicyError(f"{resource_code}.{table} 含永久拒绝字段: {sorted(denied)}")
             if not requested <= bound.columns:
                 raise ResourcePolicyError(f"{resource_code}.{table} 超出代码上限: {sorted(requested - bound.columns)}")
+            required = {column for column in (bound.tenant_column, bound.status_column) if column is not None}
+            missing = required - requested
+            if missing:
+                raise ResourcePolicyError(f"{resource_code}.{table} 缺少行权限必需列: {sorted(missing)}")
             tables[table] = requested
         max_rows = int(spec.get("max_rows", 200))
         if max_rows > 200:
@@ -72,6 +76,10 @@ def build_policy(payload: dict) -> tuple[dict[str, ResourceGrant], dict[str, tup
 
 _PAYLOAD = yaml.safe_load(POLICY_PATH.read_text(encoding="utf-8"))
 RESOURCE_POLICY, MENU_TO_RESOURCES, AI_GATE_MENU_IDS = build_policy(_PAYLOAD)
+
+# 功能门菜单 CODE，取自 YAML menu_ids 的键，作为实现侧的对照集合；
+# 真正门禁按 ID（AI_GATE_MENU_IDS）判定，CODE 仅用于资源映射与配置一致性守卫。
+AI_GATE_MENU_CODES: frozenset[str] = frozenset(str(code) for code in (_PAYLOAD.get("menu_ids") or {}))
 
 
 def resolve_grants(resource_codes: Collection[str]) -> tuple[ResourceGrant, ...]:

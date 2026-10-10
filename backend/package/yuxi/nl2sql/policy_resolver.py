@@ -6,13 +6,9 @@ from dataclasses import dataclass
 from yuxi.nl2sql import errors
 from yuxi.nl2sql.directory import BusinessDirectory
 from yuxi.nl2sql.principal import BusinessPrincipal
-from yuxi.nl2sql.resource_policy import MENU_TO_RESOURCES, resolve_grants
+from yuxi.nl2sql.resource_policy import AI_GATE_MENU_IDS, MENU_TO_RESOURCES, resolve_grants
 from yuxi.nl2sql.table_policy import PERMANENTLY_DENIED_COLUMNS, PERMANENTLY_DENIED_TABLES, TABLE_UPPER_BOUNDS
 from yuxi.permissions.sql_security import QueryPolicy
-
-# 功能门菜单 CODE，与 resource_policy.yaml 的 menu_ids 对应；
-# 单元测试 test_gate_menu_codes_match_gate_menu_ids 守卫两边一致。
-_GATE_MENU_CODES = frozenset({"AI", "QA", "projectManage:projectList:ai"})
 
 
 @dataclass(frozen=True)
@@ -62,6 +58,7 @@ def resolve_function_gate(subject: BusinessSubject, directory: BusinessDirectory
 
     角色数量必须对 tb_user_enterprise_role_tenant 的原始关系行计数：
     对角色—菜单 JOIN 计数会把一个角色放大成上百个角色。
+    功能门按约定的菜单 ID（253/254/238）判定，不按 CODE——CODE 可被同码异 ID 的菜单冒充。
     """
     relations = directory.find_role_relation_ids(subject.user_id, subject.tenant_id)
     if not relations:
@@ -76,11 +73,11 @@ def resolve_function_gate(subject: BusinessSubject, directory: BusinessDirectory
     if not active_roles:
         raise errors.PolicyDenial(errors.ROLE_INACTIVE, "角色关系指向的角色不存在或已失效")
 
-    menu_codes = directory.find_menu_codes(active_roles, subject.tenant_id)
-    if not (menu_codes & _GATE_MENU_CODES):
+    menu_ids = directory.find_menu_ids(active_roles, subject.tenant_id)
+    if not (menu_ids & AI_GATE_MENU_IDS):
         raise errors.PolicyDenial(
             errors.FUNCTION_GATE_DENIED,
-            f"未命中 AI 功能菜单（{sorted(_GATE_MENU_CODES)}），当前可见菜单 {sorted(menu_codes)}",
+            f"未命中 AI 功能菜单 ID（{sorted(AI_GATE_MENU_IDS)}），当前可见菜单 ID {sorted(menu_ids)}",
         )
     return active_roles
 
