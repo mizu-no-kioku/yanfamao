@@ -445,13 +445,48 @@ def test_v2_scope_validation_rejects_union_with_any_disallowed_level():
 @pytest.mark.parametrize(
     ("container", "target", "expected"),
     [
-        pytest.param(_new_scope(["global"]), _new_scope(["department"], department_ids=[1]), True, id="global-covers-all"),
-        pytest.param(_new_scope(["department"], department_ids=[1]), _new_scope(["global"]), False, id="nothing-covers-global"),
-        pytest.param(_new_scope(["department"], department_ids=[1]), _new_scope(["department"], department_ids=[1]), True, id="same-department"),
-        pytest.param(_new_scope(["department"], department_ids=[1]), _new_scope(["department"], department_ids=[2]), False, id="other-department"),
-        pytest.param(_new_scope(["user"], user_uids=["u-1"]), _new_scope(["user"], user_uids=["u-2"]), False, id="other-user"),
-        pytest.param(_new_scope(["user"], user_uids=["u-1"]), _new_scope(["user"], user_uids=["u-1"]), True, id="same-user"),
-        pytest.param(_new_scope(["user"], user_uids=["u-1"]), _new_scope(["department"], department_ids=[1]), False, id="cross-level-is-not-derivable"),
+        pytest.param(
+            _new_scope(["global"]),
+            _new_scope(["department"], department_ids=[1]),
+            True,
+            id="global-covers-all",
+        ),
+        pytest.param(
+            _new_scope(["department"], department_ids=[1]),
+            _new_scope(["global"]),
+            False,
+            id="nothing-covers-global",
+        ),
+        pytest.param(
+            _new_scope(["department"], department_ids=[1]),
+            _new_scope(["department"], department_ids=[1]),
+            True,
+            id="same-department",
+        ),
+        pytest.param(
+            _new_scope(["department"], department_ids=[1]),
+            _new_scope(["department"], department_ids=[2]),
+            False,
+            id="other-department",
+        ),
+        pytest.param(
+            _new_scope(["user"], user_uids=["u-1"]),
+            _new_scope(["user"], user_uids=["u-2"]),
+            False,
+            id="other-user",
+        ),
+        pytest.param(
+            _new_scope(["user"], user_uids=["u-1"]),
+            _new_scope(["user"], user_uids=["u-1"]),
+            True,
+            id="same-user",
+        ),
+        pytest.param(
+            _new_scope(["user"], user_uids=["u-1"]),
+            _new_scope(["department"], department_ids=[1]),
+            False,
+            id="cross-level-is-not-derivable",
+        ),
         pytest.param(
             _new_scope(["department", "user"], department_ids=[1], user_uids=["u-7"]),
             _new_scope(["user"], user_uids=["u-7"]),

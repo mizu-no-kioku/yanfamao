@@ -130,9 +130,9 @@ Owner：backend/server/utils/knowledge_response.py
 上报现场的实测（真实 HTTP + 真实数据，用管理员凭证临时创建一个研发部门普通账号，查完即删）：
 
 - `GET /api/knowledge/databases/accessible` 对该账号返回（只摘卡片用的字段）
-  `{"name": "研发知识库", "row_count": 5, "stats.file_count": 5, "created_at": "2026-09-24T06:05:32.705762Z", "can_manage": false, "share_config.read_scope.access_level": "department"}`
+  `{"name": "研发知识库", "row_count": 5, "stats.file_count": 5, "created_at": "2026-09-24T06:05:32.705762Z", "can_manage": false, "share_config.read_scope.access_levels": ["department"]}`
   与
-  `{"name": "通用知识库", "row_count": 9, "stats.file_count": 9, "created_at": "2026-09-21T09:01:25.999549Z", "can_manage": false, "share_config.read_scope.access_level": "global"}`
+  `{"name": "通用知识库", "row_count": 9, "stats.file_count": 9, "created_at": "2026-09-21T09:01:25.999549Z", "can_manage": false, "share_config.read_scope.access_levels": ["global"]}`
   ——正是截图中显示「0 文件」的两个库。两者的卡片标签现在来自真实的 `read_scope`（部门与全局），
   不再是拼出来的「只读用户(0)」；`can_manage` 均为 `false`，即普通用户在这两个共享库上最多只读。
 - 临时账号已删除（`DELETE /api/auth/users/{id}` → 200）。凭证经环境变量注入，不入库、不入文档。

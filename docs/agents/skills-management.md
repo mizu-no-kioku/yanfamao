@@ -130,7 +130,7 @@ Agent 配置可以用 `preload_skills` 指定少量需要从首轮就可用的 S
 
 ## 权限和选择
 
-共享 Skill 使用 `source_type`、`share_config` 和 `enabled` 表达来源、范围和启用状态。范围使用 version 2 的 `read_scope`、`manage_scope`，可以是全局、部门或指定用户；管理范围必须包含在读取范围内。
+共享 Skill 使用 `source_type`、`share_config` 和 `enabled` 表达来源、范围和启用状态。范围使用 version 2 的 `read_scope`、`manage_scope`，`access_levels` 是档位**集合**（全局／部门／指定用户），判定取**并集**——可以同时含部门与指定人，`global` 必须独占；管理范围必须包含在读取范围内（逐主体：每个部门 id、每个 uid 都要被读取范围覆盖）。
 
 | 用户 | 可见和使用 | 可管理 |
 | --- | --- | --- |

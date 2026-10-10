@@ -109,7 +109,7 @@ async def test_skill_artifact_rechecks_authorization_after_share_revoke(
                 "share_config": {
                     "version": 2,
                     "read_scope": {
-                        "access_level": "user",
+                        "access_levels": ["user"],
                         "department_ids": [],
                         "user_uids": [admin_uid],
                     },

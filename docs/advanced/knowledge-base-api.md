@@ -6,7 +6,7 @@
 
 接口接受任意已登录且绑定部门的用户，最终授权按知识库范围判定；角色上限只约束非创建者。文档管理接口要求知识库管理权限，读取和外部查询接口要求知识库读取权限。
 
-知识库按 `scope` 分个人库（`personal`）与共享库（`shared`，默认）。`share_config` 使用 version 2，分别保存 `read_scope` 和 `manage_scope`；范围的 `access_level` 可以是 `global`、`department` 或 `user`，管理范围必须包含在读取范围内。个人库只承认 `user` 级的 `read_scope`；共享库新建时默认 `department`（创建者所在部门，无部门时退化为仅创建者 + 超管）。
+知识库按 `scope` 分个人库（`personal`）与共享库（`shared`，默认）。`share_config` 使用 version 2，分别保存 `read_scope` 和 `manage_scope`；范围的 `access_levels` 是一个**档位集合**（`global`／`department`／`user`），判定取**并集**——命中任一档即生效，`global` 必须独占。`read_scope` 与 `manage_scope` 都可以同时含 `department` 与 `user`（例如「本部门 + 额外指定的几个人」）；管理范围必须包含在读取范围内，且是**逐主体**的——manage 的每个部门 id、每个 uid 都要被 read 的对应名单覆盖（或 read 含 `global`），只落在同一档并不够。写入时普通用户只允许 `user` 档，提交部门档或全局档返回 400（不静默降级）；读取路径仍接受迁移前的单档形状（`access_level`）并归一到单元素数组。个人库只承认 `user` 级的 `read_scope`；共享库新建时默认 `department`（创建者所在部门，无部门时退化为仅创建者 + 超管）。
 
 | 用户 | 读取 | 管理 |
 | --- | --- | --- |

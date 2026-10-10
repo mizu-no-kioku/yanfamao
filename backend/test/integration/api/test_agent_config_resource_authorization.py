@@ -110,7 +110,7 @@ async def test_admin_settings_are_readable_but_not_writable_by_delegated_user(
     slug = f"pytest-config-auth-{uuid.uuid4().hex[:10]}"
     uid = str(standard_user["user"]["uid"])
     headers = standard_user["headers"]
-    scope = {"access_level": "user", "department_ids": [], "user_uids": [uid]}
+    scope = {"access_levels": ["user"], "department_ids": [], "user_uids": [uid]}
     settings = {
         "tool_approval_mode": "always_trust",
         "summary_threshold": 37,
@@ -236,12 +236,12 @@ async def test_delegated_manager_resource_patch_preserves_hidden_config_and_reje
                 "share_config": {
                     "version": 2,
                     "read_scope": {
-                        "access_level": "user",
+                        "access_levels": ["user"],
                         "department_ids": [],
                         "user_uids": [manager_uid],
                     },
                     "manage_scope": {
-                        "access_level": "user",
+                        "access_levels": ["user"],
                         "department_ids": [],
                         "user_uids": [manager_uid],
                     },
@@ -371,7 +371,7 @@ def _user_share_config(*uids: str) -> str:
     return json.dumps(
         {
             "version": 2,
-            "read_scope": {"access_level": "user", "department_ids": [], "user_uids": list(uids)},
+            "read_scope": {"access_levels": ["user"], "department_ids": [], "user_uids": list(uids)},
             "manage_scope": None,
         }
     )

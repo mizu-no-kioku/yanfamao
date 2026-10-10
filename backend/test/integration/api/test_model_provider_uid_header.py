@@ -86,7 +86,10 @@ async def test_provider_uid_header_http_round_trip_and_rejections(monkeypatch):
             assert "YUXI_UID_SIGNATURE_SECRET" in missing_secret.json()["detail"]
 
             monkeypatch.setenv("YUXI_UID_SIGNATURE_SECRET", "integration-test-signing-secret")
-            invalid_type = await client.post(path, json={**provider, "provider_id": f"pytest-invalid-{uid}", "include_user_uid": "true"})
+            invalid_type = await client.post(
+                path,
+                json={**provider, "provider_id": f"pytest-invalid-{uid}", "include_user_uid": "true"},
+            )
             assert invalid_type.status_code == 422
 
             gemini = await client.post(
