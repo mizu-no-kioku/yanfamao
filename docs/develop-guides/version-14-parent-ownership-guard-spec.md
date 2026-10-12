@@ -30,6 +30,10 @@
 
 **反查（父行 `kb_id` 变化时，哪些子行会失配）**——这就是父侧触发器要覆盖的集合：
 
+> 反查表只覆盖**"子行有自己的 `kb_id`"**的情形：这类子行的失配判据是
+> `child.kb_id IS DISTINCT FROM NEW.kb_id`。**没有 `kb_id` 列的子行不在本表机械范围内**，
+> 见下面"两条必须单独处理"的第 1 条。
+
 | 父行 | 受影响的子行（列） |
 |---|---|
 | `knowledge_files` | `knowledge_files.parent_id`；`knowledge_chunks.file_id`；`knowledge_graph_entity_mentions.file_id`；`knowledge_graph_triple_mentions.file_id` |
@@ -44,22 +48,38 @@
 1. **`evaluation_runs.kb_id` → `evaluation_run_items`**：这条**不在** `TENANT_REFERENCE_RULES` 里
    （run_items 的规则只写了 `dataset_item_id`）。但 run_items **没有 `kb_id` 列**，它们的归属**由
    run 定义**——所以改 `evaluation_runs.kb_id` 会**隐式**把它们一起搬走。这正是禁止的
-   **"静默级联迁移归属"**。该链的父侧检查不能去比 run_items 的"行自身 kb"（那是个会跟着变的
-   子查询，恒等），必须落在它的**另一个引用**上：某个 run_item 指向的 `dataset_item` 的 kb
-   ≠ `NEW.kb_id` 时拒绝。
+   **"静默级联迁移归属"**。
+
+   **这里必须分成两项互相独立、不能互相替代的约束**（先前版本把它写成"只比题目所在库"，
+   那是错的——`dataset_item_id` **可以为空**，只校验非空题目会放过所有题目引用为空的结果行，
+   让它们随 Run 隐式迁移）：
+
+   - **① Run 改库：只要存在结果行就拒绝。** 判据是 `EXISTS (run_items WHERE run_id = OLD.run_id)`，
+     **不看** `dataset_item_id` 是否为空。这是"已有子行禁止隐式搬迁"的独立约束。
+   - **② 结果行的题目引用：非空时题目与 Run 同库，为空时合法。** 这一项留在**子侧**
+     （`evaluation_run_items` 的 `BEFORE INSERT OR UPDATE`），是原有的引用一致性规则。
+
+   ①通过**不**意味着②成立，②通过也**不**意味着①成立：前者管"归属被搬走"，后者管"引用跨库"。
 2. **`knowledge_bases.kb_id`**：它是根，子表以 `ON DELETE CASCADE` 引用它。改它属于改**键**，
    外键（NO ACTION）本身就会挡住——不需要新增防护，但要记名：这条链的保护来自外键而非本机制。
 
 ## 2. 更新路径盘点（哪些路径能改到归属字段）
 
-| 路径 | 能否改 `kb_id` | 依据 |
+| 路径 | 能否改 `kb_id` | 依据（已逐个核对） |
 |---|---|---|
 | `KnowledgeFileRepository.update_fields` / `update_fields_if_status` | **能** | `_writable_fields`（:174-175）含 `kb_id`；`_sanitize_data`（:204-208）按白名单过滤后 `update_fields` 逐个 `setattr`（:749-750） |
-| `KnowledgeChunkRepository` 的 upsert 路径 | **能** | `_writable_fields`（:16-19）含 `kb_id`；upsert 对已存在行执行更新 |
+| `KnowledgeChunkRepository` 的 upsert 路径 | **能** | `_writable_fields`（:16-19）含 `kb_id`；upsert 对已存在行 `setattr`（:122-123） |
+| `EvaluationRepository` 的三处更新（dataset / run / run_item） | **能** | `for key, value in data.items(): setattr(record, key, value)`（:63-68、:153-157、:209-216）——**没有白名单**，调用方给什么键就写什么列 |
+| `KnowledgeGraphRepository.upsert_chunk_graph` | **不能** | `on_conflict_do_update` 的 `set_` 只列 `name`/`attributes`/`updated_at`（entity，:265-269）与 `content`/`relation_type`/`updated_at`（triple，:297-301），**不含 `kb_id`**；mention 走 `on_conflict_do_nothing`（:285）→ 已存在行的归属改不动 |
 | 裸 SQL / 迁移脚本 / 运维脚本 | **能**（白名单管不到） | 这是"删白名单"方案不成立的原因 |
-| 图谱 / 评估域各 repository 的更新路径 | **未核对** | 全仓只有上面两处 `_writable_fields` 定义，这两域的更新走的是别的机制，本轮**没有**逐个追完 |
 
-**未核对就是未核对**：上面第 4 行是缺口，实施父侧防护前必须补完（否则会漏掉一条更新路径）。
+**这条盘点的措辞边界**（评审校正）：以上是**可达的写入能力**，**不是**"已证实的业务迁移需求"
+——我没有追出哪个调用方真的把 `kb_id` 放进 `data`。
+
+**仍要注意的两点**：
+- 评估域那三处**没有白名单**，比 file/chunk 那两处更宽；父侧防护对它是**唯一的**数据库边界。
+- 图谱写路径目前改不动 `kb_id`，但这依赖 `set_` 清单**保持**不含 `kb_id`——这是一条**约定**，
+  不是机制。父侧触发器把这条约定变成硬约束。
 
 ## 3. 锁顺序设计（门槛的核心，也是"双方都有触发器"不够用的原因）
 
@@ -80,21 +100,37 @@
    检查既有子行，任一失配即 `RAISE EXCEPTION`（`ERRCODE = '23514'`）。此刻父行已由自身的
    `UPDATE` 持有 `FOR NO KEY UPDATE` 锁，而任何并发的子行写入都因第 1 条阻塞在 `FOR SHARE` 上
    ——检查看到的是一个**冻结**的子集合，不会"查完又冒出一行"。
-3. **锁顺序只有一种：父行本身。** 子侧拿父行的 `FOR SHARE`；父侧由 `UPDATE` 自身拿本行锁，
-   对子行**只做不加锁的读**。不存在"父侧反过来锁子行"的路径，所以**死锁面是被结构消除的**，
-   而不是靠"约定按某个顺序加锁"——后者在跨表链（如 files→chunks→mentions）上很容易失守。
+3. **减少父子反向加锁，并给多父引用定一个明确、稳定的锁顺序。** 父侧不锁子行，所以"父锁子"
+   这条方向不存在；但这**不等于**死锁面被消除——**子侧一行可以锁多个父行**
+   （`knowledge_graph_entity_mentions` 要锁 entity + file + chunk 三个；
+   `knowledge_graph_triple_mentions` 要锁 triple + file + chunk；
+   `knowledge_graph_triples` 要锁两个 entity），两个并发事务若以不同顺序取这些锁就会死锁。
+   因此生成函数里父行 `FOR SHARE` 的先后**按确定的全局顺序排列**（按父表名、父表键、
+   本表列排序），而不是按规则表的书写顺序。
+   **锁顺序是否真的稳定、是否真的不死锁，必须由真实 PostgreSQL 并发用例验证，不能由本文断言。**
 4. 父行不存在时保持现状：`FOR SHARE` 查不到行 → 交给外键报错，避免用"引用不一致"盖掉
    "父行不存在"这个更准确的原因。
 
 ### 必须由真实 PostgreSQL 用例证明的部分
 
-锁模式与检查时机**不能靠推理定稿**：`FOR SHARE` 与 `FOR NO KEY UPDATE` 的冲突关系、
-`READ COMMITTED` 下并发事务各自的可见性、以及自引用链（`knowledge_files.parent_id`）上
-触发器对同表的递归可见性，都要在隔离实例上跑出来。**在这些用例通过之前，本设计只是设计。**
+锁模式与检查时机**不能靠推理定稿**。至少这几件事本文不作结论：
+
+- `FOR SHARE` 与 `FOR NO KEY UPDATE` 的冲突关系（本文的推理是设计的依据，但要跑出来才算数）；
+- **父侧"只读子行"能否看见并发事务刚提交的子行**——这取决于隔离级别与触发器里查询的实际时机，
+  **不能凭锁冲突推定安全**。相应地，验收必须**读事务最终提交的数据**来判断是否失配，
+  而不是只看"观察到阻塞"或"抛了异常"；
+- 多父引用的锁顺序在并发下是否真的不死锁；
+- 自引用链（`knowledge_files.parent_id`）上触发器对同表的可见性；
+- **多行 `UPDATE`**（一条语句改多行、每行各触发一次）与事务中其它操作叠加时的行为。
+
+**在这些用例通过之前，本设计只是设计。**
 
 ## 4. 明确契约（含需要裁决的一处行为）
 
 - **有既有子行时修改父行归属**：会被父侧触发器**明确拒绝**（`23514`），不做级联改写。
+  对**没有 `kb_id` 列的子行**（只有 `evaluation_run_items`）这条尤其要说清：判据是
+  **"存在结果行"**，与结果行的 `dataset_item_id` 是否为空**无关**——空题目引用的结果行
+  同样会被隐式搬走，所以同样必须拒绝。
 - **子行插入/改引用 × 父行改归属并发**：两种先后顺序都不得提交失配数据（靠第 3 节的锁）。
 - **`evaluation_run_items.dataset_item_id` 置空**与 `ON DELETE SET NULL` 触发的更新**必须仍然合法**
   ——子侧规则里"引用为 NULL 时跳过"这条不能被新增的锁改动破坏。
@@ -106,10 +142,19 @@
 ## 5. 验收清单（第 2 步必须覆盖，逐条要能红）
 
 1. 有既有子行时修改父行归属 → 失配必须被拒绝。
-2. 子行插入 × 父行归属修改**并发**，两种先后顺序都不能提交失配数据。
-3. 子行**修改父引用** × 父行归属修改并发。
-4. `evaluation_run_items.dataset_item_id` 置空及 `ON DELETE SET NULL` 仍合法。
-5. 无子行且满足其他约束的归属修改 → 行为符合第 4 节的契约。
+2. **Run 改库 × 已有结果行**：拒绝；且**要单独覆盖 `dataset_item_id` 为空的结果行**——
+   只测非空题目不够（这正是先前设计的漏洞）。
+3. 结果行的题目引用（**子侧**规则）：非空时跨库被拒，**为空时合法**。
+4. 子行插入 × 父行归属修改**并发**：两种先后顺序都不能提交失配数据。
+5. 子行**修改父引用** × 父行归属修改并发。
+6. **多父引用的锁顺序**：两个并发事务以不同顺序引用同一组父行时，不得死锁；
+   或在确实会死锁时如实记录并重新设计（不接受"偶尔死锁"）。
+7. `evaluation_run_items.dataset_item_id` 置空及 `ON DELETE SET NULL` 触发的更新仍合法。
+8. 无子行且满足其他约束的归属修改 → 行为符合第 4 节的契约。
+
+**验收方式（对第 4–6 条尤其重要）**：必须**读事务最终提交的数据**来判定"是否提交了失配"，
+不能只看"观察到阻塞"或"抛了异常"——父侧只读子行能否看见并发刚提交的子行，取决于隔离级别与
+触发器查询的实际时机，用阻塞/异常反推安全性是不成立的。
 
 ——以上五条 + 第 2 节的更新路径补完，构成"引用一致性并发门槛"；全部通过前不接线版本 14，
 开发库保持版本 13。
