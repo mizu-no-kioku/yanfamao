@@ -32,9 +32,9 @@ from __future__ import annotations
 
 import os
 import shutil
-import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -45,6 +45,7 @@ from yuxi.storage_migrations import v071_skills as _v071_skills
 from yuxi.storage_migrations import v072_runtime_identity as _runtime_identity
 from yuxi.storage_migrations.v072_runtime_identity import RUNTIME_GID, RUNTIME_UID
 
+from _round_process import CapturedProcess, spawn_captured
 from _tenant_schema_test_db import assert_target_is_the_test_instance, tenant_schema_url
 
 # 迁移会写到的**全部**文件根。逐项显式覆盖，不靠"继承默认值"——漏一项就是往开发目录写。
@@ -83,13 +84,25 @@ class MigrationRound:
     child_cwd: Path
     env: dict[str, str]
     development_markers_before: dict[str, tuple[bool, int, int]] = field(default_factory=dict)
-    completed: subprocess.CompletedProcess[str] | None = None
+    captured: CapturedProcess | None = None
+    timed_out: bool = False
 
     @property
     def log_path(self) -> Path:
         return self.root / "migration.log"
 
+    @property
+    def returncode(self) -> int | None:
+        return None if self.captured is None else self.captured.process.returncode
+
+    def succeeded(self) -> bool:
+        return self.returncode == 0
+
     def log_tail(self) -> str:
+        if self.captured is not None:
+            tail = self.captured.log_tail(_LOG_TAIL_LINES)
+            if tail:
+                return tail
         try:
             content = self.log_path.read_text(encoding="utf-8")
         except OSError as exc:
@@ -140,10 +153,21 @@ def development_marker_paths() -> dict[str, Path]:
 
 
 def seed_runtime_identity_marker(user_data_root: Path) -> bool:
-    """见模块 docstring「运行身份迁移标记」。返回是否写入了标记。"""
+    """见模块 docstring「运行身份迁移标记」。返回是否写入了标记。
 
-    if os.geteuid() != RUNTIME_UID:
+    标记的内容是 `UID:GID`，所以**两个都要真的成立**才写：只核对 euid 的话，egid 不同的环境里
+    这个标记就是一句不成立的话（而它会让实际的身份迁移被跳过）。写完再核对一次临时根的归属，
+    把"标记说的是真的"从假设变成断言。
+    """
+
+    if os.geteuid() != RUNTIME_UID or os.getegid() != RUNTIME_GID:
         return False
+    stat = user_data_root.stat()
+    if (stat.st_uid, stat.st_gid) != (RUNTIME_UID, RUNTIME_GID):
+        raise RuntimeError(
+            f"临时根 {user_data_root} 的归属是 {stat.st_uid}:{stat.st_gid}，不是 "
+            f"{RUNTIME_UID}:{RUNTIME_GID}——身份迁移标记会是一句假话，拒绝预置。"
+        )
     (user_data_root / RUNTIME_IDENTITY_MARKER).write_text(RUNTIME_IDENTITY_CONTENT, encoding="ascii")
     return True
 
@@ -179,44 +203,50 @@ def start_round() -> MigrationRound:
     )
 
 
-def run_full_migration(round_: MigrationRound, *, timeout_seconds: float = 300.0) -> None:
-    """跑**完整迁移入口**（与 production 的 storage-migrator 同一个模块）。"""
+def run_full_migration(
+    round_: MigrationRound,
+    *,
+    timeout_seconds: float = 300.0,
+    command: list[str] | None = None,
+) -> None:
+    """跑**完整迁移入口**（与 production 的 storage-migrator 同一个模块）。
 
-    command = [sys.executable, "-m", "yuxi.storage_migration"]
-    completed = subprocess.run(
+    日志由读线程**持续**落盘，所以超时那一轮也有日志可看（旧写法在 `subprocess.run` 抛超时后
+    才写日志，超时那一轮等于没有日志）。
+
+    `command` 只给脚手架自检用例注入（验证超时也会留下日志），生产路径永远用迁移入口。
+    """
+
+    command = command or [sys.executable, "-m", "yuxi.storage_migration"]
+    round_.log_path.write_text(f"$ {' '.join(command)}\n[cwd] {round_.child_cwd}\n", encoding="utf-8")
+    captured = spawn_captured(
         command,
-        cwd=str(round_.child_cwd),
+        cwd=round_.child_cwd,
         env=round_.env,
-        capture_output=True,
-        text=True,
-        timeout=timeout_seconds,
+        log_path=round_.log_path,
     )
-    round_.completed = completed
-    round_.log_path.write_text(
-        "\n".join(
-            [
-                f"$ {' '.join(command)}",
-                f"[cwd] {round_.child_cwd}",
-                f"[exit] {completed.returncode}",
-                "--- stdout ---",
-                completed.stdout,
-                "--- stderr ---",
-                completed.stderr,
-                "",
-            ]
-        ),
-        encoding="utf-8",
-    )
+    round_.captured = captured
+    deadline = time.monotonic() + timeout_seconds
+    finished = captured.wait_until(lambda _lines: captured.process.poll() is not None, deadline=deadline)
+    if not finished:
+        round_.timed_out = True
+    captured.reap()
 
 
-def finish_round(round_: MigrationRound) -> None:
-    """成功清理本轮资源；失败保留日志与临时产物，并把路径打出来。"""
+def must_keep_artifacts(round_: MigrationRound) -> bool:
+    """超时、没起起来、或非 0 退出 → 一定保留产物。"""
 
-    succeeded = round_.completed is not None and round_.completed.returncode == 0
-    if succeeded:
+    return round_.captured is None or round_.timed_out or round_.returncode != 0
+
+
+def finish_round(round_: MigrationRound, *, keep_artifacts: bool) -> None:
+    """`keep_artifacts` 为真时保留日志与临时产物，并把路径打出来。"""
+
+    if not keep_artifacts:
         shutil.rmtree(round_.root, ignore_errors=True)
         return
-    print(f"[part2] 本轮迁移未成功，保留临时根：{round_.root}")
+    print(f"[part2] 本轮迁移产物保留（returncode={round_.returncode}，timed_out={round_.timed_out}）")
+    print(f"[part2] 临时根：{round_.root}")
     print(round_.log_tail())
 
 

@@ -47,19 +47,30 @@ docker compose exec -T api uv run --no-sync pytest test/integration/storage_migr
 |---|---|
 | worker 在自己日志里报出 `worker_id` | `test_the_worker_announces_its_own_identity_in_its_log` |
 | 健康键的值 = 本轮子进程的 `worker_id` | `test_the_health_records_belong_to_the_worker_we_started` |
-| worker 也没写到临时根之外（cwd 诱饵为空） | `test_the_worker_does_not_write_outside_the_round_root` |
-| 缺配置/指到开发 Redis 一律硬失败 | `test_the_test_redis_is_required_and_must_not_be_the_development_one` |
+| worker 也没写到临时根之外（cwd 诱饵为空、沙箱端点改道） | `test_the_worker_does_not_write_outside_the_round_root` |
 | 同一时刻只允许一个测试 worker（全局健康键） | `test_the_round_mutex_refuses_a_second_worker` |
 
+**第三组：脚手架自身**（`test_round_scaffolding.py`，不需要轮次，也不改测试实例）
+
+守卫是否**接线**（曾经只在负向测试里被调用，真实启动路径根本没接线，于是"负向测试通过"毫无意义）、
+报错不泄漏凭证、租约原子释放与续期、组长先退出/后代忽略 TERM 时的整组回收、日志在超时前就已落盘、
+以及"断言失败也要保留产物"的判定。
+
 失败时保留本轮临时根与日志，并在输出里打印路径与日志尾部；成功则整根删除。
+**保留与否看 pytest 的判定结果**，不只看子进程退出码——退出码 0 只说明"跑完了"。
 
 ## 已知限制（不要当成已覆盖）
 
 - **"开发目录未被写入"的锚点只有两个标记文件**，不是整棵目录树：`/app/user-data` 与
   `/app/runtime/*` 被运行中的 api/worker 持续写入，整树对比必然抖动。未识别的**第六个根**
   由"诱饵 cwd 必须为空"这条来兜（相对路径默认值会落在那里）。
-- 运行身份迁移（`.v072-runtime-identity`）是**预置**的，见 `_migration_round.py` 的 docstring：
-  api 容器以 `1000:1000` 运行，而那一步要求 root。预置是如实陈述，不是绕过。
+- **隔离边界只说被显式指定的那些**：四个连接、五个文件根、导入路径，以及被改道到
+  `http://127.0.0.1:1` 的沙箱 provisioner（真走到沙箱会立刻失败，不会打到开发 provisioner）。
+  Neo4j / Milvus / MinIO **没有**隔离——本轮不投递任何 job，因此不作那些方面的声明。
+- 这一步应称为**「带已满足身份前置条件的完整入口验收」**，不是身份迁移本身的证据：运行身份迁移
+  （`.v072-runtime-identity`）在 api 容器里是**预置**的（该容器以 `1000:1000` 运行，而迁移步骤要求
+  root）。预置是如实陈述的条件：标记内容 `UID:GID` 的**两个值都被核对**，且临时根的归属被断言过。
+  身份迁移本身需要在可控的 root 环境里另行验收。
 - **迁移轮次断言"库是空的"，所以每跑一轮都要先重建 `postgres-test`**；第二轮（worker）本身不要求
   空库，但复用同一套 session 前置，因此整目录一起跑时前置仍然是"全新库"。
 - Step D（启动补发 / 周期补发两个场景）**未做**：本轮只证明"能起、能归属、能回收"，

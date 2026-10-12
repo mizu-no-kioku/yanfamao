@@ -8,7 +8,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -18,21 +17,7 @@ from _migration_round import ROOT_ENV_VARS
 from _worker_round import WorkerRound, WorkerRoundMutex
 
 
-@pytest.fixture(scope="module")
-def worker_round(migrated_test_database) -> Iterator[WorkerRound]:
-    """拿互斥、起 worker、等它报出 worker_id；结束时整组回收。"""
-
-    with WorkerRoundMutex(worker_round_module.redis_test_url()):
-        round_ = worker_round_module.start_worker_round()
-        try:
-            yield round_
-        finally:
-            worker_round_module.stop_worker_round(round_)
-
-
-def test_the_worker_announces_its_own_identity_in_its_log(
-    worker_round: WorkerRound, migrated_test_database
-) -> None:
+def test_the_worker_announces_its_own_identity_in_its_log(worker_round: WorkerRound) -> None:
     """没有这条启动行就无法把健康记录归属到某个进程——这一步同时是 C 的 RED 门。"""
 
     assert worker_round.worker_id is not None, (
@@ -50,35 +35,25 @@ def test_the_health_records_belong_to_the_worker_we_started(worker_round: Worker
 
     for key, value in values.items():
         assert value is not None, f"健康键 {key} 不存在——worker 没有发布收敛能力"
-        assert value.decode() == worker_round.worker_id, (
-            f"健康键 {key} 的值是 {value!r}，不是本轮 worker 的 {worker_round.worker_id}——"
-            "它来自别的进程"
+        assert value == worker_round.worker_id, (
+            f"健康键 {key} 的值是 {value!r}，不是本轮 worker 的 {worker_round.worker_id}——它来自别的进程"
         )
 
 
-def test_the_worker_does_not_write_outside_the_round_root(
-    worker_round: WorkerRound, migrated_test_database
-) -> None:
-    """worker 与迁移器一样：五个根显式改道，诱饵 cwd 必须保持为空。"""
+def test_the_worker_does_not_write_outside_the_round_root(worker_round: WorkerRound) -> None:
+    """worker 与迁移器一样：五个根显式改道，诱饵 cwd 必须保持为空。
+
+    只声明**文件根**：沙箱端点被指向拒绝外联的测试端点，但 Neo4j / Milvus / MinIO 未隔离，
+    因此这条不作那些方面的声明（本轮也不投递任何 job）。
+    """
 
     leftovers = sorted(path.name for path in worker_round.child_cwd.iterdir())
     assert leftovers == [], f"worker 在 cwd 里留下了内容，说明还有文件根没被隔离：{leftovers}"
     for name in ROOT_ENV_VARS:
         assert Path(worker_round.env[name]).is_relative_to(worker_round.root)
-
-
-def test_the_test_redis_is_required_and_must_not_be_the_development_one(monkeypatch) -> None:
-    """配置缺失或指到开发 Redis 一律**硬失败**：skip 会让"忘了配"看起来像"跑过了"。"""
-
-    monkeypatch.delenv(worker_round_module.REDIS_TEST_URL_ENV, raising=False)
-    with pytest.raises(RuntimeError, match="需要 REDIS_TEST_URL"):
-        worker_round_module.assert_redis_is_not_the_development_instance()
-
-    shared = "redis://shared-host:6379/0"
-    monkeypatch.setenv(worker_round_module.REDIS_TEST_URL_ENV, shared)
-    monkeypatch.setenv(worker_round_module.DEVELOPMENT_REDIS_URL_ENV, shared)
-    with pytest.raises(RuntimeError, match="指向同一个目标"):
-        worker_round_module.assert_redis_is_not_the_development_instance()
+    assert worker_round.env["SANDBOX_PROVISIONER_URL"] == worker_round_module.SANDBOX_ISOLATION_OVERRIDES[
+        "SANDBOX_PROVISIONER_URL"
+    ], "沙箱端点没有改道到拒绝外联的测试端点"
 
 
 def test_the_round_mutex_refuses_a_second_worker(worker_round: WorkerRound) -> None:

@@ -36,9 +36,10 @@ def test_the_child_environment_overrides_every_file_root(migration_round: Migrat
 
 
 def test_the_full_migration_exits_zero_and_keeps_its_log_in_the_round_root(migration_round: MigrationRound) -> None:
-    assert migration_round.completed is not None, "迁移子进程没有跑起来"
-    assert migration_round.completed.returncode == 0, (
-        f"迁移子进程退出 {migration_round.completed.returncode}\n{migration_round.log_tail()}"
+    assert migration_round.captured is not None, "迁移子进程没有跑起来"
+    assert migration_round.returncode == 0, (
+        f"迁移子进程退出 {migration_round.returncode}（超时={migration_round.timed_out}）\n"
+        f"{migration_round.log_tail()}"
     )
     assert migration_round.log_path.is_file(), "迁移日志没有落在本轮临时根里"
 

@@ -4,8 +4,11 @@
 直接返回，但显式覆盖能保证本目录**永远**不去 ping 真实 API——这里的验收对象是迁移子进程、
 worker 子进程与独立测试实例，与运行中的服务无关。
 
-`migrated_test_database` 是**整个目录的前置**：两轮（Step B 的迁移、Step C 的 worker）都要求
-独立实例记着 `business=13 / knowledge=2`，所以它放在这里，session 级只跑一次。
+`migrated_test_database` 与 `worker_round` 是本目录两轮的前置与主体，都放在这里。
+
+**产物保留的依据是 pytest 的判定结果，不是子进程的退出码**：退出码为 0 只说明"迁移/worker 跑完了"，
+版本记录、RLS、健康归属、目录断言任何一条失败时，日志与临时产物同样必须留下。所以这里用
+`pytest_runtest_makereport` 记录已判定的失败，夹具在 teardown 时一并参考。
 """
 
 from __future__ import annotations
@@ -16,7 +19,34 @@ import anyio
 import pytest
 
 import _migration_round as round_module
+import _worker_round as worker_round_module
 from _migration_round import MigrationRound
+from _worker_round import WorkerRound, WorkerRoundMutex
+
+# 本次会话里已判定失败的用例。夹具 teardown 时看它，决定是清理还是保留产物。
+# 用模块级可变对象而不是夹具：hook 拿不到夹具，而一个 conftest 每个会话只有一个实例。
+_FAILED_TESTS: list[str] = []
+
+
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_makereport(item, call):
+    report = yield
+    if report.failed:
+        _FAILED_TESTS.append(report.nodeid)
+    return report
+
+
+def keep_artifacts(*, round_failed: bool) -> bool:
+    """轮次本身不成功，或任一相关用例已失败，都保留产物。"""
+
+    return round_failed or bool(_FAILED_TESTS)
+
+
+@pytest.fixture()
+def artifact_retention() -> tuple[list[str], object]:
+    """把"已判定失败"的登记簿与判定函数交给脚手架自检用例驱动。"""
+
+    return _FAILED_TESTS, keep_artifacts
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -39,7 +69,6 @@ def migrated_test_database() -> Iterator[MigrationRound]:
     """在独立测试实例上从**空库**跑一遍完整迁移，产出 `business=13 / knowledge=2`。
 
     前置是全新库（重建 `postgres-test`，tmpfs 重建即空）；不是全新库就直接失败，不做清残留。
-    成功清理本轮临时根，失败保留日志与临时产物。
     """
 
     round_ = round_module.start_round()
@@ -48,4 +77,25 @@ def migrated_test_database() -> Iterator[MigrationRound]:
         round_module.run_full_migration(round_)
         yield round_
     finally:
-        round_module.finish_round(round_)
+        round_module.finish_round(
+            round_,
+            keep_artifacts=keep_artifacts(round_failed=round_module.must_keep_artifacts(round_)),
+        )
+
+
+@pytest.fixture(scope="module")
+def worker_round(migrated_test_database: MigrationRound) -> Iterator[WorkerRound]:
+    """拿互斥、起 worker、等它报出 worker_id；结束时整组回收。"""
+
+    # 守卫必须在**任何 Redis 写入之前**：拿互斥本身就是一次 Redis 写。
+    worker_round_module.assert_redis_is_not_the_development_instance()
+
+    with WorkerRoundMutex(worker_round_module.redis_test_url()) as mutex:
+        round_ = worker_round_module.start_worker_round(mutex=mutex)
+        try:
+            yield round_
+        finally:
+            worker_round_module.stop_worker_round(
+                round_,
+                keep_artifacts=keep_artifacts(round_failed=worker_round_module.must_keep_artifacts(round_)),
+            )
