@@ -1552,6 +1552,74 @@ async def _publish_reconciliation_health() -> None:
     )
 
 
+def _transient_database_errors() -> tuple[type[BaseException], ...]:
+    """等待 PostgreSQL 期间视为「暂时不可用」的异常类型。
+
+    `CannotConnectNowError`（数据库正在启动）继承自 `OperatorInterventionError`，
+    **不是** `PostgresConnectionError`——只捕后者会恰好漏掉最常见的那一种。
+    其他异常一律不重试，避免把真正的配置或 Schema 错误拖到超时才暴露。
+    """
+    import asyncpg
+    from sqlalchemy.exc import InterfaceError
+
+    return (
+        asyncpg.exceptions.CannotConnectNowError,
+        asyncpg.PostgresConnectionError,
+        OperationalError,
+        InterfaceError,
+        ConnectionError,
+        OSError,
+        asyncio.TimeoutError,
+    )
+
+
+async def _await_database_ready() -> None:
+    """等待 PostgreSQL 就绪后再继续启动。
+
+    主机或 Docker 重启后，worker 可能先于 PostgreSQL 被恢复，而 Compose 的
+    `depends_on` 在「恢复既有容器」时并不保证顺序。因此这里自行做有上限、可观测的
+    重试，使 PostgreSQL 恢复后 worker 能自动就绪，不需要人工重启 worker。
+    """
+    timeout_seconds = get_int_env("YUXI_WORKER_DB_READY_TIMEOUT_SECONDS", 300)
+    try:
+        interval_seconds = max(0.2, float(os.getenv("YUXI_WORKER_DB_READY_INTERVAL_SECONDS", "2")))
+    except ValueError:
+        interval_seconds = 2.0
+    transient = _transient_database_errors()
+
+    deadline = time.monotonic() + timeout_seconds
+    attempts = 0
+    while True:
+        attempts += 1
+        try:
+            await pg_manager.require_current_schema()
+        except transient as exc:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                logger.error(
+                    "PostgreSQL 未在 {} 秒内就绪，worker 放弃启动：attempts={} error={}: {}",
+                    timeout_seconds,
+                    attempts,
+                    type(exc).__name__,
+                    exc,
+                )
+                raise
+            wait = min(interval_seconds, remaining)
+            logger.warning(
+                "PostgreSQL 暂不可用，{:.1f} 秒后重试：attempt={} error={}: {}",
+                wait,
+                attempts,
+                type(exc).__name__,
+                exc,
+            )
+            await asyncio.sleep(wait)
+            continue
+
+        if attempts > 1:
+            logger.warning("PostgreSQL 已就绪，worker 继续启动：attempts={}", attempts)
+        return
+
+
 async def _worker_startup(ctx):
     """初始化 worker 依赖。"""
 
@@ -1560,7 +1628,7 @@ async def _worker_startup(ctx):
     AuthUtils.require_security_secrets()
     ctx["worker_id"] = WORKER_ID
     pg_manager.initialize()
-    await pg_manager.require_current_schema()
+    await _await_database_ready()
     async with pg_manager.get_async_session_context() as session:
         from yuxi.config.options import (
             ensure_options_in_db,
