@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+import os
 from functools import partial
 
 from yuxi.repositories.task_repository import TaskRepository
@@ -9,8 +11,40 @@ from yuxi.utils.logging_config import logger
 
 TASK_LEASE_SECONDS = 30.0
 TASK_HEARTBEAT_SECONDS = 10.0
-TASK_RECONCILIATION_SECONDS = 30.0
+
+DEFAULT_TASK_RECONCILIATION_SECONDS = 30.0
+TASK_RECONCILIATION_SECONDS_ENV = "TASK_RECONCILIATION_SECONDS"
+
+
+def reconciliation_seconds_from_env(raw: str | None) -> float:
+    """解析 pending 意图补发周期：缺省 30，必须是**有限正数**。
+
+    三种坏值都不会自己报错，只会让周期补发静默失效，所以这里一律硬失败：
+    `nan` 会让 `asyncio.sleep` 立刻返回（收敛循环退化成忙等）、`inf` 与 `<= 0` 会让它永不醒来，
+    非数字则说明配置打错了。回落到默认值同样不可接受——"我注入了 1 秒"变成静默的 30 秒，
+    正是这一步要根除的"看起来生效其实没有"。
+    """
+
+    if raw is None or not raw.strip():
+        return DEFAULT_TASK_RECONCILIATION_SECONDS
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"{TASK_RECONCILIATION_SECONDS_ENV}={raw!r} 不是数字。"
+            f"留空用默认 {DEFAULT_TASK_RECONCILIATION_SECONDS:g} 秒。"
+        ) from exc
+    if not math.isfinite(value) or value <= 0:
+        raise RuntimeError(
+            f"{TASK_RECONCILIATION_SECONDS_ENV}={raw!r} 必须是有限正数——"
+            "NaN 会让 asyncio.sleep 立刻返回（循环变忙等），±inf 与 ≤0 会让补发永不发生。"
+        )
+    return value
+
+
+TASK_RECONCILIATION_SECONDS = reconciliation_seconds_from_env(os.getenv(TASK_RECONCILIATION_SECONDS_ENV))
 TASK_RECONCILIATION_HEALTH_KEY = "yuxi:worker:health:durable-task-reconciliation-v1"
+# 健康键的 TTL 必须覆盖**至少两个**周期：一个周期内没续上就说明补发能力已经不可信。
 TASK_RECONCILIATION_HEALTH_TTL_SECONDS = int(TASK_RECONCILIATION_SECONDS * 2 + 5)
 
 
