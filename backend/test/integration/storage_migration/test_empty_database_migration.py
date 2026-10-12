@@ -10,10 +10,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
 from pathlib import Path
 
-import anyio
 import pytest
 
 import _migration_round as round_module
@@ -21,18 +19,11 @@ from _migration_round import EXPECTED_VERSIONS, ROOT_ENV_VARS, MigrationRound
 
 pytestmark = [pytest.mark.integration]
 
+@pytest.fixture(name="migration_round")
+def migration_round_fixture(migrated_test_database: MigrationRound) -> MigrationRound:
+    """conftest 里 session 级的迁移轮次；这里只是让断言读起来是"本轮这一轮"。"""
 
-@pytest.fixture(scope="module")
-def migration_round() -> Iterator[MigrationRound]:
-    """跑一轮完整迁移；成功清理临时根，失败保留日志与临时产物。"""
-
-    round_ = round_module.start_round()
-    try:
-        anyio.run(round_module.assert_target_is_the_test_instance_and_database_is_empty)
-        round_module.run_full_migration(round_)
-        yield round_
-    finally:
-        round_module.finish_round(round_)
+    return migrated_test_database
 
 
 def test_the_child_environment_overrides_every_file_root(migration_round: MigrationRound) -> None:

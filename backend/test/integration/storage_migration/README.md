@@ -16,10 +16,16 @@ docker compose --profile test-db up -d --force-recreate postgres-test redis-test
 docker compose exec -T api uv run --no-sync pytest test/integration/storage_migration -q -p no:cacheprovider
 ```
 
-跑完这一轮，测试实例上就是 `business=13 / knowledge=2` 的库——Part 2 Step C/D 的测试 worker
-需要这个状态（`_worker_startup` 第一步是 `require_current_schema()`）。
+跑完这一轮，测试实例上就是 `business=13 / knowledge=2` 的库——Part 2 的测试 worker 需要这个状态
+（`_worker_startup` 第一步是 `require_current_schema()`）。这条前置由 `conftest.py` 的
+`migrated_test_database` 提供，session 级只跑一次。
 
-## 这一轮断言什么
+**前提：`REDIS_TEST_URL` 必须在 api 容器里**（测试 worker 用它连独立 Redis）。compose 里已经声明；
+改过 compose 的**环境变量**后必须 `up -d` 重建容器，`restart` 不生效——否则这一步会硬失败并告诉你去重建。
+
+## 两轮分别断言什么
+
+**第一轮：空库完整迁移**（`test_empty_database_migration.py`）
 
 | 断言 | 依据 |
 |---|---|
@@ -30,7 +36,22 @@ docker compose exec -T api uv run --no-sync pytest test/integration/storage_migr
 | 产物全落在临时根（诱饵 cwd 保持为空） | `test_no_artifact_escapes_the_round_root` |
 | 开发目录未被写入 | `test_development_directories_are_not_written` |
 
-失败时保留本轮临时根与 `migration.log`，并在输出里打印路径与日志尾部；成功则整根删除。
+**第二轮：worker 子进程与健康记录的归属**（`test_worker_health_attribution.py`）
+
+`yuxi:worker:health:*` 的键名是全局的、`redis-test` 又跨轮复用，"键存在"只说明某个 worker 报过到。
+所以本轮的判定链是：**从目标子进程自己的日志**取 `worker_id`（`_worker_startup` 的启动行
+`Worker startup ready: worker_id=<id>`）→ 再要求两个收敛健康键的值与它**精确相等**。
+没有这条启动行就无法归属，因此那条断言同时是 Step C 的 RED 门。
+
+| 断言 | 依据 |
+|---|---|
+| worker 在自己日志里报出 `worker_id` | `test_the_worker_announces_its_own_identity_in_its_log` |
+| 健康键的值 = 本轮子进程的 `worker_id` | `test_the_health_records_belong_to_the_worker_we_started` |
+| worker 也没写到临时根之外（cwd 诱饵为空） | `test_the_worker_does_not_write_outside_the_round_root` |
+| 缺配置/指到开发 Redis 一律硬失败 | `test_the_test_redis_is_required_and_must_not_be_the_development_one` |
+| 同一时刻只允许一个测试 worker（全局健康键） | `test_the_round_mutex_refuses_a_second_worker` |
+
+失败时保留本轮临时根与日志，并在输出里打印路径与日志尾部；成功则整根删除。
 
 ## 已知限制（不要当成已覆盖）
 
@@ -39,3 +60,7 @@ docker compose exec -T api uv run --no-sync pytest test/integration/storage_migr
   由"诱饵 cwd 必须为空"这条来兜（相对路径默认值会落在那里）。
 - 运行身份迁移（`.v072-runtime-identity`）是**预置**的，见 `_migration_round.py` 的 docstring：
   api 容器以 `1000:1000` 运行，而那一步要求 root。预置是如实陈述，不是绕过。
+- **迁移轮次断言"库是空的"，所以每跑一轮都要先重建 `postgres-test`**；第二轮（worker）本身不要求
+  空库，但复用同一套 session 前置，因此整目录一起跑时前置仍然是"全新库"。
+- Step D（启动补发 / 周期补发两个场景）**未做**：本轮只证明"能起、能归属、能回收"，
+  还没有断言补发时机。`TASK_RECONCILIATION_SECONDS` 也还没改成 env 驱动。

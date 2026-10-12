@@ -97,11 +97,26 @@ class MigrationRound:
         return "\n".join(content.splitlines()[-_LOG_TAIL_LINES:])
 
 
-def _new_root() -> Path:
+def new_round_root() -> Path:
+    """每轮一个唯一临时根。两个轮次（迁移 / worker）共用同一套根，不各自造一份。"""
+
     base = os.environ.get("YUXI_TEST_MIGRATION_ROOT_BASE", "").strip() or tempfile.gettempdir()
     base_path = Path(base)
     base_path.mkdir(parents=True, exist_ok=True)
     return Path(tempfile.mkdtemp(prefix="yuxi-part2-", dir=str(base_path)))
+
+
+def build_round_roots(root: Path) -> tuple[dict[str, Path], Path]:
+    """在临时根下建出每个文件根与那个"必须保持为空"的诱饵 cwd。"""
+
+    roots: dict[str, Path] = {}
+    for env_name, subdir in ROOT_ENV_VARS.items():
+        path = root / subdir
+        path.mkdir()
+        roots[env_name] = path
+    child_cwd = root / CHILD_CWD_DIRNAME
+    child_cwd.mkdir()
+    return roots, child_cwd
 
 
 def marker_state(path: Path) -> tuple[bool, int, int]:
@@ -152,14 +167,8 @@ def build_migration_env(roots: dict[str, Path]) -> dict[str, str]:
 def start_round() -> MigrationRound:
     """建唯一临时根、装好子进程环境，并记下开发目录标记的当前状态。"""
 
-    root = _new_root()
-    roots: dict[str, Path] = {}
-    for env_name, subdir in ROOT_ENV_VARS.items():
-        path = root / subdir
-        path.mkdir()
-        roots[env_name] = path
-    child_cwd = root / CHILD_CWD_DIRNAME
-    child_cwd.mkdir()
+    root = new_round_root()
+    roots, child_cwd = build_round_roots(root)
     seed_runtime_identity_marker(roots["YUXI_USER_DATA_DIR"])
     return MigrationRound(
         root=root,

@@ -1594,6 +1594,10 @@ async def _worker_startup(ctx):
     await _publish_reconciliation_health()
     ctx[_RECONCILIATION_TASK_KEY] = asyncio.create_task(_reconcile_agent_run_leases_forever())
     ctx[_TASK_RECONCILIATION_TASK_KEY] = asyncio.create_task(_reconcile_durable_tasks_forever())
+    # 收敛健康键的值就是 WORKER_ID，但键名是全局的：外部凭键存在无法区分**是哪个** worker 报的到。
+    # 这条启动行让观察者能把健康记录归属到具体进程（放在最后，出现即表示两个健康键都已发布）。
+    # 用 f-string：本项目的 logger 不插值位置参数，`%s` 会原样打进日志。
+    logger.info(f"Worker startup ready: worker_id={WORKER_ID}")
 
 
 async def _worker_shutdown(ctx):
