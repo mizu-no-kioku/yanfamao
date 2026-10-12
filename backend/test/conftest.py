@@ -11,15 +11,24 @@ if str(PROJECT_ROOT) not in sys.path:
 
 
 def _close_leaked_pg_pool_before_loop_close() -> None:
-    """事件循环关闭前，关闭可能被测试泄漏的全局 PostgreSQL 连接池。
+    """**临时 workaround**：事件循环关闭前关闭被测试泄漏的全局 PostgreSQL 连接池。
 
-    `pg_manager` 是进程级单例。有测试会让它连上真实 PostgreSQL（从而创建 psycopg
-    连接池）却不关闭；pytest-asyncio 随后关闭事件循环，`_cancel_all_tasks` 会取消并
-    **等待**池的 worker 协程，而该协程若正阻塞在建连上就永远等不到——整套测试因此挂起。
-    实测复现率约 50%：表现为某个用例的 teardown 超时，其余用例全部通过。
+    **这不是根因修复。** 泄漏该池的具体测试尚未定位——单元测试中查不到构造 psycopg
+    池的地方，池构造探针也从未触发。本函数只消除泄漏造成的后果。
 
-    这里在事件循环真正关闭之前把池关掉，使取消阶段没有等待对象。**不掩盖任何测试结果**：
-    只关闭连接池，用例数、断言与 pass/fail 判定都未改变。
+    **为什么必须替换全局 `asyncio.runners.Runner.close`，而不是范围更小的 fixture：**
+
+    1. 泄漏的任务只能**在创建它们的那一个事件循环上**关闭。pytest-asyncio 由自身的
+       `_scoped_runner` fixture 创建并关闭循环，用户 fixture 的 teardown 顺序无法保证
+       早于它，等到用户 fixture 拿到循环时可能已经太晚。
+    2. 本套件同时含同步与异步用例。异步 autouse fixture 无法覆盖同步用例，而同步用例
+       同样会在**前一个异步用例泄漏的循环**关闭时被卡住。
+    3. `Runner.close` 是循环关闭的唯一必经点，在这里收口才能覆盖全部用例形态。
+
+    因此这里选择全局收口，并明确标注为临时措施；定位到泄漏源头后应当移除。
+
+    **关闭失败不吞掉**：异常直接抛出使测试显式失败。guard 一旦失效必须立刻可见，
+    静默降级成警告会让"挂起已解决"变成一句无证据的结论。
     """
     import asyncio.runners
 
@@ -36,12 +45,8 @@ def _close_leaked_pg_pool_before_loop_close() -> None:
         pool = getattr(pg_manager, "langgraph_pool", None)
         engine = getattr(pg_manager, "async_engine", None)
         if callable(close) and (pool is not None or engine is not None):
-            try:
-                self._loop.run_until_complete(close())
-            except Exception as exc:  # 关闭失败不应改变测试结果
-                from yuxi.utils.logging_config import logger
-
-                logger.warning("关闭测试泄漏的 PostgreSQL 连接池失败：{}: {}", type(exc).__name__, exc)
+            # 不 try/except：关闭失败即让本用例失败，不允许静默降级。
+            self._loop.run_until_complete(close())
         return original(self)
 
     guarded._yuxi_pool_guard = True  # type: ignore[attr-defined]

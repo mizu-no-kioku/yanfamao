@@ -143,3 +143,84 @@ def test_cannot_connect_now_is_covered_by_transient_errors():
     import asyncpg
 
     assert asyncpg.exceptions.CannotConnectNowError in run_worker._transient_database_errors()
+
+
+def test_permanent_auth_error_fails_immediately(env, monkeypatch):
+    """密码错误等永久性配置/认证问题必须立刻失败，不得重试到超时。
+
+    这类错误重试再多次也不会好，把部署配置错误拖成 300 秒静默等待，
+    只会让排障更难。
+    """
+    clock, _logger = env
+    monkeypatch.setenv("YUXI_WORKER_DB_READY_TIMEOUT_SECONDS", "300")
+
+    import asyncpg
+
+    attempts = []
+
+    async def wrong_password():
+        attempts.append(1)
+        raise asyncpg.exceptions.InvalidPasswordError("password authentication failed")
+
+    monkeypatch.setattr(run_worker.pg_manager, "require_current_schema", wrong_password)
+
+    with pytest.raises(asyncpg.exceptions.InvalidPasswordError):
+        asyncio.run(run_worker._await_database_ready())
+
+    assert len(attempts) == 1, f"永久性错误只应尝试一次，实际 {len(attempts)} 次"
+    assert clock.slept == [], "永久性错误不得进入等待"
+
+
+def test_permanent_database_config_error_fails_immediately(env, monkeypatch):
+    """数据库不存在等永久性配置问题同样立刻失败。
+
+    用 asyncpg 的真实异常类型，而不是泛化 RuntimeError——以下四种情形已对
+    真实 PostgreSQL 实测：密码错误 → InvalidPasswordError、库名不存在 →
+    InvalidCatalogNameError，两者都不该重试；PostgreSQL 不可达 →
+    ConnectionRefusedError、数据库正在启动 → CannotConnectNowError，两者该重试。
+    """
+    clock, _logger = env
+    monkeypatch.setenv("YUXI_WORKER_DB_READY_TIMEOUT_SECONDS", "300")
+
+    import asyncpg
+
+    attempts = []
+
+    async def missing_database():
+        attempts.append(1)
+        raise asyncpg.exceptions.InvalidCatalogNameError('database "nonexistent" does not exist')
+
+    monkeypatch.setattr(run_worker.pg_manager, "require_current_schema", missing_database)
+
+    with pytest.raises(asyncpg.exceptions.InvalidCatalogNameError):
+        asyncio.run(run_worker._await_database_ready())
+
+    assert len(attempts) == 1
+    assert clock.slept == []
+
+
+def test_connection_refused_is_covered_by_transient_errors():
+    """PostgreSQL 不可达抛的是 ConnectionRefusedError，必须落在真实的可重试集合里。
+
+    它是 ConnectionError/OSError 的子类，因此以基类形式被覆盖——按子类关系判定。
+    """
+    assert any(issubclass(ConnectionRefusedError, item) for item in run_worker._transient_database_errors())
+
+
+def test_connection_refused_is_retried(env, monkeypatch):
+    """PostgreSQL 不可达（端口拒绝）属于可恢复，必须重试。"""
+    clock, _logger = env
+    monkeypatch.setattr(run_worker, "_transient_database_errors", lambda: (ConnectionRefusedError,))
+    attempts = []
+
+    async def refused():
+        attempts.append(1)
+        if len(attempts) < 2:
+            raise ConnectionRefusedError("connection refused")
+
+    monkeypatch.setattr(run_worker.pg_manager, "require_current_schema", refused)
+
+    asyncio.run(run_worker._await_database_ready())
+
+    assert len(attempts) == 2
+    assert len(clock.slept) == 1
