@@ -449,6 +449,35 @@ services:
       - app-network
     restart: unless-stopped
 
+  postgres-test:
+    # 存储迁移验收专用的**独立实例**。
+    #
+    # 全新库迁移与 13→14 升级会执行实例级全局 DDL（`CREATE ROLE yuxi_app`、`ALTER ROLE`、
+    # `GRANT ... ON SCHEMA public`）。跑在共享实例上会改到共享角色与公共 schema；跑在共享库的
+    # 隔离 schema 上也不够——角色是实例级的。因此这些验收只在这里跑。
+    #
+    # 起法：docker compose --profile test-db up -d postgres-test
+    # 数据目录挂 tmpfs，容器一停数据即失，天然就是"全新库"。
+    profiles: ["test-db"]
+    image: postgres:16
+    ports:
+      - "127.0.0.1:${YUXI_POSTGRES_TEST_PORT:-6433}:5432"
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER:-postgres}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-postgres}
+      - POSTGRES_DB=${POSTGRES_DB:-yuxi}
+      - TZ=${TZ:-Asia/Shanghai}
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-yuxi} || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    networks:
+      - app-network
+    restart: "no"
+
   redis:
     image: redis:7.4.10-alpine
     ports:
