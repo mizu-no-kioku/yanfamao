@@ -38,7 +38,7 @@ def cleanup_test_sandboxes():
 async def test_the_dedicated_test_instance_is_accepted():
     """正向：正确的测试实例必须通过——否则守卫就是"全都拒绝"的假绿。"""
 
-    await guard.assert_target_is_the_test_instance(force=True)
+    await guard.assert_target_is_the_test_instance()
 
 
 async def test_a_database_without_the_instance_marker_is_rejected(monkeypatch):
@@ -50,7 +50,7 @@ async def test_a_database_without_the_instance_marker_is_rejected(monkeypatch):
 
     monkeypatch.setenv("POSTGRES_TEST_CLUSTER_MARKER", "not-this-instance")
     with pytest.raises(RuntimeError, match="测试实例标记不符"):
-        await guard.assert_target_is_the_test_instance(force=True)
+        await guard.assert_target_is_the_test_instance()
 
 
 async def test_a_wrong_database_name_is_rejected(monkeypatch):
@@ -58,7 +58,7 @@ async def test_a_wrong_database_name_is_rejected(monkeypatch):
 
     monkeypatch.setenv("POSTGRES_TEST_DB", "yuxi")
     with pytest.raises(RuntimeError, match="期望专用测试库"):
-        await guard.assert_target_is_the_test_instance(force=True)
+        await guard.assert_target_is_the_test_instance()
 
 
 async def test_a_marker_not_set_on_the_command_line_is_rejected(monkeypatch):
@@ -73,7 +73,7 @@ async def test_a_marker_not_set_on_the_command_line_is_rejected(monkeypatch):
 
     monkeypatch.setattr(guard, "_read_cluster_marker", fake_marker)
     with pytest.raises(RuntimeError, match="来源不是命令行"):
-        await guard.assert_target_is_the_test_instance(force=True)
+        await guard.assert_target_is_the_test_instance()
 
 
 async def test_the_failure_messages_never_leak_the_password(monkeypatch):
@@ -89,7 +89,7 @@ async def test_the_failure_messages_never_leak_the_password(monkeypatch):
 
     monkeypatch.setenv("POSTGRES_TEST_CLUSTER_MARKER", "not-this-instance")
     with pytest.raises(RuntimeError) as excinfo:
-        await guard.assert_target_is_the_test_instance(force=True)
+        await guard.assert_target_is_the_test_instance()
 
     message = str(excinfo.value)
     assert credential not in message, "整段凭证出现在错误信息里"

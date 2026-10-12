@@ -6,7 +6,13 @@
 - 守卫曾经只在负向测试里被调用，真实启动路径根本没接线——所以"负向测试通过"毫无意义；
 - 互斥失败信息里带了完整连接串（含密码）；
 - 租约释放是 GET 后 DEL，会把别人的新租约删掉，且没有续期；
-- 产物保留原先只看退出码，断言失败时日志照样被删。
+- 产物保留原先只看退出码，断言失败时日志照样被删；
+- 丢锁原先只在"等启动日志"时被核对，worker 就绪后没人再看——所以这里有一条**真实场景**：
+  起真 worker、就绪后让租约失效、断言整组被回收且本轮被判失败；
+- 互斥原先只是可选前置，第二条启动路径仍能删健康键、起第二个 worker——现在 `mutex` 是必填参数。
+
+`test_losing_the_lease_...` 需要 `migrated_test_database`（worker 的启动闸门要求 13/2），
+它是本文件里唯一会起真实 worker 的用例；其余用例不碰测试库。
 """
 
 from __future__ import annotations
@@ -41,6 +47,8 @@ def test_starting_a_worker_refuses_a_development_redis_before_touching_it(monkey
 
     url = worker_round_module.redis_test_url()
     client = _redis_client(url)
+    # 只构造、**不获取**：获取锁本身就是一次 Redis 写，会把这条用例的前提弄脏。
+    mutex = WorkerRoundMutex(url)
     planted = {key: b"planted-by-the-test" for key in HEALTH_KEYS}
     try:
         for key, value in planted.items():
@@ -51,14 +59,34 @@ def test_starting_a_worker_refuses_a_development_redis_before_touching_it(monkey
         )
 
         with pytest.raises(RuntimeError, match="指向同一个目标"):
-            worker_round_module.start_worker_round()
+            worker_round_module.start_worker_round(mutex=mutex)
 
         survivors = {key: client.get(key) for key in HEALTH_KEYS}
     finally:
         for key in HEALTH_KEYS:
             client.delete(key)
         client.close()
+        mutex.close()
     assert survivors == planted, "守卫放行前就动了 Redis（健康键被删/改写）"
+
+
+def test_starting_a_worker_requires_holding_the_round_lease() -> None:
+    """`mutex` 是必填参数：靠"调用方记得拿锁"的约定挡不住第二条启动路径。"""
+
+    with pytest.raises(TypeError):
+        worker_round_module.start_worker_round()
+
+
+def test_starting_a_worker_refuses_a_lease_that_is_not_held() -> None:
+    """传了一个**没有真正持有**的租约也必须拒绝——否则等于没锁。"""
+
+    url = worker_round_module.redis_test_url()
+    mutex = WorkerRoundMutex(url)
+    try:
+        with pytest.raises(RuntimeError, match="不再属于本轮"):
+            worker_round_module.start_worker_round(mutex=mutex)
+    finally:
+        mutex.close()
 
 
 def test_a_default_port_alias_is_rejected(monkeypatch) -> None:
@@ -67,7 +95,7 @@ def test_a_default_port_alias_is_rejected(monkeypatch) -> None:
     monkeypatch.setenv(worker_round_module.DEVELOPMENT_REDIS_URL_ENV, "redis://shared-host:6379/0")
     monkeypatch.setenv(worker_round_module.REDIS_TEST_URL_ENV, "redis://shared-host/0")
     with pytest.raises(RuntimeError, match="指向同一个目标"):
-        worker_round_module.assert_redis_is_not_the_development_instance(force=True)
+        worker_round_module.assert_redis_is_not_the_development_instance()
 
 
 def test_a_different_target_string_with_the_same_instance_is_rejected(monkeypatch) -> None:
@@ -77,7 +105,7 @@ def test_a_different_target_string_with_the_same_instance_is_rejected(monkeypatc
     monkeypatch.setenv(worker_round_module.REDIS_TEST_URL_ENV, "redis://redis-test:6379/0")
     monkeypatch.setattr(worker_round_module, "redis_run_id", lambda _url: "same-instance-run-id")
     with pytest.raises(RuntimeError, match="run_id 相同"):
-        worker_round_module.assert_redis_is_not_the_development_instance(force=True)
+        worker_round_module.assert_redis_is_not_the_development_instance()
 
 
 def test_a_missing_test_redis_url_is_a_hard_failure(monkeypatch) -> None:
@@ -85,7 +113,7 @@ def test_a_missing_test_redis_url_is_a_hard_failure(monkeypatch) -> None:
 
     monkeypatch.delenv(worker_round_module.REDIS_TEST_URL_ENV, raising=False)
     with pytest.raises(RuntimeError, match="需要 REDIS_TEST_URL"):
-        worker_round_module.assert_redis_is_not_the_development_instance(force=True)
+        worker_round_module.assert_redis_is_not_the_development_instance()
 
 
 def test_the_guard_messages_never_leak_the_redis_credentials(monkeypatch) -> None:
@@ -106,7 +134,7 @@ def test_the_guard_messages_never_leak_the_redis_credentials(monkeypatch) -> Non
     monkeypatch.setenv(worker_round_module.DEVELOPMENT_REDIS_URL_ENV, credentialed)
     monkeypatch.setenv(worker_round_module.REDIS_TEST_URL_ENV, credentialed)
     with pytest.raises(RuntimeError) as guard_error:
-        worker_round_module.assert_redis_is_not_the_development_instance(force=True)
+        worker_round_module.assert_redis_is_not_the_development_instance()
     assert secret not in str(guard_error.value)
     assert credential not in str(guard_error.value)
 
@@ -159,24 +187,53 @@ def test_the_lease_stays_exclusive_past_its_initial_ttl() -> None:
                 pass
 
 
-def test_a_lost_lease_stops_the_round() -> None:
-    """续期失败必须让本轮终止，而不是继续跑下去与别人共享全局健康键。"""
+def test_check_reports_a_lease_that_is_no_longer_ours() -> None:
+    """`check()` 直接问一次 Redis：键被别人换掉时就地报错（不只依赖续期线程的标记）。"""
 
     url = worker_round_module.redis_test_url()
     client = _redis_client(url)
     try:
-        with WorkerRoundMutex(url, ttl_ms=1000, renew_interval_seconds=0.1) as mutex:
-            client.delete(worker_round_module.MUTEX_KEY)  # 模拟被别人抢走/过期
-            deadline = time.monotonic() + 3
-            while time.monotonic() < deadline:
-                try:
-                    mutex.check()
-                except RuntimeError as exc:
-                    assert "互斥租约已失效" in str(exc)
-                    return
-                time.sleep(0.05)
-        pytest.fail("租约已丢失，check() 却一直没报错")
+        with WorkerRoundMutex(url, ttl_ms=1000, renew_interval_seconds=10) as mutex:
+            client.set(worker_round_module.MUTEX_KEY, b"held-by-another")
+            with pytest.raises(RuntimeError, match="不再属于本轮"):
+                mutex.check()
     finally:
+        client.delete(worker_round_module.MUTEX_KEY)
+        client.close()
+
+
+def test_losing_the_lease_reaps_the_real_worker_and_fails_the_round(migrated_test_database) -> None:
+    """真实场景：worker 就绪之后让租约失效 → 整组被回收，本轮被判失败、产物应保留。
+
+    这条是审查指出的缺口：原先只在"等启动日志"时核对租约，worker 起来之后丢锁不会产生任何后果，
+    于是"丢锁就终止本轮"只是一句话，不是行为。
+    """
+
+    url = worker_round_module.redis_test_url()
+    client = _redis_client(url)
+    mutex = WorkerRoundMutex(url, ttl_ms=60_000)
+    mutex.__enter__()
+    round_ = None
+    try:
+        round_ = worker_round_module.start_worker_round(mutex=mutex)
+        assert round_.worker_id is not None, "worker 没起来，这条用例覆盖不到丢锁之后的行为"
+
+        # 就绪之后让租约易主。
+        client.set(worker_round_module.MUTEX_KEY, b"held-by-another")
+
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline and round_.captured.process.poll() is None:
+            time.sleep(0.1)
+
+        assert round_.lease_lost is True, "丢锁之后本轮没有被判失败"
+        assert round_.captured.process.poll() is not None, "丢锁之后 worker 进程组没有被回收"
+        assert round_.captured.group_is_alive() is False
+        assert worker_round_module.must_keep_artifacts(round_) is True, "丢锁那一轮的产物不该被清理"
+    finally:
+        # 判定为"应保留"之后，本用例自己把它清掉：它是自检用例，不是真失败。
+        if round_ is not None:
+            worker_round_module.stop_worker_round(round_, keep_artifacts=False)
+        mutex.__exit__(None, None, None)
         client.delete(worker_round_module.MUTEX_KEY)
         client.close()
 
@@ -221,6 +278,23 @@ def test_the_reaper_kills_the_whole_group_when_the_leader_already_exited(tmp_pat
     assert captured.group_is_alive() is False, "组长已退出，后代却没人收"
 
 
+def test_the_log_contains_the_child_last_line_after_the_reaper_returns(tmp_path: Path) -> None:
+    """回收返回即代表日志**写完**：读线程必须被等待，否则清理/读取会与它抢尾部日志。"""
+
+    captured = _spawn_sleeper(
+        tmp_path,
+        "import time\nfor n in range(5):\n    print(f'line-{n}', flush=True)\n    time.sleep(0.05)\ntime.sleep(120)",
+    )
+    try:
+        assert captured.wait_until(
+            lambda lines: any("line-4" in line for line in lines),
+            deadline=time.monotonic() + 20,
+        )
+    finally:
+        captured.reap()
+    assert "line-4" in captured.log_path.read_text(encoding="utf-8"), "回收返回后日志里还缺最后一行"
+
+
 def test_the_reaper_kills_a_descendant_that_ignores_sigterm(tmp_path: Path) -> None:
     """后代忽略 SIGTERM 时必须升级到 SIGKILL，且回收后整组确实为空。"""
 
@@ -241,17 +315,16 @@ def test_the_reaper_kills_a_descendant_that_ignores_sigterm(tmp_path: Path) -> N
 # ---------------------------------------------------------------- 产物保留判定
 
 
-def test_artifacts_are_kept_when_an_assertion_failed_even_if_the_child_succeeded(artifact_retention) -> None:
-    """退出码为 0 但断言失败时也要保留产物——保留的依据是 pytest 判定，不是退出码。"""
+def test_artifacts_are_kept_when_an_assertion_failed_even_if_the_child_succeeded(artifact_decider) -> None:
+    """退出码为 0 但断言失败时也要保留产物——保留的依据是 pytest 判定，不是退出码。
 
-    failed_tests, decide = artifact_retention
-    failed_tests.clear()
-    try:
-        assert decide(round_failed=False) is False
-        failed_tests.append("test/integration/storage_migration/test_x.py::test_y")
-        assert decide(round_failed=False) is True
-    finally:
-        failed_tests.clear()
+    用**独立列表**驱动判定：这条用例绝不能清空真实的会话记录，否则会把此前别处的失败抹掉，
+    让本该保留的产物被清理掉（那正是它要防的错）。
+    """
+
+    assert artifact_decider(round_failed=False, failed_tests=[]) is False
+    assert artifact_decider(round_failed=False, failed_tests=["some/earlier/test.py::test_x"]) is True
+    assert artifact_decider(round_failed=True, failed_tests=[]) is True
 
 
 def test_the_migration_round_keeps_artifacts_on_timeout() -> None:

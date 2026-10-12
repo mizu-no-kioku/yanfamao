@@ -50,14 +50,17 @@ docker compose exec -T api uv run --no-sync pytest test/integration/storage_migr
 | worker 也没写到临时根之外（cwd 诱饵为空、沙箱端点改道） | `test_the_worker_does_not_write_outside_the_round_root` |
 | 同一时刻只允许一个测试 worker（全局健康键） | `test_the_round_mutex_refuses_a_second_worker` |
 
-**第三组：脚手架自身**（`test_round_scaffolding.py`，不需要轮次，也不改测试实例）
+**第三组：脚手架自身**（`test_round_scaffolding.py`）
 
-守卫是否**接线**（曾经只在负向测试里被调用，真实启动路径根本没接线，于是"负向测试通过"毫无意义）、
-报错不泄漏凭证、租约原子释放与续期、组长先退出/后代忽略 TERM 时的整组回收、日志在超时前就已落盘、
-以及"断言失败也要保留产物"的判定。
+守卫是否**接线**且**每次核对**（不缓存——缓存过的版本只记部分输入，"测试 URL 不变、`REDIS_URL`
+被换成同一目标"就能绕过）、报错不泄漏凭证、租约必需且原子释放并自动续期、
+**真实场景下丢锁会回收整组并把本轮判失败**、组长先退出/后代忽略 TERM 时的整组回收、
+回收返回后日志已写完、以及"断言失败也要保留产物"的判定。
 
 失败时保留本轮临时根与日志，并在输出里打印路径与日志尾部；成功则整根删除。
 **保留与否看 pytest 的判定结果**，不只看子进程退出码——退出码 0 只说明"跑完了"。
+覆盖范围是 **setup / call 阶段的失败**；与本夹具同批的 teardown 报告产生于清理**之后**，
+所以"某个在其后才失败的 teardown 步骤"不在覆盖内。
 
 ## 已知限制（不要当成已覆盖）
 

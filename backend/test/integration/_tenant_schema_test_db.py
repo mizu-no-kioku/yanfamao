@@ -31,9 +31,6 @@ _MISSING_CONFIG = (
     "起法：docker compose --profile test-db up -d postgres-test"
 )
 
-_verified = False
-
-
 def tenant_schema_url() -> str:
     """独立测试实例的连接串；未配置直接报错，不静默回退。"""
 
@@ -72,12 +69,14 @@ async def _read_cluster_marker(connection) -> tuple[str | None, str | None]:
     return (row.setting, row.source) if row is not None else (None, None)
 
 
-async def assert_target_is_the_test_instance(*, force: bool = False) -> None:
-    """核对连接目标确实是独立测试实例。每个进程只做一次（`force=True` 供负向测试）。"""
+async def assert_target_is_the_test_instance() -> None:
+    """核对连接目标确实是独立测试实例。不回退、不 skip、**不缓存**。
 
-    global _verified
-    if _verified and not force:
-        return
+    这里执行的是实例级全局 DDL（`CREATE ROLE` / `ALTER ROLE` / `GRANT ... ON SCHEMA public`），
+    所以每次入口都重新核对。曾经有过"每进程只核对一次"的缓存：那样在核对过一次之后
+    **换掉 `POSTGRES_TEST_URL`** 就会直接跳过保护，而它保护的正是不可逆的实例级对象。
+    多两次只读查询的成本远低于那个代价。
+    """
 
     raw = tenant_schema_url()
     expected = expected_test_database_name()
@@ -119,8 +118,6 @@ async def assert_target_is_the_test_instance(*, force: bool = False) -> None:
         raise RuntimeError(
             f"测试实例标记来源不是命令行（source={source!r}）——标记可能被运行期设置过，拒绝执行。"
         )
-
-    _verified = True
 
 
 async def create_test_admin_engine():

@@ -103,11 +103,6 @@ end
 return 0
 """
 
-# 已核对过的 URL。**按 URL 缓存**而不是"核对过一次就不再看"：后者在配置中途被换掉时
-# （测试 monkeypatch、或多份配置混用）会直接跳过核对——那正是最需要核对的时候。
-_verified_url: str | None = None
-
-
 def redis_test_url() -> str:
     """独立测试 Redis 的连接串；未配置直接报错，不静默回退。"""
 
@@ -147,19 +142,18 @@ def redis_run_id(url: str) -> str:
     return str(run_id)
 
 
-def assert_redis_is_not_the_development_instance(*, force: bool = False) -> None:
-    """核对测试 Redis 确实是独立实例。不回退、不 skip；每个进程只做一次（`force` 供负向测试）。
+def assert_redis_is_not_the_development_instance() -> None:
+    """核对测试 Redis 确实是独立实例。不回退、不 skip、**不缓存**。
 
     两道：① 归一化后的 (host, port, db) 不同；② 实例身份 `run_id` 不同。"目标串不同"挡不住
     **连接别名**（hosts / DNS / 端口转发指向同一实例），`run_id` 是实例自己的随机身份，能挡住。
     读开发的 `run_id` 是一次只读 INFO——守卫要证明的正是"这两个不是同一个"，不连过去就无法证明。
+
+    **不缓存**：任何只缓存部分输入的缓存都有绕过路径——只记测试 URL 的话，"测试 URL 不变、
+    `REDIS_URL` 被换成同一目标"就会直接跳过核对。两次只读 INFO 的成本远低于绕过的代价。
     """
 
-    global _verified_url
-
     test_url = redis_test_url()
-    if _verified_url == test_url and not force:
-        return
     development = os.environ.get(DEVELOPMENT_REDIS_URL_ENV, "").strip()
     if not development:
         raise RuntimeError(
@@ -177,8 +171,6 @@ def assert_redis_is_not_the_development_instance(*, force: bool = False) -> None
             f"REDIS_TEST_URL 与 REDIS_URL 连到同一个 Redis 实例（run_id 相同，目标 {describe_redis(test_url)}）。"
             "目标串不同但实例相同——别名 hosts/DNS/端口转发，同样会污染开发队列。"
         )
-
-    _verified_url = test_url
 
 
 class WorkerRoundMutex:
@@ -211,14 +203,32 @@ class WorkerRoundMutex:
         try:
             self._client.eval(_RELEASE_SCRIPT, 1, MUTEX_KEY, self._token)
         finally:
-            self._client.close()
+            self.close()
+
+    def close(self) -> None:
+        self._client.close()
 
     def check(self) -> None:
-        """续期失败即本轮必须终止——否则两个 worker 会同时持有全局健康键。"""
+        """本轮是否仍持有租约。丢锁就必须终止——否则两个 worker 会同时持有全局健康键。
+
+        不只信续期线程的标记，还直接**问一次 Redis**：键被删/被别人抢走而续期线程尚未醒来时，
+        只看标记会漏判。
+        """
 
         if self._lost.is_set():
             raise RuntimeError(
                 f"互斥租约已失效（{describe_redis(self._url)}）——本轮必须终止，不能继续跑。"
+            )
+        try:
+            held = self._client.get(MUTEX_KEY)
+        except Exception as exc:
+            raise RuntimeError(
+                f"无法核对互斥租约（{describe_redis(self._url)}）：{type(exc).__name__}——本轮必须终止。"
+            ) from exc
+        if held != self._token.encode():
+            self._lost.set()
+            raise RuntimeError(
+                f"互斥租约已不再属于本轮（{describe_redis(self._url)}）——本轮必须终止，不能继续跑。"
             )
 
     def _renew_forever(self) -> None:
@@ -244,6 +254,9 @@ class WorkerRound:
     log_path: Path
     captured: CapturedProcess | None = None
     worker_id: str | None = None
+    lease_lost: bool = False
+    watchdog_stop: threading.Event | None = None
+    watchdog: threading.Thread | None = None
 
     @property
     def returncode(self) -> int | None:
@@ -298,22 +311,26 @@ def build_worker_env(roots: dict[str, Path], *, redis_url: str) -> dict[str, str
 
 
 def must_keep_artifacts(round_: WorkerRound) -> bool:
-    """worker 没起来、没报出身份、或非 0 退出 → 一定保留产物。"""
+    """worker 没起来、没报出身份、非 0 退出、或中途丢了租约 → 一定保留产物。"""
 
+    if round_.lease_lost:
+        return True
     return round_.captured is None or round_.worker_id is None or round_.returncode != 0
 
 
 def start_worker_round(
     *,
+    mutex: WorkerRoundMutex,
     start_timeout_seconds: float = 60.0,
-    mutex: WorkerRoundMutex | None = None,
 ) -> WorkerRound:
     """起 worker 子进程，等它从自己的日志里报出 worker_id。
 
-    守卫排在**最前面**：它必须在任何 Redis 写入（删健康键）与任何子进程之前生效。
+    顺序是有意的：**守卫** → **确认自己真的持有租约** → 才允许删健康键、起子进程。
+    `mutex` 是**必填**参数：健康键是全局的，靠"调用方记得拿锁"的约定挡不住第二条启动路径。
     """
 
     assert_redis_is_not_the_development_instance()
+    mutex.check()
 
     root = new_round_root()
     roots, child_cwd = build_round_roots(root)
@@ -339,24 +356,54 @@ def start_worker_round(
         env=round_.env,
         log_path=round_.log_path,
     )
+    _start_lease_watchdog(round_, mutex)
     try:
-        _pump_lines(round_, mutex=mutex, deadline=time.monotonic() + start_timeout_seconds)
+        _pump_lines(round_, deadline=time.monotonic() + start_timeout_seconds)
     except BaseException:
-        # 起完就抛（含续期失效）时不能把子进程留在后台。
+        # 起完就抛（含丢锁）时不能把子进程留在后台。
         round_.captured.reap()
         raise
     return round_
 
 
-def _pump_lines(round_: WorkerRound, *, mutex: WorkerRoundMutex | None, deadline: float) -> None:
-    """等启动行；每一轮都核对互斥仍然有效，租约失效就终止本轮而不是继续跑。"""
+def _start_lease_watchdog(round_: WorkerRound, mutex: WorkerRoundMutex, *, interval: float = 0.2) -> None:
+    """轮次**整个生命周期**内持续核对租约；丢锁就回收整组并把本轮判失败。
+
+    只等启动日志时核对是不够的：worker 就绪之后如果没人再看一眼，丢锁会静默地继续用全局健康键
+    （两个 worker 同时活着却都以为自己是唯一的）——这正是要根除的东西。
+    """
+
+    stop = threading.Event()
+    round_.watchdog_stop = stop
+
+    def watchdog() -> None:
+        while not stop.wait(interval):
+            try:
+                mutex.check()
+            except BaseException:
+                round_.lease_lost = True
+                if round_.captured is not None:
+                    round_.captured.reap()
+                return
+
+    round_.watchdog = threading.Thread(target=watchdog, daemon=True)
+    round_.watchdog.start()
+
+
+def _stop_lease_watchdog(round_: WorkerRound) -> None:
+    if round_.watchdog_stop is not None:
+        round_.watchdog_stop.set()
+    if round_.watchdog is not None:
+        round_.watchdog.join(timeout=5)
+
+
+def _pump_lines(round_: WorkerRound, *, deadline: float) -> None:
+    """等启动行。丢锁由看门狗负责（它会回收整组并置 `lease_lost`），这里只看进程与时间。"""
 
     captured = round_.captured
     assert captured is not None
 
     while True:
-        if mutex is not None:
-            mutex.check()
         found = _extract_worker_id(captured.lines())
         if found is not None:
             round_.worker_id = found
@@ -393,6 +440,7 @@ def health_record_values(redis_url: str) -> dict[str, str | None]:
 def stop_worker_round(round_: WorkerRound, *, keep_artifacts: bool) -> None:
     """整组回收；`keep_artifacts` 为真时保留日志与临时产物并打印路径与日志尾部。"""
 
+    _stop_lease_watchdog(round_)
     if round_.captured is not None:
         round_.captured.reap()
 

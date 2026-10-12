@@ -9,11 +9,16 @@ worker 子进程与独立测试实例，与运行中的服务无关。
 **产物保留的依据是 pytest 的判定结果，不是子进程的退出码**：退出码为 0 只说明"迁移/worker 跑完了"，
 版本记录、RLS、健康归属、目录断言任何一条失败时，日志与临时产物同样必须留下。所以这里用
 `pytest_runtest_makereport` 记录已判定的失败，夹具在 teardown 时一并参考。
+
+**覆盖范围（不要夸大）**：本夹具的 teardown 与"本轮 teardown 阶段的报告"是同一批 finalizer，
+报告产生于清理**之后**，所以它保证的是 **setup / call 阶段的失败**（以及在本夹具之前完成清理的
+其它 finalizer 的失败）。某个**在它之后**才失败的 teardown 步骤（含本夹具自己的 teardown 出错）
+无法被它提前看到。
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator, Sequence
 
 import anyio
 import pytest
@@ -36,17 +41,21 @@ def pytest_runtest_makereport(item, call):
     return report
 
 
-def keep_artifacts(*, round_failed: bool) -> bool:
-    """轮次本身不成功，或任一相关用例已失败，都保留产物。"""
+def decide_keep_artifacts(*, round_failed: bool, failed_tests: Sequence[str]) -> bool:
+    """轮次本身不成功，或任一相关用例已失败，都保留产物。**纯函数**，便于自检用例驱动。"""
 
-    return round_failed or bool(_FAILED_TESTS)
+    return round_failed or bool(failed_tests)
+
+
+def keep_artifacts(*, round_failed: bool) -> bool:
+    return decide_keep_artifacts(round_failed=round_failed, failed_tests=_FAILED_TESTS)
 
 
 @pytest.fixture()
-def artifact_retention() -> tuple[list[str], object]:
-    """把"已判定失败"的登记簿与判定函数交给脚手架自检用例驱动。"""
+def artifact_decider() -> Callable[..., bool]:
+    """把判定函数交给脚手架自检用例——它**不**暴露真实登记簿，自检用例不得改会话记录。"""
 
-    return _FAILED_TESTS, keep_artifacts
+    return decide_keep_artifacts
 
 
 @pytest.fixture(scope="session", autouse=True)

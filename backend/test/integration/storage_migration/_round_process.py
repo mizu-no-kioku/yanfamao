@@ -32,6 +32,9 @@ class CapturedProcess:
     log_path: Path
     _lines: list[str] = field(default_factory=list)
     _lock: threading.Lock = field(default_factory=threading.Lock)
+    _reader: threading.Thread | None = None
+    _reap_lock: threading.Lock = field(default_factory=threading.Lock)
+    _reaped: bool = False
 
     def lines(self) -> list[str]:
         with self._lock:
@@ -55,19 +58,38 @@ class CapturedProcess:
             time.sleep(poll)
 
     def reap(self, *, grace_seconds: float = 20.0) -> None:
-        """整组回收：TERM → 收割组长 → 按 PGID 复核 → 仍有成员就 KILL 再复核。"""
+        """整组回收：TERM → 收割组长 → 按 PGID 复核 → 仍有成员就 KILL 再复核。
 
-        self._signal_group(signal.SIGTERM)
-        self._wait_leader(grace_seconds)
-        if not self.group_is_alive():
-            return
-        self._signal_group(signal.SIGKILL)
-        self._wait_leader(10.0)
-        for _ in range(50):  # 最多 5s：SIGKILL 之后整组应该很快消失
-            if not self.group_is_alive():
+        可重入：看门狗与 teardown 都可能调用它。整组消失后**还要等读线程收尾**——
+        否则"回收返回了"不等于"日志写完了"，紧接着读日志或删目录就会与读线程抢。
+        """
+
+        with self._reap_lock:
+            if self._reaped:
                 return
-            time.sleep(0.1)
-        raise RuntimeError(f"进程组 {self.pgid} 在 SIGKILL 后仍有成员存活")
+            self._reaped = True
+            self._signal_group(signal.SIGTERM)
+            self._wait_leader(grace_seconds)
+            if self.group_is_alive():
+                self._signal_group(signal.SIGKILL)
+                self._wait_leader(10.0)
+                for _ in range(50):  # 最多 5s：SIGKILL 之后整组应该很快消失
+                    if not self.group_is_alive():
+                        break
+                    time.sleep(0.1)
+                else:
+                    raise RuntimeError(f"进程组 {self.pgid} 在 SIGKILL 后仍有成员存活")
+            self._join_reader()
+
+    def _join_reader(self, *, timeout: float = 15.0) -> None:
+        """等读线程把管道读完并关闭日志文件。`with open(...)` 退出即刷新。"""
+
+        reader = self._reader
+        if reader is None:
+            return
+        reader.join(timeout=timeout)
+        if reader.is_alive():
+            raise RuntimeError(f"进程已结束，读线程却没有收尾——日志可能不完整：{self.log_path}")
 
     def live_group_members(self) -> list[int]:
         """本组里**真正活着**的进程（Linux：读 /proc；`pgrp` 在 comm 之后的第 3 个字段）。
@@ -161,4 +183,5 @@ def _stream_to_log(captured: CapturedProcess) -> None:
                 sink.write(line)
                 sink.flush()
 
-    threading.Thread(target=reader, daemon=True).start()
+    captured._reader = threading.Thread(target=reader, daemon=True)
+    captured._reader.start()
