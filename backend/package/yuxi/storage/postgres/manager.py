@@ -831,7 +831,12 @@ class PostgresManager(metaclass=SingletonMeta):
         logger.info("PostgreSQL business tables created/checked")
 
     async def ensure_tenant_schema(self) -> None:
-        """建立租户模型。幂等，可在现有数据上重复执行。"""
+        """建立租户模型。幂等，可在现有数据上重复执行。
+
+        **不含 RLS 策略**：策略是一批需要隔离验证的独立语句，走 `ensure_tenant_rls()`。
+        两者合并过一次，结果是全新库（`business_version is None`）会因为跑一遍租户迁移就
+        自动启用尚未验证的策略。
+        """
 
         self._check_initialized()
         async with self.async_engine.begin() as conn:
@@ -843,8 +848,20 @@ class PostgresManager(metaclass=SingletonMeta):
                 *TENANT_CONSTRAINT_SCHEMA_STATEMENTS,
                 *_tenant_role_statements(),
                 *TENANT_ROLE_GRANT_SCHEMA_STATEMENTS,
-                *RLS_POLICY_SCHEMA_STATEMENTS,
             ):
+                await conn.execute(text(statement))
+
+    async def ensure_tenant_rls(self) -> None:
+        """启用受保护表的 RLS 策略。
+
+        独立于 `ensure_tenant_schema()`：策略未过隔离验证前，全新库不得因为跑一遍租户
+        迁移就自动带上它。策略语句**不加** `to_regclass` 守卫——缺表时显式失败能暴露
+        建表顺序错误，守卫会把"漏建策略"变成静默的安全洞。
+        """
+
+        self._check_initialized()
+        async with self.async_engine.begin() as conn:
+            for statement in RLS_POLICY_SCHEMA_STATEMENTS:
                 await conn.execute(text(statement))
 
     async def upgrade_knowledge_schema_v1_to_v2(self) -> None:

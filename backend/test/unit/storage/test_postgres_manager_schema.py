@@ -374,7 +374,7 @@ def test_business_schema_version_is_thirteen():
 async def test_rls_policies_cover_roots_and_derived_tables():
     """归属根按列比较，派生表按递归 EXISTS；两侧都同时定义 USING 与 WITH CHECK。"""
     async with _recording_manager() as (manager, connection):
-        await manager.ensure_tenant_schema()
+        await manager.ensure_tenant_rls()
 
     statements = "\n".join(connection.statements)
     for table in TENANT_ROOT_TABLES:
@@ -389,6 +389,30 @@ async def test_rls_policies_cover_roots_and_derived_tables():
     )
     # 初稿的写法会把前缀拼两次，生成不存在的列。
     assert "parent_row.parent_row." not in statements
+
+
+@pytest.mark.asyncio
+async def test_tenant_schema_does_not_enable_rls():
+    """全新库会走到 ensure_tenant_schema —— 它不得夹带尚未验证的 RLS 策略。"""
+    async with _recording_manager() as (manager, connection):
+        await manager.ensure_tenant_schema()
+
+    statements = "\n".join(connection.statements)
+    assert "ROW LEVEL SECURITY" not in statements
+    assert "CREATE POLICY" not in statements
+
+
+@pytest.mark.asyncio
+async def test_tenant_rls_is_its_own_step_covering_both_root_and_derived_tables():
+    """拆出的方法仍要覆盖全部受保护表——少一张就是一个直连读写缺口。"""
+    from yuxi.storage.postgres.manager import DERIVED_TABLE_PARENTS
+
+    async with _recording_manager() as (manager, connection):
+        await manager.ensure_tenant_rls()
+
+    statements = "\n".join(connection.statements)
+    for table in set(TENANT_ROOT_TABLES) | set(DERIVED_TABLE_PARENTS):
+        assert f"CREATE POLICY tenant_isolation ON {table}" in statements, table
 
 
 def test_derived_table_parents_match_real_foreign_keys():
