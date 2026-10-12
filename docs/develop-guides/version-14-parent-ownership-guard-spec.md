@@ -69,15 +69,24 @@
 |---|---|---|
 | `KnowledgeFileRepository.update_fields` / `update_fields_if_status` | **能** | `_writable_fields`（:174-175）含 `kb_id`；`_sanitize_data`（:204-208）按白名单过滤后 `update_fields` 逐个 `setattr`（:749-750） |
 | `KnowledgeChunkRepository` 的 upsert 路径 | **能** | `_writable_fields`（:16-19）含 `kb_id`；upsert 对已存在行 `setattr`（:122-123） |
-| `EvaluationRepository` 的三处更新（dataset / run / run_item） | **能** | `for key, value in data.items(): setattr(record, key, value)`（:63-68、:153-157、:209-216）——**没有白名单**，调用方给什么键就写什么列 |
+| `EvaluationRepository.update_dataset_in_session` | **能** | 同一套**无白名单**的 `setattr`（:63-68）；`EvaluationDataset` **确实有 `kb_id` 列**（`models_knowledge.py:241`）→ 能持久化 |
+| `EvaluationRepository` 的 run 更新（:153-157） | **能** | 无白名单 `setattr`；`EvaluationRun` **确实有 `kb_id` 列**（`models_knowledge.py:288`）→ 能持久化 |
+| `EvaluationRepository` 的 run_item 更新（:209-216） | **不能** | `setattr` 同样无白名单，但 `EvaluationRunItem` **没有 `kb_id` 列**（`models_knowledge.py:305-321` 只有 `run_id` / `dataset_item_id` 等）→ 设上去只是**非映射的 Python 属性，不落库**；它的归属只能经 `run_id` **间接**变化 |
 | `KnowledgeGraphRepository.upsert_chunk_graph` | **不能** | `on_conflict_do_update` 的 `set_` 只列 `name`/`attributes`/`updated_at`（entity，:265-269）与 `content`/`relation_type`/`updated_at`（triple，:297-301），**不含 `kb_id`**；mention 走 `on_conflict_do_nothing`（:285）→ 已存在行的归属改不动 |
 | 裸 SQL / 迁移脚本 / 运维脚本 | **能**（白名单管不到） | 这是"删白名单"方案不成立的原因 |
 
-**这条盘点的措辞边界**（评审校正）：以上是**可达的写入能力**，**不是**"已证实的业务迁移需求"
-——我没有追出哪个调用方真的把 `kb_id` 放进 `data`。
+**两条措辞边界（评审校正，都必须守住）**：
+
+1. 以上是**可达的写入能力**，**不是**"已证实的业务迁移需求"——我没有追出哪个调用方真的把
+   `kb_id` 放进 `data`。
+2. **"更新能力宽"不等于"该表有这个字段"**。`EvaluationRepository` 的通用 `setattr` 只说明
+   *输入限制宽*；能不能**持久化**改 `kb_id` 取决于**该表是否真有这个 ORM 列**——所以上表按
+   **真实列**逐条分开列，`run_item` 单独标为**不能**（它没有该列）。同理，"父引用字段"
+   （如 `run_items.run_id`）与"归属列"是两回事，不能混在一行里。
 
 **仍要注意的两点**：
-- 评估域那三处**没有白名单**，比 file/chunk 那两处更宽；父侧防护对它是**唯一的**数据库边界。
+- 评估域那两处（dataset / run）**没有白名单**，比 file/chunk 那两处更宽；父侧防护对它们是
+  **唯一**的数据库边界。
 - 图谱写路径目前改不动 `kb_id`，但这依赖 `set_` 清单**保持**不含 `kb_id`——这是一条**约定**，
   不是机制。父侧触发器把这条约定变成硬约束。
 
@@ -100,16 +109,34 @@
    检查既有子行，任一失配即 `RAISE EXCEPTION`（`ERRCODE = '23514'`）。此刻父行已由自身的
    `UPDATE` 持有 `FOR NO KEY UPDATE` 锁，而任何并发的子行写入都因第 1 条阻塞在 `FOR SHARE` 上
    ——检查看到的是一个**冻结**的子集合，不会"查完又冒出一行"。
-3. **减少父子反向加锁，并给多父引用定一个明确、稳定的锁顺序。** 父侧不锁子行，所以"父锁子"
+3. **减少父子反向加锁，并按「实际父行」定一个明确、稳定的锁顺序。** 父侧不锁子行，所以"父锁子"
    这条方向不存在；但这**不等于**死锁面被消除——**子侧一行可以锁多个父行**
    （`knowledge_graph_entity_mentions` 要锁 entity + file + chunk 三个；
    `knowledge_graph_triple_mentions` 要锁 triple + file + chunk；
    `knowledge_graph_triples` 要锁两个 entity），两个并发事务若以不同顺序取这些锁就会死锁。
-   因此生成函数里父行 `FOR SHARE` 的先后**按确定的全局顺序排列**（按父表名、父表键、
-   本表列排序），而不是按规则表的书写顺序。
-   **锁顺序是否真的稳定、是否真的不死锁，必须由真实 PostgreSQL 并发用例验证，不能由本文断言。**
+
+   **排序键必须是"实际父行"，不是"父表 + 键列名"**：`knowledge_graph_triples` 的两个引用
+   （`source_entity_id` / `target_entity_id`）是**同表、同键列**，按表名+列名排序得到的次序是
+   固定的，但两次事务里这两个 ID 的角色可以互换（A→B 与 B→A）→ **仍然反向取锁**。
+   所以实现必须是两步：
+
+   1. **先收集并去重**本行要锁的父行集合，元素是 `(父表, 实际主键值)`；
+   2. 再按 `(父表名, 实际主键值)` 的**统一顺序**逐个 `FOR SHARE`（plpgsql 里即把待锁键值
+      取成数组、`ORDER BY` 之后 `FOREACH` 循环），而不是按规则表/列的书写顺序。
+
+   **锁顺序是否真的稳定、是否真的不死锁，必须由真实 PostgreSQL 并发用例验证，不能由本文断言**；
+   而且**死锁用例只针对本文定义好的那些并发场景**（同表两引用互换、多父引用交叉），
+   **不承诺**任意业务事务都绝无死锁——那既证明不了，也不是本门槛的要求。
 4. 父行不存在时保持现状：`FOR SHARE` 查不到行 → 交给外键报错，避免用"引用不一致"盖掉
    "父行不存在"这个更准确的原因。
+
+### 明确支持的事务隔离级别（证据的作用域）
+
+- **代码里没有任何显式隔离级别设置**（`grep -rn "isolation_level" backend/package backend/server` 无命中）
+  → 走 PostgreSQL 服务端默认；隔离实例上实测 `SHOW default_transaction_isolation` = **`read committed`**。
+- 因此**本门槛的证据范围就是 READ COMMITTED**，并发验收至少要在该级别下做。
+- **不得**把 READ COMMITTED 下的结论推广到其它级别。若将来某个路径改用别的级别（或把应用整体
+  切过去），必须**分别**验收；在那之前，**支持级别明确限制为 READ COMMITTED**。
 
 ### 必须由真实 PostgreSQL 用例证明的部分
 
@@ -152,9 +179,14 @@
 7. `evaluation_run_items.dataset_item_id` 置空及 `ON DELETE SET NULL` 触发的更新仍合法。
 8. 无子行且满足其他约束的归属修改 → 行为符合第 4 节的契约。
 
-**验收方式（对第 4–6 条尤其重要）**：必须**读事务最终提交的数据**来判定"是否提交了失配"，
-不能只看"观察到阻塞"或"抛了异常"——父侧只读子行能否看见并发刚提交的子行，取决于隔离级别与
-触发器查询的实际时机，用阻塞/异常反推安全性是不成立的。
+**验收方式（对第 4–6 条尤其重要）**：
+
+- 并发用例用**屏障（barrier/Event）协调两个事务到指定交错点**，**不用固定 `sleep`**——
+  sleep 只能靠时序撞运气，撞不到就变成"看起来绿"。
+- 必须**读事务最终提交的数据**来判定"是否提交了失配"，不能只看"观察到阻塞"或"抛了异常"。
+- 全部并发用例在**上文声明的 READ COMMITTED** 下跑；结论只作用于该级别。
+- 第 6 条只针对**本文定义好的并发场景**（`triples` 两引用互换、多父引用交叉），
+  **不承诺**任意业务事务都绝无死锁。
 
 ——以上五条 + 第 2 节的更新路径补完，构成"引用一致性并发门槛"；全部通过前不接线版本 14，
 开发库保持版本 13。
