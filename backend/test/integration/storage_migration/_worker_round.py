@@ -27,7 +27,17 @@
 
 显式指定的只有：四个连接（Postgres owner / Postgres 受限角色 / Redis / 导入路径）与五个文件根。
 沙箱 provisioner 被指向**拒绝外联**的测试端点，因此真走到沙箱会立刻失败而不是打到开发 provisioner。
-其它外部依赖（Neo4j / Milvus / MinIO）**没有**隔离——本轮不投递任何 job，所以不作相关声明。
+其它外部依赖（Neo4j / Milvus / MinIO）**没有**隔离。Step D 起本轮**会投递 job**（`dataset_generation`），
+所以"不投递 job"这句已作废；能安全投递靠的是探针意图 `count=0` 走短路路径，**不是**隔离。
+
+## 等待期间的核对，与"谁停的"
+
+`assert_round_health` 是等业务结果时**每轮**都要过的一道：租约未丢、没有后台回收错误、
+worker 仍存活。前两项由看门狗维护，第三项靠 `WorkerRound.stopping` 区分两种"进程不在了"——
+`stop_worker_round` 先置 `stopping`，此后不再存活是本轮**要求**的结果；没置位就退出了，
+`assert_round_health` 立刻判失败，而不是让业务超时把"进程崩了"报成"业务没收敛"。
+`managed_worker_round` 把"守卫 → 互斥 → prepare → 起 worker → 按固定顺序收尾"整条封起来，
+调用方不需要自己维护这个次序。
 
 ## 前置
 
@@ -37,13 +47,15 @@ worker 的 `_worker_startup` 第一步是 `require_current_schema()`，要求库
 
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 import shutil
 import sys
 import threading
 import time
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
@@ -265,10 +277,22 @@ class WorkerRound:
     watchdog_error: BaseException | None = None
     watchdog_stop: threading.Event | None = None
     watchdog: threading.Thread | None = None
+    # 由 `stop_worker_round` 置位：此后进程不再存活是**本轮要求的**，不是"提前自行退出"。
+    stopping: bool = False
 
     @property
     def returncode(self) -> int | None:
         return None if self.captured is None else self.captured.process.returncode
+
+    @property
+    def is_running(self) -> bool:
+        return self.captured is not None and self.captured.process.poll() is None
+
+    @property
+    def exited_before_being_stopped(self) -> bool:
+        """提前**自行**退出：本轮还没让它停，它自己没了。"""
+
+        return self.captured is not None and not self.stopping and self.captured.process.poll() is not None
 
     def log_text(self) -> str:
         return "" if self.captured is None else self.captured.log_text()
@@ -299,10 +323,21 @@ def application_root() -> Path:
     raise RuntimeError("找不到应用根（同时含 server/ 与 package/ 的目录）")
 
 
-def build_worker_env(roots: dict[str, Path], *, redis_url: str) -> dict[str, str]:
-    """构造 worker 子进程环境：四个连接、五个文件根、导入路径与沙箱端点全部显式指定。"""
+def build_worker_env(
+    roots: dict[str, Path],
+    *,
+    redis_url: str,
+    overrides: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """构造 worker 子进程环境：四个连接、五个文件根、导入路径与沙箱端点全部显式指定。
+
+    `overrides` 只用于**调优注入**（例如把 `TASK_RECONCILIATION_SECONDS` 缩短到秒级）。
+    它先落、隔离项后落——注入**改不掉隔离**，这个不变式由构造顺序保证，不靠调用方自觉。
+    """
 
     env = dict(os.environ)
+    if overrides:
+        env.update(overrides)
     for name in QUIESCENCE_ENV_VARS:
         env.pop(name, None)
     env["POSTGRES_URL"] = tenant_schema_url()
@@ -330,11 +365,14 @@ def start_worker_round(
     *,
     mutex: WorkerRoundMutex,
     start_timeout_seconds: float = 60.0,
+    env_overrides: dict[str, str] | None = None,
 ) -> WorkerRound:
     """起 worker 子进程，等它从自己的日志里报出 worker_id。
 
     顺序是有意的：**守卫** → **确认自己真的持有租约** → 才允许删健康键、起子进程。
     `mutex` 是**必填**参数：健康键是全局的，靠"调用方记得拿锁"的约定挡不住第二条启动路径。
+
+    `env_overrides` 见 `build_worker_env`：只做调优注入，改不掉隔离。
     """
 
     assert_redis_is_not_the_development_instance()
@@ -353,7 +391,7 @@ def start_worker_round(
         root=root,
         roots=roots,
         child_cwd=child_cwd,
-        env=build_worker_env(roots, redis_url=redis_url),
+        env=build_worker_env(roots, redis_url=redis_url, overrides=env_overrides),
         log_path=root / "worker.log",
     )
 
@@ -475,11 +513,115 @@ def raise_if_round_failed(round_: WorkerRound) -> None:
 
 
 def stop_worker_round(round_: WorkerRound) -> None:
-    """停看门狗并整组回收。**不做清理判定**——判定的时机由 `close_worker_round` 保证。"""
+    """停看门狗并整组回收。**不做清理判定**——判定的时机由 `close_worker_round` 保证。
 
+    先置 `stopping`：置位之后"进程不在了"是本轮**要求**的结果，不再算提前退出。少了这一步，
+    每次正常收尾都会被 `assert_round_health` 判成"worker 自行退出"。
+    """
+
+    round_.stopping = True
     _stop_lease_watchdog(round_)
     if round_.captured is not None:
         round_.captured.reap()
+
+
+def assert_round_health(round_: WorkerRound) -> None:
+    """等待业务结果期间必须**持续**核对的三项；缺一项，"看起来绿"就会和"真的成立"分家：
+
+    1. **租约未丢**（`lease_lost`）——丢锁时看门狗会回收整组并把本轮判失败；
+    2. **没有后台回收错误**（`watchdog_error`）——回收失败被后台线程吞掉等于没发生；
+    3. **worker 仍存活**——它提前自行退出时**立刻**失败，而不是等到业务超时：超时会把
+       "进程崩了"报告成"业务没收敛"，正好把根因藏起来，这是审查明确要求补上的一条。
+
+    只在"我们还等着它干活"时调用。正常 teardown 由 `stop_worker_round` 先置 `stopping`
+    再停 worker，那时它不再存活是预期的——这条区分正是交接件记名的缺口（当时未实现）。
+    """
+
+    if round_.lease_lost:
+        detail = ""
+        if round_.watchdog_error is not None:
+            detail = f"（{type(round_.watchdog_error).__name__}: {round_.watchdog_error}）"
+        raise RuntimeError(f"等待期间丢掉了互斥租约，看门狗已回收整组——本轮验收不成立{detail}。临时根：{round_.root}")
+    if round_.watchdog_error is not None:
+        raise RuntimeError(
+            f"等待期间后台回收出错——本轮验收不成立"
+            f"（{type(round_.watchdog_error).__name__}: {round_.watchdog_error}）。临时根：{round_.root}"
+        )
+    if round_.exited_before_being_stopped:
+        raise RuntimeError(
+            f"worker 在本轮结束前**自行退出**（returncode={round_.returncode}）——不等业务超时，现在就判失败。"
+            f"临时根：{round_.root}\n{round_.log_tail()}"
+        )
+
+
+async def wait_for_round_result(
+    round_: WorkerRound,
+    observed: Callable[[], Awaitable[dict | None]],
+    *,
+    terminal: Callable[[dict], bool],
+    timeout_seconds: float,
+    description: str,
+    poll_seconds: float = 0.2,
+) -> dict:
+    """轮询到业务结果进入终态；每轮先核对 `assert_round_health` 的三项。
+
+    `observed` / `terminal` 由调用方给：等待循环不该知道"结果长什么样"，只该知道
+    "怎么读"与"什么时候算完"——但**三项健康核对是固定的**，所以写在这里而不是各个用例里。
+    """
+
+    deadline = time.monotonic() + timeout_seconds
+    last: dict | None = None
+    while True:
+        assert_round_health(round_)
+        state = await observed()
+        if state is not None:
+            last = state
+            if terminal(state):
+                return state
+        if time.monotonic() >= deadline:
+            raise AssertionError(
+                f"{description} 在 {timeout_seconds:g} 秒内没有收敛（最后一次读到 {last!r}）——"
+                f"不靠延长超时掩盖。临时根：{round_.root}\n{round_.log_tail()}"
+            )
+        await asyncio.sleep(poll_seconds)
+
+
+# 用例自身失败时混进 `failed_tests` 的标记：`close_worker_round` 只判真假，值本身只为人读。
+CURRENT_TEST_FAILED_MARKER = "<本轮用例自身失败>"
+
+
+@asynccontextmanager
+async def managed_worker_round(
+    *,
+    prepare: Callable[[], Awaitable[None]] | None = None,
+    env_overrides: dict[str, str] | None = None,
+    failed_tests: Sequence[str] = (),
+) -> AsyncIterator[WorkerRound]:
+    """完整一轮：守卫 → 互斥 → `prepare` → 起 worker → （用例体）→ 固定顺序收尾。
+
+    `prepare` 在子进程起来**之前**执行。"启动补发"场景要求意图先落库、worker 后启动，
+    这个钩子是保证该顺序的唯一位置——写在用例里就得自己维护 try/except/finally 的次序，
+    而次序正是第四轮审查修过的那类错。
+    """
+
+    assert_redis_is_not_the_development_instance()
+    with WorkerRoundMutex(redis_test_url()) as mutex:
+        if prepare is not None:
+            await prepare()
+        round_ = start_worker_round(mutex=mutex, env_overrides=env_overrides)
+        failure: BaseException | None = None
+        try:
+            yield round_
+        except BaseException as exc:
+            failure = exc
+            raise
+        finally:
+            # 用例体自己失败时也必须保留现场——此时 pytest 的报告还没生成，`failed_tests`
+            # 里还没有这一条，所以由这里显式补上。
+            close_worker_round(
+                round_,
+                failed_tests=[*failed_tests, CURRENT_TEST_FAILED_MARKER] if failure else failed_tests,
+            )
 
 
 def close_worker_round(round_: WorkerRound, *, failed_tests: Sequence[str]) -> None:

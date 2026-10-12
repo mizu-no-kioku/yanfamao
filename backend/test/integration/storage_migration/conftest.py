@@ -58,6 +58,18 @@ def artifact_decider() -> Callable[..., bool]:
     return decide_keep_artifacts
 
 
+@pytest.fixture()
+def session_failed_tests() -> Sequence[str]:
+    """会话内已判定失败的用例清单，**只读**。
+
+    自己起收尾轮次的用例（`managed_worker_round`）把它传进 `close_worker_round`，
+    否则"别处已经失败"这件事不会体现在本轮是清理还是保留产物的判定里。
+    返回的是**活对象**而不是快照：快照会在 setup 阶段就固化，而失败发生在之后。
+    """
+
+    return _FAILED_TESTS
+
+
 @pytest.fixture(scope="session", autouse=True)
 def ensure_live_api_schema():
     """本目录不碰真实 API。"""

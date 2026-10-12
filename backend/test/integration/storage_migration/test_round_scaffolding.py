@@ -425,6 +425,73 @@ def test_artifacts_are_kept_when_an_assertion_failed_even_if_the_child_succeeded
     assert artifact_decider(round_failed=True, failed_tests=[]) is True
 
 
+# ---------------------------------------------------------------- 等待期间的三项健康核对
+
+
+def _synthetic_round(tmp_path: Path, script: str) -> WorkerRound:
+    """不连库、不起真 worker 的轮次：单独验 `assert_round_health` 的三项判定。"""
+
+    root = migration_round_module.new_round_root()
+    roots, child_cwd = migration_round_module.build_round_roots(root)
+    round_ = WorkerRound(root=root, roots=roots, child_cwd=child_cwd, env={}, log_path=root / "worker.log")
+    round_.captured = _spawn_sleeper(tmp_path, script)
+    return round_
+
+
+def test_health_check_fails_immediately_when_the_worker_exits_on_its_own(tmp_path: Path) -> None:
+    """提前自行退出必须**立刻**失败——等到业务超时会把"进程崩了"报告成"业务没收敛"。"""
+
+    round_ = _synthetic_round(tmp_path, "import time; time.sleep(0.2)")
+    try:
+        round_.captured.process.wait(timeout=30)
+        with pytest.raises(RuntimeError, match="自行退出"):
+            worker_round_module.assert_round_health(round_)
+    finally:
+        round_.captured.reap()
+        shutil.rmtree(round_.root, ignore_errors=True)
+
+
+def test_health_check_accepts_a_worker_this_round_stopped_on_purpose(tmp_path: Path) -> None:
+    """正常 teardown 主动停 worker **不算**异常退出——否则每次收尾都会被判成失败。
+
+    这就是交接件记名的缺口（"这一点当前尚未实现"）：区分靠 `stop_worker_round` 先置的
+    `stopping` 标记，而不是靠"进程还在不在"这种两侧都成立的观察。
+    """
+
+    round_ = _synthetic_round(tmp_path, "import time; time.sleep(120)")
+    try:
+        worker_round_module.stop_worker_round(round_)
+        assert round_.captured.process.poll() is not None, "前提不成立：worker 没被停掉"
+        assert round_.exited_before_being_stopped is False
+        worker_round_module.assert_round_health(round_)  # 不抛
+    finally:
+        shutil.rmtree(round_.root, ignore_errors=True)
+
+
+def test_health_check_reports_a_background_reap_error(tmp_path: Path) -> None:
+    """后台线程里吞掉的回收异常等于没发生——必须由核对把它变成异常。"""
+
+    round_ = _synthetic_round(tmp_path, "import time; time.sleep(120)")
+    try:
+        round_.watchdog_error = RuntimeError("回收失败")
+        with pytest.raises(RuntimeError, match="后台回收出错"):
+            worker_round_module.assert_round_health(round_)
+    finally:
+        worker_round_module.stop_worker_round(round_)
+        shutil.rmtree(round_.root, ignore_errors=True)
+
+
+def test_health_check_reports_a_lost_lease(tmp_path: Path) -> None:
+    round_ = _synthetic_round(tmp_path, "import time; time.sleep(120)")
+    try:
+        round_.lease_lost = True
+        with pytest.raises(RuntimeError, match="丢掉了互斥租约"):
+            worker_round_module.assert_round_health(round_)
+    finally:
+        worker_round_module.stop_worker_round(round_)
+        shutil.rmtree(round_.root, ignore_errors=True)
+
+
 def test_the_migration_round_keeps_artifacts_on_timeout() -> None:
     """超时也必须保留：旧写法在超时后没有日志可看。"""
 
