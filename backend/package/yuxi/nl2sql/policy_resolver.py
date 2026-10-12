@@ -1,13 +1,18 @@
 """把业务身份解析成完整的 QueryPolicy：身份 → 功能门 → 资源 → 行权限 → 策略。"""
 
-from collections.abc import Collection
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass
 
 from yuxi.nl2sql import errors
 from yuxi.nl2sql.directory import BusinessDirectory
 from yuxi.nl2sql.principal import BusinessPrincipal
 from yuxi.nl2sql.resource_policy import AI_GATE_MENU_IDS, MENU_TO_RESOURCES, resolve_grants
-from yuxi.nl2sql.table_policy import PERMANENTLY_DENIED_COLUMNS, PERMANENTLY_DENIED_TABLES, TABLE_UPPER_BOUNDS
+from yuxi.nl2sql.table_policy import (
+    PERMANENTLY_DENIED_COLUMNS,
+    PERMANENTLY_DENIED_TABLES,
+    TABLE_UPPER_BOUNDS,
+    selectable_columns_for,
+)
 from yuxi.services.business_database_security import QueryPolicy
 
 
@@ -100,24 +105,59 @@ class ResolvedPolicy:
     policy: QueryPolicy
 
 
-def resolve_query_policy(principal: BusinessPrincipal, directory: BusinessDirectory) -> ResolvedPolicy:
-    """完整解析：身份 → 功能门 → 资源 → 行权限 → QueryPolicy。"""
+def resolve_query_policy(
+    principal: BusinessPrincipal,
+    directory: BusinessDirectory,
+    *,
+    allowed_tables: Collection[str] | None = None,
+    allowed_columns: Mapping[str, Collection[str]] | None = None,
+    allow_project_member_rows: bool = False,
+) -> ResolvedPolicy:
+    """完整解析：身份 → 功能门 → 资源 → 行权限 → QueryPolicy。
+
+    三层交集：代码硬上限 ∩ YAML/RBAC 授权 ∩ 环境变量可选收紧。
+    `allowed_tables` / `allowed_columns` 是环境变量层，**只能缩小授权，不能扩权**：
+    超出授权范围的项被剔除；若剔除后没有可用表，按配置错误拒绝，不静默放行。
+
+    它们只影响 `selectable_columns`（模型可见列）。`table_columns` 始终保留授权列，
+    含租户/状态等守卫内部列——守卫要靠它们注入条件，缺了会直接拒绝。
+    """
     subject = resolve_business_subject(principal, directory)
     role_ids = resolve_function_gate(subject, directory)
     resource_codes = resolve_resource_codes(subject, role_ids, directory)
 
     grants = resolve_grants(resource_codes)
-    allowed_tables: set[str] = set()
-    table_columns: dict[str, frozenset[str]] = {}
+    granted_tables: set[str] = set()
+    granted_columns: dict[str, frozenset[str]] = {}
     max_rows = 200
     for grant in grants:
-        allowed_tables |= grant.tables
+        granted_tables |= grant.tables
         for table, columns in grant.columns.items():
-            table_columns[table] = table_columns.get(table, frozenset()) | columns
+            granted_columns[table] = granted_columns.get(table, frozenset()) | columns
         max_rows = min(max_rows, grant.max_rows)
 
-    if not allowed_tables:
+    if not granted_tables:
         raise errors.PolicyDenial(errors.FUNCTION_GATE_DENIED, "当前角色没有可用的数据资源")
+
+    narrowed_tables = granted_tables
+    if allowed_tables is not None:
+        requested = {str(name).strip().lower() for name in allowed_tables if str(name).strip()}
+        narrowed_tables = granted_tables & requested
+        if not narrowed_tables:
+            raise errors.PolicyDenial(errors.FUNCTION_GATE_DENIED, "环境变量收紧后没有可用业务表")
+
+    table_columns: dict[str, frozenset[str]] = {}
+    selectable_columns: dict[str, frozenset[str]] = {}
+    for table in sorted(narrowed_tables):
+        columns = granted_columns[table]
+        table_columns[table] = columns
+        visible = columns
+        if allowed_columns is not None and table in allowed_columns:
+            visible = visible & {str(name).strip().upper() for name in allowed_columns[table]}
+        visible = selectable_columns_for(table, visible)
+        if not visible:
+            raise errors.PolicyDenial(errors.FUNCTION_GATE_DENIED, f"环境变量收紧后表 {table} 没有可用字段")
+        selectable_columns[table] = visible
 
     project_ids = directory.find_authorized_project_ids(subject.tenant_id, subject.staff_id)
     if not project_ids:
@@ -125,17 +165,22 @@ def resolve_query_policy(principal: BusinessPrincipal, directory: BusinessDirect
 
     project_scope_columns = {
         table: TABLE_UPPER_BOUNDS[table].project_column
-        for table in allowed_tables
+        for table in narrowed_tables
         if TABLE_UPPER_BOUNDS[table].project_column
     }
+    staff_scope_columns = (
+        {} if allow_project_member_rows or "t_project_user" not in narrowed_tables else {"t_project_user": "STAFF_ID"}
+    )
 
     policy = QueryPolicy(
         tenant_id=subject.tenant_id,
         staff_id=subject.staff_id,
-        allowed_tables=frozenset(allowed_tables),
+        allowed_tables=frozenset(narrowed_tables),
         table_columns=table_columns,
         allowed_project_ids=tuple(project_ids),
+        selectable_columns=selectable_columns,
         project_scope_columns=project_scope_columns,
+        staff_scope_columns=staff_scope_columns,
         global_tables=frozenset(),
         denied_tables=PERMANENTLY_DENIED_TABLES,
         denied_columns=PERMANENTLY_DENIED_COLUMNS,

@@ -5,24 +5,26 @@ from __future__ import annotations
 import json
 import os
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import date, datetime, time as datetime_time
 from decimal import Decimal
 from typing import Any
 
+import pymysql
+
+from yuxi.nl2sql import errors as nl2sql_errors
+from yuxi.nl2sql.directory import BusinessDirectory
+from yuxi.nl2sql.mysql_directory import MySqlBusinessDirectory
+from yuxi.nl2sql.policy_resolver import ResolvedPolicy, resolve_query_policy
+from yuxi.nl2sql.principal import BusinessPrincipal
 from yuxi.repositories.business_database_repository import (
     BusinessDatabaseConnection,
     BusinessDatabaseRepository,
 )
-from yuxi.services.business_database_security import QueryPolicy, SQLSecurityGuard
+from yuxi.services.business_database_security import SQLSecurityGuard
 from yuxi.utils import logger
 
-DEFAULT_ALLOWED_TABLES = frozenset({"t_project", "t_project_user"})
-PROJECT_SCOPE_COLUMNS = {
-    "t_project": "ID",
-    "t_project_user": "PROJECT_ID",
-}
 PERMANENTLY_DENIED_COLUMNS = frozenset(
     {
         "ACCOUNT",
@@ -36,10 +38,6 @@ PERMANENTLY_DENIED_COLUMNS = frozenset(
     }
 )
 PERMANENTLY_DENIED_SUFFIXES = ("_URL", "_ANNEX_ID")
-# 守卫内部列：守卫需要它们来注入有效状态条件，但模型不得看见、也不得在
-# SELECT/WHERE/HAVING 中引用。原业务库用 9999 表示启用（与 t_user_login_log.STATE 同风格），
-# 模型一旦看见就会按常识猜 =1，把结果清空——2026-10-12 实测两个问题都因此答 0。
-INTERNAL_STATUS_COLUMNS = frozenset({"ENABLE_STATUS", "OPERATER_STATUS"})
 
 
 class BusinessDatabaseConfigurationError(RuntimeError):
@@ -51,14 +49,18 @@ class BusinessDatabaseAuthorizationError(PermissionError):
 
 
 @dataclass(frozen=True)
-class BusinessDatabaseIdentity:
-    """由服务端维护的原业务系统身份和授权范围。"""
+class BusinessDatabaseBinding:
+    """Yuxi 用户到业务库身份的绑定。
 
-    tenant_id: int
-    staff_id: int
-    allowed_tables: frozenset[str]
+    只声明「这个 Yuxi 用户是谁」以及可选的环境变量收紧项。
+    租户可以省略（由业务库推导），**员工编号不在此声明**——由解析器按当前租户动态推导，
+    这样员工与租户的对应关系变化时不需要改配置。
+    """
+
+    business_user_id: int
+    tenant_id: int | None
+    allowed_tables: frozenset[str] | None
     allowed_columns: dict[str, frozenset[str]]
-    allow_all_projects: bool
     allow_project_member_rows: bool
 
 
@@ -117,21 +119,28 @@ class BusinessDatabaseSettings:
             max_rows=max_rows,
         )
 
-    def resolve_identity(self, uid: str) -> BusinessDatabaseIdentity:
-        """把可信 Yuxi uid 解析为旧系统租户、员工和查询授权。"""
+    def resolve_binding(self, uid: str) -> BusinessDatabaseBinding:
+        """把可信 Yuxi uid 解析为业务库身份绑定与可选收紧项。
+
+        绑定只给 `business_user_id`（租户可选），**员工编号不再静态声明**——
+        它由解析器按当前租户从业务库推导，员工归属变化时无需改配置。
+        `allowed_tables` / `allowed_columns` 是环境变量层，语义上只能收紧。
+        """
         raw = self.identities.get(uid)
         if not isinstance(raw, dict):
             raise BusinessDatabaseAuthorizationError("当前用户尚未绑定业务数据库身份")
 
-        tenant_id = _positive_integer(raw.get("tenant_id"), "tenant_id")
-        staff_id = _positive_integer(raw.get("staff_id"), "staff_id")
-        configured_tables = raw.get("allowed_tables", sorted(DEFAULT_ALLOWED_TABLES))
-        if not isinstance(configured_tables, list) or not configured_tables:
-            raise BusinessDatabaseConfigurationError("allowed_tables 必须是非空表名列表")
-        allowed_tables = frozenset(str(name).strip().lower() for name in configured_tables if str(name).strip())
-        unsupported = allowed_tables - DEFAULT_ALLOWED_TABLES
-        if unsupported:
-            raise BusinessDatabaseConfigurationError("以下业务表尚未完成权限审计：" + ", ".join(sorted(unsupported)))
+        business_user_id = _positive_integer(raw.get("business_user_id"), "business_user_id")
+        raw_tenant = raw.get("tenant_id")
+        tenant_id = None if raw_tenant in (None, "") else _positive_integer(raw_tenant, "tenant_id")
+
+        allowed_tables: frozenset[str] | None = None
+        if "allowed_tables" in raw:
+            configured = raw["allowed_tables"]
+            if not isinstance(configured, list) or not configured:
+                raise BusinessDatabaseConfigurationError("allowed_tables 必须是非空表名列表")
+            names = frozenset(str(name).strip().lower() for name in configured if str(name).strip())
+            allowed_tables = names or None
 
         raw_columns = raw.get("allowed_columns", {})
         if not isinstance(raw_columns, dict):
@@ -139,24 +148,19 @@ class BusinessDatabaseSettings:
         allowed_columns: dict[str, frozenset[str]] = {}
         for table_name, columns in raw_columns.items():
             normalized_table = str(table_name).strip().lower()
-            if normalized_table not in allowed_tables:
-                raise BusinessDatabaseConfigurationError(f"allowed_columns 包含未授权表 {normalized_table}")
             if not isinstance(columns, list) or not columns:
                 raise BusinessDatabaseConfigurationError(f"表 {normalized_table} 的 allowed_columns 必须是非空列表")
             allowed_columns[normalized_table] = frozenset(str(column).strip().upper() for column in columns)
 
-        allow_all_projects = raw.get("allow_all_projects", False)
-        if not isinstance(allow_all_projects, bool):
-            raise BusinessDatabaseConfigurationError("allow_all_projects 必须是布尔值")
         allow_project_member_rows = raw.get("allow_project_member_rows", False)
         if not isinstance(allow_project_member_rows, bool):
             raise BusinessDatabaseConfigurationError("allow_project_member_rows 必须是布尔值")
-        return BusinessDatabaseIdentity(
+
+        return BusinessDatabaseBinding(
+            business_user_id=business_user_id,
             tenant_id=tenant_id,
-            staff_id=staff_id,
             allowed_tables=allowed_tables,
             allowed_columns=allowed_columns,
-            allow_all_projects=allow_all_projects,
             allow_project_member_rows=allow_project_member_rows,
         )
 
@@ -165,7 +169,7 @@ class BusinessDatabaseSettings:
 class PreparedBusinessDatabaseAccess:
     """完成身份、Schema 和项目授权解析后的执行上下文。"""
 
-    identity: BusinessDatabaseIdentity
+    resolved: ResolvedPolicy
     metadata: dict[str, list[dict[str, Any]]]
     guard: SQLSecurityGuard
 
@@ -179,9 +183,12 @@ class BusinessDatabaseService:
         repository_factory: Callable[
             [BusinessDatabaseConnection], BusinessDatabaseRepository
         ] = BusinessDatabaseRepository,
+        directory_factory: Callable[[BusinessDatabaseConnection], BusinessDirectory] | None = None,
     ):
         self._settings_loader = settings_loader
         self._repository_factory = repository_factory
+        # 延迟解析：模块级工厂函数定义在类之后，直接做默认参数会在类定义时求值失败。
+        self._directory_factory = directory_factory or _mysql_directory
 
     def list_authorized_tables(self, uid: str) -> list[dict[str, str]]:
         """列出当前用户可供模型选择的业务表。"""
@@ -227,8 +234,8 @@ class BusinessDatabaseService:
         logger.info(
             "business database query completed uid={} tenant_id={} staff_id={} tables={} rows={} latency_ms={}",
             uid,
-            access.identity.tenant_id,
-            access.identity.staff_id,
+            access.resolved.subject.tenant_id,
+            access.resolved.subject.staff_id,
             list(secured.tables),
             normalized_result["row_count"],
             round((time.monotonic() - started_at) * 1000, 2),
@@ -248,97 +255,91 @@ class BusinessDatabaseService:
         if not normalized_uid:
             raise BusinessDatabaseAuthorizationError("无法获取当前 Yuxi 用户身份")
         settings = self._settings_loader()
-        identity = settings.resolve_identity(normalized_uid)
+        binding = settings.resolve_binding(normalized_uid)
         repository = self._repository_factory(settings.connection)
-        if not repository.validate_staff_identity(identity.tenant_id, identity.staff_id):
-            raise BusinessDatabaseAuthorizationError("绑定的员工不属于当前租户或员工记录已失效")
 
-        raw_metadata = repository.load_schema(identity.allowed_tables)
-        missing_tables = identity.allowed_tables - set(raw_metadata)
+        resolved = self._resolve_policy(settings, binding)
+        policy = resolved.policy
+
+        raw_metadata = repository.load_schema(policy.allowed_tables)
+        missing_tables = policy.allowed_tables - set(raw_metadata)
         if missing_tables:
             raise BusinessDatabaseConfigurationError("授权表不存在：" + ", ".join(sorted(missing_tables)))
-        safe_metadata = _filter_metadata(raw_metadata, {})
-        metadata = _without_internal_columns(_filter_metadata(safe_metadata, identity.allowed_columns))
-        table_columns = {
-            table_name: frozenset(str(column["COLUMN_NAME"]) for column in columns)
-            for table_name, columns in safe_metadata.items()
-        }
-        selectable_columns = {
-            table_name: frozenset(str(column["COLUMN_NAME"]) for column in columns)
-            for table_name, columns in metadata.items()
-        }
-        project_scope_columns = {
-            table_name: PROJECT_SCOPE_COLUMNS[table_name] for table_name in identity.allowed_tables
-        }
-        for table_name, project_column in project_scope_columns.items():
-            normalized_columns = {column.upper() for column in table_columns[table_name]}
-            if "TENANT_ID" not in normalized_columns or project_column not in normalized_columns:
-                raise BusinessDatabaseConfigurationError(f"表 {table_name} 缺少租户或项目安全字段")
+        metadata = _visible_metadata(raw_metadata, policy.selectable_columns)
 
-        staff_scope_columns = (
-            {}
-            if identity.allow_project_member_rows or "t_project_user" not in identity.allowed_tables
-            else {"t_project_user": "STAFF_ID"}
-        )
+        guard = SQLSecurityGuard(policy)
+        return settings, repository, PreparedBusinessDatabaseAccess(resolved, metadata, guard)
 
-        project_ids = repository.list_project_ids(
-            identity.tenant_id,
-            identity.staff_id,
-            allow_all_projects=identity.allow_all_projects,
-        )
-        guard = SQLSecurityGuard(
-            QueryPolicy(
-                tenant_id=identity.tenant_id,
-                staff_id=identity.staff_id,
-                allowed_tables=identity.allowed_tables,
-                table_columns=table_columns,
-                allowed_project_ids=project_ids,
-                selectable_columns=selectable_columns,
-                project_scope_columns=project_scope_columns,
-                staff_scope_columns=staff_scope_columns,
-                denied_columns=PERMANENTLY_DENIED_COLUMNS,
-                max_rows=settings.max_rows,
+    def _resolve_policy(self, settings: BusinessDatabaseSettings, binding: BusinessDatabaseBinding) -> ResolvedPolicy:
+        """每次调用都重新解析身份、功能门、资源与项目范围。
+
+        不缓存结果：撤权必须在下一次执行前生效，缓存会让旧授权继续放行。
+        """
+        directory = self._directory_factory(settings.connection)
+        try:
+            return resolve_query_policy(
+                BusinessPrincipal(user_id=binding.business_user_id, tenant_id=binding.tenant_id),
+                directory,
+                allowed_tables=binding.allowed_tables,
+                allowed_columns=binding.allowed_columns,
+                allow_project_member_rows=binding.allow_project_member_rows,
             )
-        )
-        return settings, repository, PreparedBusinessDatabaseAccess(identity, metadata, guard)
+        except nl2sql_errors.PolicyDenial as exc:
+            raise BusinessDatabaseAuthorizationError(f"{exc.code}: {exc.message}") from exc
 
 
-def _without_internal_columns(
-    metadata: dict[str, list[dict[str, Any]]],
-) -> dict[str, list[dict[str, Any]]]:
-    """从模型可见 schema 中移除守卫内部列。
-
-    只在构造 selectable_columns 与对外 schema 时使用；table_columns 必须保留这些列，
-    否则守卫无法注入 OPERATER_STATUS > 0。
-    """
-    stripped: dict[str, list[dict[str, Any]]] = {}
-    for table_name, columns in metadata.items():
-        visible = [column for column in columns if str(column["COLUMN_NAME"]).upper() not in INTERNAL_STATUS_COLUMNS]
-        if not visible:
-            raise BusinessDatabaseConfigurationError(f"表 {table_name} 没有可授权字段")
-        stripped[table_name] = visible
-    return stripped
-
-
-def _filter_metadata(
+def _visible_metadata(
     raw_metadata: dict[str, list[dict[str, Any]]],
-    allowed_columns: dict[str, frozenset[str]],
+    selectable_columns: Mapping[str, frozenset[str]],
 ) -> dict[str, list[dict[str, Any]]]:
-    filtered: dict[str, list[dict[str, Any]]] = {}
+    """按策略的 selectable_columns 裁剪模型可见 schema。
+
+    模型可见列的唯一来源是策略，不在服务层重新推导——否则容易出现
+    「守卫按策略校验、schema 按另一套展示」这种两套口径不一致的缺陷。
+    守卫内部列（租户/状态）因此不会出现在模型可见结构里。
+    """
+    visible: dict[str, list[dict[str, Any]]] = {}
     for table_name, columns in raw_metadata.items():
-        requested = allowed_columns.get(table_name)
-        visible: list[dict[str, Any]] = []
+        allowed = selectable_columns.get(table_name.lower())
+        if not allowed:
+            continue
+        kept: list[dict[str, Any]] = []
         for column in columns:
             column_name = str(column["COLUMN_NAME"]).upper()
             if column_name in PERMANENTLY_DENIED_COLUMNS or column_name.endswith(PERMANENTLY_DENIED_SUFFIXES):
                 continue
-            if requested is not None and column_name not in requested:
+            if column_name not in allowed:
                 continue
-            visible.append(column)
-        if not visible:
+            kept.append(column)
+        if not kept:
             raise BusinessDatabaseConfigurationError(f"表 {table_name} 没有可授权字段")
-        filtered[table_name] = visible
-    return filtered
+        visible[table_name] = kept
+    return visible
+
+
+def _mysql_directory(connection: BusinessDatabaseConnection) -> MySqlBusinessDirectory:
+    """给解析器用的只读连接工厂。
+
+    解析器每条查询各开一条连接（`MySqlBusinessDirectory` 每次调用自行开关），
+    因此多步解析会读到跨时刻的状态。spec 要求「解析在一个连接一个事务内完成」，
+    **Plan 2 必须替换该接口**；这里不假装已经满足。
+    """
+    timeout_seconds = max(1, (connection.query_timeout_ms + 999) // 1000)
+
+    def connect() -> pymysql.connections.Connection:
+        return pymysql.connect(
+            host=connection.host,
+            port=connection.port,
+            user=connection.user,
+            password=connection.password,
+            database=connection.database,
+            charset="utf8mb4",
+            connect_timeout=timeout_seconds,
+            read_timeout=timeout_seconds,
+            write_timeout=timeout_seconds,
+        )
+
+    return MySqlBusinessDirectory(connect)
 
 
 def _positive_integer(value: Any, name: str) -> int:

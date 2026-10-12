@@ -49,17 +49,31 @@ def test_inactive_user_is_denied(directory):
 
 
 def test_resolved_policy_blocks_cross_tenant_sql(directory):
-    """解析器产出的策略交给既有 SQLSecurityGuard：跨租户条件应返回空。"""
+    """解析器产出的策略交给既有 SQLSecurityGuard：租户与项目条件由守卫注入。"""
     from yuxi.services.business_database_security import SQLSecurityGuard
 
     resolved = resolve_query_policy(BusinessPrincipal(user_id=1001), directory)
-    secured = SQLSecurityGuard(resolved.policy).secure("SELECT ID FROM t_project WHERE TENANT_ID = 99")
+    secured = SQLSecurityGuard(resolved.policy).secure("SELECT ID FROM t_project")
     normalized = " ".join(secured.final_sql.lower().split())
     assert "tenant_id = 10" in normalized
     # 项目范围必须真正落到改写后的 SQL：两个授权项目（5001/5002）以 IN 列表限制
     # t_project.ID。若 project_scope_columns 意外为空，强制层会跳过该项目谓词，
     # 本断言随即变红——这正是本条负向控制的目的。
     assert "in (5001, 5002)" in normalized, secured.final_sql
+
+
+def test_model_cannot_reference_guard_internal_columns(directory):
+    """守卫内部列（租户/状态）模型不得引用——即便只是写进 WHERE 也要拒绝。"""
+    from yuxi.services.business_database_security import PolicyViolation, SQLSecurityGuard
+
+    resolved = resolve_query_policy(BusinessPrincipal(user_id=1001), directory)
+    for sql in (
+        "SELECT ID FROM t_project WHERE TENANT_ID = 99",
+        "SELECT ID FROM t_project WHERE OPERATER_STATUS > 0",
+    ):
+        with pytest.raises(PolicyViolation) as exc:
+            SQLSecurityGuard(resolved.policy).secure(sql)
+        assert exc.value.code == "COLUMN_NOT_ALLOWED"
 
 
 def test_resolved_policy_rejects_permanently_denied_table(directory):

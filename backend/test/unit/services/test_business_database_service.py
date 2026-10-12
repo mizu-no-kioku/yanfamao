@@ -114,25 +114,54 @@ SCHEMA = {
 }
 
 
+class FakeDirectory:
+    """实现解析器依赖的只读目录协议，不连数据库。"""
+
+    def __init__(self) -> None:
+        self.projects: tuple[int, ...] = (2, 71)
+        self.active_user = True
+        self.tenants: tuple[int, ...] = (1,)
+        self.staff_ids: tuple[int, ...] = (13,)
+        self.role_relations: tuple[int, ...] = (3001,)
+        self.active_roles: tuple[int, ...] = (3001,)
+        self.menu_ids: frozenset[int] = frozenset({253})
+        self.menu_codes: frozenset[str] = frozenset({"AI"})
+
+    def find_active_user(self, user_id: int) -> bool:
+        return self.active_user
+
+    def find_tenants_for_user(self, user_id: int) -> tuple[int, ...]:
+        return self.tenants
+
+    def find_active_staff_ids(self, user_id: int, tenant_id: int) -> tuple[int, ...]:
+        return self.staff_ids
+
+    def find_role_relation_ids(self, user_id: int, tenant_id: int) -> tuple[int, ...]:
+        return self.role_relations
+
+    def find_active_role_ids(self, role_ids: tuple[int, ...]) -> tuple[int, ...]:
+        return tuple(role_id for role_id in role_ids if role_id in self.active_roles)
+
+    def find_menu_ids(self, role_ids: tuple[int, ...], tenant_id: int) -> frozenset[int]:
+        return self.menu_ids
+
+    def find_menu_codes(self, role_ids: tuple[int, ...], tenant_id: int) -> frozenset[str]:
+        return self.menu_codes
+
+    def find_authorized_project_ids(self, tenant_id: int, staff_id: int) -> tuple[int, ...]:
+        return self.projects
+
+
 class FakeRepository:
     """记录服务调用并返回固定业务数据。"""
 
     def __init__(self, config: BusinessDatabaseConnection):
         self.config = config
-        self.identity_valid = True
-        self.project_ids = (2, 71)
         self.executed_sql: str | None = None
-
-    def validate_staff_identity(self, tenant_id: int, staff_id: int) -> bool:
-        assert (tenant_id, staff_id) == (1, 13)
-        return self.identity_valid
+        self.directory = FakeDirectory()
 
     def load_schema(self, table_names: frozenset[str]):
         return {name: SCHEMA[name] for name in table_names}
-
-    def list_project_ids(self, tenant_id: int, staff_id: int, *, allow_all_projects: bool):
-        assert (tenant_id, staff_id, allow_all_projects) == (1, 13, False)
-        return self.project_ids
 
     def execute_query(self, sql: str):
         self.executed_sql = sql
@@ -143,7 +172,7 @@ class FakeRepository:
         }
 
 
-def make_settings(identity: dict | None = None) -> BusinessDatabaseSettings:
+def make_settings(binding: dict | None = None) -> BusinessDatabaseSettings:
     """构造不含真实凭据的测试配置。"""
     return BusinessDatabaseSettings(
         connection=BusinessDatabaseConnection(
@@ -155,12 +184,10 @@ def make_settings(identity: dict | None = None) -> BusinessDatabaseSettings:
             query_timeout_ms=1000,
         ),
         identities={
-            "uid-1": identity
+            "uid-1": binding
             or {
+                "business_user_id": 17,
                 "tenant_id": 1,
-                "staff_id": 13,
-                "allowed_tables": ["t_project", "t_project_user"],
-                "allow_all_projects": False,
                 "allow_project_member_rows": False,
             }
         },
@@ -169,11 +196,13 @@ def make_settings(identity: dict | None = None) -> BusinessDatabaseSettings:
 
 
 def build_service(settings: BusinessDatabaseSettings | None = None):
-    """返回服务和可观察的假 repository。"""
-    repository = FakeRepository((settings or make_settings()).connection)
+    """返回服务和可观察的假 repository（其 directory 供解析器使用）。"""
+    resolved = settings or make_settings()
+    repository = FakeRepository(resolved.connection)
     service = BusinessDatabaseService(
-        settings_loader=lambda: settings or make_settings(),
+        settings_loader=lambda: resolved,
         repository_factory=lambda _config: repository,
+        directory_factory=lambda _config: repository.directory,
     )
     return service, repository
 
@@ -213,11 +242,10 @@ def test_service_limits_project_member_rows_to_current_staff() -> None:
 def test_service_keeps_internal_scope_columns_out_of_visible_schema() -> None:
     settings = make_settings(
         {
+            "business_user_id": 17,
             "tenant_id": 1,
-            "staff_id": 13,
             "allowed_tables": ["t_project"],
             "allowed_columns": {"t_project": ["PROJECT_NAME"]},
-            "allow_all_projects": False,
             "allow_project_member_rows": False,
         }
     )
@@ -272,28 +300,38 @@ def test_service_rejects_unmapped_uid_before_database_access() -> None:
 
 
 def test_service_rejects_invalid_staff_binding() -> None:
+    """员工编号由解析器推导；该租户下没有有效员工时应拒绝。"""
     service, repository = build_service()
-    repository.identity_valid = False
-    with pytest.raises(BusinessDatabaseAuthorizationError, match="员工"):
+    repository.directory.staff_ids = ()
+    with pytest.raises(BusinessDatabaseAuthorizationError, match="IDENTITY_STAFF_MISSING"):
         service.list_authorized_tables("uid-1")
 
 
 def test_service_rejects_queries_when_user_has_no_projects() -> None:
     service, repository = build_service()
-    repository.project_ids = ()
-    with pytest.raises(PolicyViolation) as caught:
+    repository.directory.projects = ()
+    with pytest.raises(BusinessDatabaseAuthorizationError, match="NO_PROJECT_ACCESS"):
         service.execute_authorized_query("uid-1", "SELECT ID FROM t_project")
-    assert caught.value.code == "NO_PROJECT_ACCESS"
 
 
-def test_settings_reject_unaudited_table() -> None:
+def test_service_rejects_function_gate_denial() -> None:
+    """没有 AI 功能菜单的身份必须被拒绝，且不得产生任何 SQL。"""
+    service, repository = build_service()
+    repository.directory.menu_ids = frozenset({900, 901})
+    with pytest.raises(BusinessDatabaseAuthorizationError, match="FUNCTION_GATE_DENIED"):
+        service.execute_authorized_query("uid-1", "SELECT ID FROM t_project")
+    assert repository.executed_sql is None
+
+
+def test_env_table_narrowing_cannot_widen_beyond_grant() -> None:
+    """环境变量层只能收紧：不在授权范围内的表取不到，收紧到空即拒绝。"""
     settings = make_settings(
         {
+            "business_user_id": 17,
             "tenant_id": 1,
-            "staff_id": 13,
             "allowed_tables": ["t_user"],
-            "allow_all_projects": False,
         }
     )
-    with pytest.raises(RuntimeError, match="尚未完成权限审计"):
-        settings.resolve_identity("uid-1")
+    service, _ = build_service(settings)
+    with pytest.raises(BusinessDatabaseAuthorizationError, match="FUNCTION_GATE_DENIED"):
+        service.list_authorized_tables("uid-1")
