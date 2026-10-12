@@ -1,14 +1,16 @@
 """BusinessDirectory 的 MySQL 实现。
 
-每次查询各自开一条新连接、用完即关；一次 resolve_query_policy 的多步读取
-来自不同时刻，不存在共享快照。解析内部的单事务一致性需 Plan 2 替换本接口，
-本层不得声称以只读事务运行。
+**一致性边界**：默认构造（`MySqlBusinessDirectory(connect)`）下，每次查询各自开一条
+新连接、用完即关——一次 `resolve_query_policy` 的多步读取来自不同时刻，**没有共享快照**。
+需要解析内部一致性的调用方应当用 `single_transaction_directory()`：它把整次解析绑定到
+同一条连接、同一个只读事务，配合 MySQL 可重复读得到一致快照。
 
-关键：角色基数走 tb_user_enterprise_role_tenant 的原始行，
+关键：角色基数走 `tb_user_enterprise_role_tenant` 的原始行，
 不 JOIN 角色—菜单表——否则一个多菜单角色会被放大成上百行。
 """
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
 
 import pymysql
 
@@ -189,3 +191,40 @@ def business_connection_factory() -> ConnectionFactory:
 def business_directory_from_env() -> MySqlBusinessDirectory:
     """Build a read-only directory using the existing deployment configuration."""
     return MySqlBusinessDirectory(business_connection_factory())
+
+
+class _SharedConnection:
+    """把一条共享连接伪装成「每次新开」的连接。
+
+    目录的每个方法都会在 finally 里 `close()`。这里把 close 变成 no-op，
+    使整次解析复用同一条连接与同一个事务；真正的关闭交给外层上下文管理器。
+    """
+
+    def __init__(self, connection: "pymysql.connections.Connection") -> None:
+        self._connection = connection
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._connection, name)
+
+    def close(self) -> None:
+        """不关闭：由 single_transaction_directory 负责。"""
+
+
+@contextmanager
+def single_transaction_directory(connect: ConnectionFactory) -> Iterator[MySqlBusinessDirectory]:
+    """把一次权限解析绑定到同一条连接、同一个只读事务。
+
+    MySQL 默认可重复读：事务内的多次读取命中同一快照，因此身份、角色、菜单与
+    项目范围来自同一时刻，不会拼出一个跨时刻的策略。
+
+    注意：本上下文只覆盖**解析**。业务查询的执行仍走仓库自己的连接，
+    因此「解析与执行同一快照」尚未满足——那需要执行也接入这条事务。
+    """
+    connection = connect()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("SET SESSION TRANSACTION READ ONLY")
+            cursor.execute("START TRANSACTION READ ONLY")
+        yield MySqlBusinessDirectory(lambda: _SharedConnection(connection))
+    finally:
+        connection.close()

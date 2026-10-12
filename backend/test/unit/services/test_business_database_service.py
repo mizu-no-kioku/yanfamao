@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 from decimal import Decimal
 
 import pytest
@@ -202,7 +203,7 @@ def build_service(settings: BusinessDatabaseSettings | None = None):
     service = BusinessDatabaseService(
         settings_loader=lambda: resolved,
         repository_factory=lambda _config: repository,
-        directory_factory=lambda _config: repository.directory,
+        directory_scope=lambda _config: nullcontext(repository.directory),
     )
     return service, repository
 

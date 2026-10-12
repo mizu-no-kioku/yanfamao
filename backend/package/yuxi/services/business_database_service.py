@@ -6,6 +6,7 @@ import json
 import os
 import time
 from collections.abc import Callable, Mapping
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from datetime import date, datetime, time as datetime_time
 from decimal import Decimal
@@ -15,7 +16,7 @@ import pymysql
 
 from yuxi.nl2sql import errors as nl2sql_errors
 from yuxi.nl2sql.directory import BusinessDirectory
-from yuxi.nl2sql.mysql_directory import MySqlBusinessDirectory
+from yuxi.nl2sql.mysql_directory import single_transaction_directory
 from yuxi.nl2sql.policy_resolver import ResolvedPolicy, resolve_query_policy
 from yuxi.nl2sql.principal import BusinessPrincipal
 from yuxi.repositories.business_database_repository import (
@@ -183,12 +184,13 @@ class BusinessDatabaseService:
         repository_factory: Callable[
             [BusinessDatabaseConnection], BusinessDatabaseRepository
         ] = BusinessDatabaseRepository,
-        directory_factory: Callable[[BusinessDatabaseConnection], BusinessDirectory] | None = None,
+        directory_scope: Callable[[BusinessDatabaseConnection], AbstractContextManager[BusinessDirectory]]
+        | None = None,
     ):
         self._settings_loader = settings_loader
         self._repository_factory = repository_factory
-        # 延迟解析：模块级工厂函数定义在类之后，直接做默认参数会在类定义时求值失败。
-        self._directory_factory = directory_factory or _mysql_directory
+        # 延迟解析：模块级上下文管理器定义在类之后，直接做默认参数会在类定义时求值失败。
+        self._directory_scope = directory_scope or _single_transaction_directory_scope
 
     def list_authorized_tables(self, uid: str) -> list[dict[str, str]]:
         """列出当前用户可供模型选择的业务表。"""
@@ -275,15 +277,15 @@ class BusinessDatabaseService:
 
         不缓存结果：撤权必须在下一次执行前生效，缓存会让旧授权继续放行。
         """
-        directory = self._directory_factory(settings.connection)
         try:
-            return resolve_query_policy(
-                BusinessPrincipal(user_id=binding.business_user_id, tenant_id=binding.tenant_id),
-                directory,
-                allowed_tables=binding.allowed_tables,
-                allowed_columns=binding.allowed_columns,
-                allow_project_member_rows=binding.allow_project_member_rows,
-            )
+            with self._directory_scope(settings.connection) as directory:
+                return resolve_query_policy(
+                    BusinessPrincipal(user_id=binding.business_user_id, tenant_id=binding.tenant_id),
+                    directory,
+                    allowed_tables=binding.allowed_tables,
+                    allowed_columns=binding.allowed_columns,
+                    allow_project_member_rows=binding.allow_project_member_rows,
+                )
         except nl2sql_errors.PolicyDenial as exc:
             raise BusinessDatabaseAuthorizationError(f"{exc.code}: {exc.message}") from exc
 
@@ -317,13 +319,8 @@ def _visible_metadata(
     return visible
 
 
-def _mysql_directory(connection: BusinessDatabaseConnection) -> MySqlBusinessDirectory:
-    """给解析器用的只读连接工厂。
-
-    解析器每条查询各开一条连接（`MySqlBusinessDirectory` 每次调用自行开关），
-    因此多步解析会读到跨时刻的状态。spec 要求「解析在一个连接一个事务内完成」，
-    **Plan 2 必须替换该接口**；这里不假装已经满足。
-    """
+def _mysql_connection_factory(connection: BusinessDatabaseConnection) -> Callable[[], pymysql.connections.Connection]:
+    """解析器用的只读连接工厂。连接的真实生命周期由 single_transaction_directory 管理。"""
     timeout_seconds = max(1, (connection.query_timeout_ms + 999) // 1000)
 
     def connect() -> pymysql.connections.Connection:
@@ -334,12 +331,20 @@ def _mysql_directory(connection: BusinessDatabaseConnection) -> MySqlBusinessDir
             password=connection.password,
             database=connection.database,
             charset="utf8mb4",
+            cursorclass=pymysql.cursors.Cursor,
             connect_timeout=timeout_seconds,
             read_timeout=timeout_seconds,
             write_timeout=timeout_seconds,
         )
 
-    return MySqlBusinessDirectory(connect)
+    return connect
+
+
+def _single_transaction_directory_scope(
+    connection: BusinessDatabaseConnection,
+) -> AbstractContextManager[BusinessDirectory]:
+    """默认的解析作用域：一条连接、一个只读事务。"""
+    return single_transaction_directory(_mysql_connection_factory(connection))
 
 
 def _positive_integer(value: Any, name: str) -> int:

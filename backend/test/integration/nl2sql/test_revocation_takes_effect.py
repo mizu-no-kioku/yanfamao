@@ -9,7 +9,9 @@ from __future__ import annotations
 import pymysql
 import pytest
 
-from yuxi.nl2sql.mysql_directory import MySqlBusinessDirectory
+from yuxi.nl2sql.mysql_directory import MySqlBusinessDirectory, single_transaction_directory
+from yuxi.nl2sql.policy_resolver import resolve_query_policy
+from yuxi.nl2sql.principal import BusinessPrincipal
 from yuxi.nl2sql.test_database import require_test_database
 from yuxi.repositories.business_database_repository import BusinessDatabaseConnection
 from yuxi.services.business_database_service import (
@@ -57,7 +59,7 @@ def service_and_config():
         query_timeout_ms=10_000,
     )
 
-    def directory_factory(_connection):
+    def directory_scope(_connection):
         def connect():
             return pymysql.connect(
                 host=config.host,
@@ -70,7 +72,9 @@ def service_and_config():
                 read_timeout=15,
             )
 
-        return MySqlBusinessDirectory(connect)
+        # 用真实的单事务目录：这条路径正是「解析绑定到一条连接一个事务」的实现，
+        # 换成假对象就测不到它。
+        return single_transaction_directory(connect)
 
     settings = BusinessDatabaseSettings(
         connection=connection,
@@ -79,7 +83,7 @@ def service_and_config():
     )
     service = BusinessDatabaseService(
         settings_loader=lambda: settings,
-        directory_factory=directory_factory,
+        directory_scope=directory_scope,
     )
     _set_role_status(config, 1)
     try:
@@ -114,3 +118,40 @@ def test_restoring_the_role_restores_access(service_and_config):
     _set_role_status(config, 1)
     after = service.execute_authorized_query("probe-uid", "SELECT ID FROM t_project")
     assert after["row_count"] > 0
+
+
+def _counting_connect(config, counter):
+    def connect():
+        counter.append(1)
+        return pymysql.connect(
+            host=config.host,
+            port=config.port,
+            user=config.app_user,
+            password=config.app_password.get_secret_value(),
+            database=config.database,
+            charset="utf8mb4",
+            connect_timeout=5,
+            read_timeout=15,
+        )
+
+    return connect
+
+
+def test_resolution_runs_in_a_single_connection():
+    """整次解析必须只用一条连接，否则多步读取来自不同时刻、拼出跨时刻的策略。
+
+    带对照：默认构造的目录为每次查询各开一条连接，会用到不止一条——
+    两者比对说明本断言确实在测「单连接」这件事，而不是恒真。
+    """
+    config = require_test_database()
+    principal = BusinessPrincipal(user_id=SEEDED_USER_ID, tenant_id=10)
+
+    scoped_calls: list[int] = []
+    with single_transaction_directory(_counting_connect(config, scoped_calls)) as directory:
+        resolve_query_policy(principal, directory)
+    assert len(scoped_calls) == 1, f"单事务作用域应只开一条连接，实际 {len(scoped_calls)} 条"
+
+    plain_calls: list[int] = []
+    plain_directory = MySqlBusinessDirectory(_counting_connect(config, plain_calls))
+    resolve_query_policy(principal, plain_directory)
+    assert len(plain_calls) > 1, "对照组本应多次开连接；若为 1 说明对照失效，本测试无法证明单连接"
