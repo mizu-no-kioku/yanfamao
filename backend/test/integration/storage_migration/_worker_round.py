@@ -205,6 +205,12 @@ class WorkerRoundMutex:
         finally:
             self.close()
 
+    @property
+    def url(self) -> str:
+        """这把锁所属的 Redis 目标——启动前要和 worker 要连的目标比对，否则锁挡不住第二条路径。"""
+
+        return self._url
+
     def close(self) -> None:
         self._client.close()
 
@@ -255,6 +261,7 @@ class WorkerRound:
     captured: CapturedProcess | None = None
     worker_id: str | None = None
     lease_lost: bool = False
+    watchdog_error: BaseException | None = None
     watchdog_stop: threading.Event | None = None
     watchdog: threading.Thread | None = None
 
@@ -330,11 +337,17 @@ def start_worker_round(
     """
 
     assert_redis_is_not_the_development_instance()
+    redis_url = redis_test_url()
+    # 锁必须绑在**同一个目标**上：只在 A 实例持锁、却去 B 实例起 worker，锁就等于没有。
+    if _redis_target(mutex.url) != _redis_target(redis_url):
+        raise RuntimeError(
+            f"互斥租约属于 {describe_redis(mutex.url)}，而本轮 worker 要连 {describe_redis(redis_url)}——"
+            "不是同一个目标，这把锁挡不住第二条启动路径。"
+        )
     mutex.check()
 
     root = new_round_root()
     roots, child_cwd = build_round_roots(root)
-    redis_url = redis_test_url()
     round_ = WorkerRound(
         root=root,
         roots=roots,
@@ -380,10 +393,15 @@ def _start_lease_watchdog(round_: WorkerRound, mutex: WorkerRoundMutex, *, inter
         while not stop.wait(interval):
             try:
                 mutex.check()
-            except BaseException:
+            except BaseException as exc:
                 round_.lease_lost = True
+                round_.watchdog_error = exc
                 if round_.captured is not None:
-                    round_.captured.reap()
+                    try:
+                        round_.captured.reap()
+                    except BaseException as reap_exc:
+                        # 回收失败也必须传回主线程——线程里吞掉的异常等于没发生。
+                        round_.watchdog_error = reap_exc
                 return
 
     round_.watchdog = threading.Thread(target=watchdog, daemon=True)
@@ -435,6 +453,24 @@ def health_record_values(redis_url: str) -> dict[str, str | None]:
         return {key: None if (value := client.get(key)) is None else value.decode() for key in HEALTH_KEYS}
     finally:
         client.close()
+
+
+def raise_if_round_failed(round_: WorkerRound) -> None:
+    """把"这一轮其实已经不成立"变成一次**真正的失败**。
+
+    看门狗只在后台线程里回收并置标记；没人把它变成异常的话，夹具就只是"保留了产物"，
+    用例照样可能绿——健康键在 worker 死后还会活到 TTL，靠它们做的断言完全可能仍然通过。
+    调用时机是"先回收、先保留产物，再报错"，所以失败时现场还在。
+    """
+
+    if not round_.lease_lost:
+        return
+    detail = ""
+    if round_.watchdog_error is not None:
+        detail = f"（{type(round_.watchdog_error).__name__}: {round_.watchdog_error}）"
+    raise RuntimeError(
+        f"本轮丢掉了互斥租约，worker 已被回收——本次验收不成立{detail}。临时根：{round_.root}"
+    )
 
 
 def stop_worker_round(round_: WorkerRound, *, keep_artifacts: bool) -> None:

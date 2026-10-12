@@ -62,12 +62,14 @@ class CapturedProcess:
 
         可重入：看门狗与 teardown 都可能调用它。整组消失后**还要等读线程收尾**——
         否则"回收返回了"不等于"日志写完了"，紧接着读日志或删目录就会与读线程抢。
+
+        `_reaped` **只在全部成功之后**才置位：先置位的话，一旦信号/退出检查/日志收尾中途失败，
+        后续 teardown 会直接返回，既不重试也不再报原来的错——失败就被静默吞掉了。
         """
 
         with self._reap_lock:
             if self._reaped:
                 return
-            self._reaped = True
             self._signal_group(signal.SIGTERM)
             self._wait_leader(grace_seconds)
             if self.group_is_alive():
@@ -80,6 +82,7 @@ class CapturedProcess:
                 else:
                     raise RuntimeError(f"进程组 {self.pgid} 在 SIGKILL 后仍有成员存活")
             self._join_reader()
+            self._reaped = True
 
     def _join_reader(self, *, timeout: float = 15.0) -> None:
         """等读线程把管道读完并关闭日志文件。`with open(...)` 退出即刷新。"""

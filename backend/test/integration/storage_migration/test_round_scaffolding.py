@@ -89,6 +89,35 @@ def test_starting_a_worker_refuses_a_lease_that_is_not_held() -> None:
         mutex.close()
 
 
+def test_starting_a_worker_refuses_a_valid_lease_on_another_target() -> None:
+    """在别的目标上**真的持有**租约也不算数：锁必须绑在 worker 要连的那个实例与库上。
+
+    这里用同一个实例的另一个 DB 号（`/1`）构造"有效但不属于本轮目标"的租约——它确实被持有，
+    但挡不住指向 `/0` 的第二条启动路径。
+    """
+
+    url = worker_round_module.redis_test_url()
+    parsed = urlparse(url)
+    other_target = f"redis://{parsed.hostname}:{parsed.port}/1"
+    other = WorkerRoundMutex(other_target)
+    client = _redis_client(url)
+    planted = {key: b"planted-by-the-test" for key in HEALTH_KEYS}
+    try:
+        other.__enter__()
+        for key, value in planted.items():
+            client.set(key, value)
+
+        with pytest.raises(RuntimeError, match="不是同一个目标"):
+            worker_round_module.start_worker_round(mutex=other)
+
+        assert {key: client.get(key) for key in HEALTH_KEYS} == planted, "拒绝前就删了健康键"
+    finally:
+        other.__exit__(None, None, None)
+        for key in HEALTH_KEYS:
+            client.delete(key)
+        client.close()
+
+
 def test_a_default_port_alias_is_rejected(monkeypatch) -> None:
     """`redis://h/0` 与 `redis://h:6379/0` 是同一个目标——字符串不等，归一化后必须相等。"""
 
@@ -229,6 +258,9 @@ def test_losing_the_lease_reaps_the_real_worker_and_fails_the_round(migrated_tes
         assert round_.captured.process.poll() is not None, "丢锁之后 worker 进程组没有被回收"
         assert round_.captured.group_is_alive() is False
         assert worker_round_module.must_keep_artifacts(round_) is True, "丢锁那一轮的产物不该被清理"
+        # 关键的一条：光"保留产物"不算失败——夹具要的就是这里抛出去（否则断言仍可能绿）。
+        with pytest.raises(RuntimeError, match="丢掉了互斥租约"):
+            worker_round_module.raise_if_round_failed(round_)
     finally:
         # 判定为"应保留"之后，本用例自己把它清掉：它是自检用例，不是真失败。
         if round_ is not None:
@@ -293,6 +325,31 @@ def test_the_log_contains_the_child_last_line_after_the_reaper_returns(tmp_path:
     finally:
         captured.reap()
     assert "line-4" in captured.log_path.read_text(encoding="utf-8"), "回收返回后日志里还缺最后一行"
+
+
+def test_a_failed_reap_is_not_memoized_as_success(tmp_path: Path, monkeypatch) -> None:
+    """回收中途失败不能记成"已完成"：否则后续 teardown 直接返回，既不重试也不再报原错。"""
+
+    captured = _spawn_sleeper(tmp_path, "import time; time.sleep(120)")
+    attempts: list[int] = []
+    original = CapturedProcess._join_reader
+
+    def failing_join(self, *, timeout: float = 15.0) -> None:
+        attempts.append(1)
+        raise RuntimeError("读线程没收尾")
+
+    monkeypatch.setattr(CapturedProcess, "_join_reader", failing_join)
+    with pytest.raises(RuntimeError, match="读线程没收尾"):
+        captured.reap()
+    assert captured._reaped is False, "回收失败却被记成已完成，第二次会静默跳过"
+
+    with pytest.raises(RuntimeError, match="读线程没收尾"):
+        captured.reap()
+    assert len(attempts) == 2, "第二次回收没有真的重试"
+
+    monkeypatch.setattr(CapturedProcess, "_join_reader", original)
+    captured.reap()
+    assert captured._reaped is True
 
 
 def test_the_reaper_kills_a_descendant_that_ignores_sigterm(tmp_path: Path) -> None:

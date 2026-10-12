@@ -104,7 +104,9 @@ def worker_round(migrated_test_database: MigrationRound) -> Iterator[WorkerRound
         try:
             yield round_
         finally:
+            # 顺序是有意的：先回收整组、先保留产物，再报错——失败时现场还在。
             worker_round_module.stop_worker_round(
                 round_,
                 keep_artifacts=keep_artifacts(round_failed=worker_round_module.must_keep_artifacts(round_)),
             )
+            worker_round_module.raise_if_round_failed(round_)
