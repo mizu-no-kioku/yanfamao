@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import pytest
+from sqlalchemy.engine import make_url
 
 import _tenant_schema_test_db as guard
 
@@ -76,12 +77,20 @@ async def test_a_marker_not_set_on_the_command_line_is_rejected(monkeypatch):
 
 
 async def test_the_failure_messages_never_leak_the_password(monkeypatch):
-    """报错会进日志与 CI 输出，绝不能带密码。"""
+    """报错会进日志与 CI 输出，绝不能带密码。
+
+    断言用的是**本次实际配置的凭证**，不是固定的 `postgres:postgres`——写死一个值的话，
+    换了密码这条用例就形同虚设；而断言"不含 `@`"又会误伤合法信息（比如 URL 里的 host 形式）。
+    """
+
+    url = make_url(guard.tenant_schema_url())
+    assert url.password, "测试库 URL 没有密码，这条用例覆盖不到任何东西"
+    credential = f"{url.username}:{url.password}"
 
     monkeypatch.setenv("POSTGRES_TEST_CLUSTER_MARKER", "not-this-instance")
     with pytest.raises(RuntimeError) as excinfo:
         await guard.assert_target_is_the_test_instance(force=True)
 
     message = str(excinfo.value)
-    assert "postgres:postgres" not in message
-    assert "@" not in message
+    assert credential not in message, "整段凭证出现在错误信息里"
+    assert url.password not in message, "密码出现在错误信息里"
