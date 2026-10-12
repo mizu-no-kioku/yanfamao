@@ -210,6 +210,15 @@ class _SharedConnection:
         """不关闭：由 single_transaction_directory 负责。"""
 
 
+def directory_on_connection(connection: "pymysql.connections.Connection") -> MySqlBusinessDirectory:
+    """把目录绑定到调用方已开启的连接与事务。
+
+    目录内的方法不会关闭这条连接（`_SharedConnection.close()` 是 no-op），
+    因此调用方可以让权限解析与最终 SQL 共处同一条连接、同一个事务。
+    """
+    return MySqlBusinessDirectory(lambda: _SharedConnection(connection))
+
+
 @contextmanager
 def single_transaction_directory(connect: ConnectionFactory) -> Iterator[MySqlBusinessDirectory]:
     """把一次权限解析绑定到同一条连接、同一个只读事务。
@@ -225,6 +234,6 @@ def single_transaction_directory(connect: ConnectionFactory) -> Iterator[MySqlBu
         with connection.cursor() as cursor:
             cursor.execute("SET SESSION TRANSACTION READ ONLY")
             cursor.execute("START TRANSACTION READ ONLY")
-        yield MySqlBusinessDirectory(lambda: _SharedConnection(connection))
+        yield directory_on_connection(connection)
     finally:
         connection.close()

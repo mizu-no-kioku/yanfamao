@@ -5,8 +5,8 @@ from __future__ import annotations
 import json
 import os
 import time
-from collections.abc import Callable, Mapping
-from contextlib import AbstractContextManager
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime
 from datetime import time as datetime_time
@@ -16,7 +16,7 @@ from typing import Any
 import pymysql
 from yuxi.nl2sql import errors as nl2sql_errors
 from yuxi.nl2sql.directory import BusinessDirectory
-from yuxi.nl2sql.mysql_directory import single_transaction_directory
+from yuxi.nl2sql.mysql_directory import directory_on_connection
 from yuxi.nl2sql.policy_resolver import ResolvedPolicy, resolve_query_policy
 from yuxi.nl2sql.principal import BusinessPrincipal
 from yuxi.repositories.business_database_repository import (
@@ -167,12 +167,26 @@ class BusinessDatabaseSettings:
 
 
 @dataclass(frozen=True)
+class BusinessQueryScope:
+    """一次业务库工具调用共用的只读连接与解析目录。
+
+    解析与最终 SQL 必须落在这同一条连接、同一个事务上，才能保证策略所依据的
+    权限快照与查询所依据的数据快照是同一份。
+    """
+
+    connection: pymysql.connections.Connection
+    directory: BusinessDirectory
+
+
+@dataclass(frozen=True)
 class PreparedBusinessDatabaseAccess:
     """完成身份、Schema 和项目授权解析后的执行上下文。"""
 
     resolved: ResolvedPolicy
     metadata: dict[str, list[dict[str, Any]]]
     guard: SQLSecurityGuard
+    repository: BusinessDatabaseRepository
+    connection: pymysql.connections.Connection
 
 
 class BusinessDatabaseService:
@@ -184,75 +198,79 @@ class BusinessDatabaseService:
         repository_factory: Callable[
             [BusinessDatabaseConnection], BusinessDatabaseRepository
         ] = BusinessDatabaseRepository,
-        directory_scope: Callable[[BusinessDatabaseConnection], AbstractContextManager[BusinessDirectory]]
-        | None = None,
+        query_scope: Callable[[BusinessDatabaseConnection], AbstractContextManager[BusinessQueryScope]] | None = None,
     ):
         self._settings_loader = settings_loader
         self._repository_factory = repository_factory
         # 延迟解析：模块级上下文管理器定义在类之后，直接做默认参数会在类定义时求值失败。
-        self._directory_scope = directory_scope or _single_transaction_directory_scope
+        self._query_scope = query_scope or mysql_query_scope
 
     def list_authorized_tables(self, uid: str) -> list[dict[str, str]]:
         """列出当前用户可供模型选择的业务表。"""
-        settings, repository, access = self._prepare(uid)
-        del settings, repository
-        return [
-            {
-                "table_name": table_name,
-                "comment": str(columns[0].get("TABLE_COMMENT") or ""),
-            }
-            for table_name, columns in sorted(access.metadata.items())
-        ]
+        with self._prepared(uid) as access:
+            return [
+                {
+                    "table_name": table_name,
+                    "comment": str(columns[0].get("TABLE_COMMENT") or ""),
+                }
+                for table_name, columns in sorted(access.metadata.items())
+            ]
 
     def describe_authorized_table(self, uid: str, table_name: str) -> dict[str, Any]:
         """返回当前用户可见的单表字段清单。"""
         normalized = str(table_name or "").strip().lower()
-        settings, repository, access = self._prepare(uid)
-        del settings, repository
-        if normalized not in access.metadata:
-            raise BusinessDatabaseAuthorizationError(f"当前身份无权查看表 {normalized or '<empty>'}")
-        columns = access.metadata[normalized]
-        return {
-            "table_name": normalized,
-            "comment": str(columns[0].get("TABLE_COMMENT") or ""),
-            "columns": [
-                {
-                    "name": str(column["COLUMN_NAME"]),
-                    "type": str(column["COLUMN_TYPE"]),
-                    "comment": str(column.get("COLUMN_COMMENT") or ""),
-                }
-                for column in columns
-            ],
-            "enforced_scope": "tenant + active records + authorized projects + configured staff scope",
-        }
+        with self._prepared(uid) as access:
+            if normalized not in access.metadata:
+                raise BusinessDatabaseAuthorizationError(f"当前身份无权查看表 {normalized or '<empty>'}")
+            columns = access.metadata[normalized]
+            return {
+                "table_name": normalized,
+                "comment": str(columns[0].get("TABLE_COMMENT") or ""),
+                "columns": [
+                    {
+                        "name": str(column["COLUMN_NAME"]),
+                        "type": str(column["COLUMN_TYPE"]),
+                        "comment": str(column.get("COLUMN_COMMENT") or ""),
+                    }
+                    for column in columns
+                ],
+                "enforced_scope": "tenant + active records + authorized projects + configured staff scope",
+            }
 
     def execute_authorized_query(self, uid: str, sql: str) -> dict[str, Any]:
-        """校验、重写并执行一条当前身份可访问的只读查询。"""
-        started_at = time.monotonic()
-        settings, repository, access = self._prepare(uid)
-        secured = access.guard.secure(sql)
-        result = repository.execute_query(secured.final_sql)
-        normalized_result = _json_safe(result)
-        logger.info(
-            "business database query completed uid={} tenant_id={} staff_id={} tables={} rows={} latency_ms={}",
-            uid,
-            access.resolved.subject.tenant_id,
-            access.resolved.subject.staff_id,
-            list(secured.tables),
-            normalized_result["row_count"],
-            round((time.monotonic() - started_at) * 1000, 2),
-        )
-        return {
-            **normalized_result,
-            "limit": secured.limit,
-            "tables": list(secured.tables),
-            "scope": "tenant + active records + authorized projects + configured staff scope",
-        }
+        """校验、重写并执行一条当前身份可访问的只读查询。
 
-    def _prepare(
-        self,
-        uid: str,
-    ) -> tuple[BusinessDatabaseSettings, BusinessDatabaseRepository, PreparedBusinessDatabaseAccess]:
+        解析、Schema 读取、SQL 校验与最终执行共用**同一条只读连接和同一个事务**：
+        策略与它约束的数据来自同一快照。每次调用都新建连接与事务，不缓存策略，
+        因此下一次调用必然看到已提交的撤权。
+        """
+        started_at = time.monotonic()
+        with self._prepared(uid) as access:
+            secured = access.guard.secure(sql)
+            result = access.repository.execute_query(secured.final_sql, connection=access.connection)
+            normalized_result = _json_safe(result)
+            logger.info(
+                "business database query completed uid={} tenant_id={} staff_id={} tables={} rows={} latency_ms={}",
+                uid,
+                access.resolved.subject.tenant_id,
+                access.resolved.subject.staff_id,
+                list(secured.tables),
+                normalized_result["row_count"],
+                round((time.monotonic() - started_at) * 1000, 2),
+            )
+            return {
+                **normalized_result,
+                "limit": secured.limit,
+                "tables": list(secured.tables),
+                "scope": "tenant + active records + authorized projects + configured staff scope",
+            }
+
+    @contextmanager
+    def _prepared(self, uid: str) -> Iterator[PreparedBusinessDatabaseAccess]:
+        """在一次只读连接与事务内完成解析、Schema 读取与策略构造。
+
+        `list` / `describe` / `query` 都走这里，因此三者都会重新读取当前权限。
+        """
         normalized_uid = str(uid or "").strip()
         if not normalized_uid:
             raise BusinessDatabaseAuthorizationError("无法获取当前 Yuxi 用户身份")
@@ -260,32 +278,32 @@ class BusinessDatabaseService:
         binding = settings.resolve_binding(normalized_uid)
         repository = self._repository_factory(settings.connection)
 
-        resolved = self._resolve_policy(settings, binding)
-        policy = resolved.policy
+        with self._query_scope(settings.connection) as scope:
+            resolved = self._resolve_policy(binding, scope.directory)
+            policy = resolved.policy
 
-        raw_metadata = repository.load_schema(policy.allowed_tables)
-        missing_tables = policy.allowed_tables - set(raw_metadata)
-        if missing_tables:
-            raise BusinessDatabaseConfigurationError("授权表不存在：" + ", ".join(sorted(missing_tables)))
-        metadata = _visible_metadata(raw_metadata, policy.selectable_columns)
+            raw_metadata = repository.load_schema(policy.allowed_tables, connection=scope.connection)
+            missing_tables = policy.allowed_tables - set(raw_metadata)
+            if missing_tables:
+                raise BusinessDatabaseConfigurationError("授权表不存在：" + ", ".join(sorted(missing_tables)))
+            metadata = _visible_metadata(raw_metadata, policy.selectable_columns)
 
-        guard = SQLSecurityGuard(policy)
-        return settings, repository, PreparedBusinessDatabaseAccess(resolved, metadata, guard)
+            guard = SQLSecurityGuard(policy)
+            yield PreparedBusinessDatabaseAccess(resolved, metadata, guard, repository, scope.connection)
 
-    def _resolve_policy(self, settings: BusinessDatabaseSettings, binding: BusinessDatabaseBinding) -> ResolvedPolicy:
+    def _resolve_policy(self, binding: BusinessDatabaseBinding, directory: BusinessDirectory) -> ResolvedPolicy:
         """每次调用都重新解析身份、功能门、资源与项目范围。
 
-        不缓存结果：撤权必须在下一次执行前生效，缓存会让旧授权继续放行。
+        不缓存结果：撤权必须在下一次调用开始的新事务里可见，缓存会让旧授权继续放行。
         """
         try:
-            with self._directory_scope(settings.connection) as directory:
-                return resolve_query_policy(
-                    BusinessPrincipal(user_id=binding.business_user_id, tenant_id=binding.tenant_id),
-                    directory,
-                    allowed_tables=binding.allowed_tables,
-                    allowed_columns=binding.allowed_columns,
-                    allow_project_member_rows=binding.allow_project_member_rows,
-                )
+            return resolve_query_policy(
+                BusinessPrincipal(user_id=binding.business_user_id, tenant_id=binding.tenant_id),
+                directory,
+                allowed_tables=binding.allowed_tables,
+                allowed_columns=binding.allowed_columns,
+                allow_project_member_rows=binding.allow_project_member_rows,
+            )
         except nl2sql_errors.PolicyDenial as exc:
             raise BusinessDatabaseAuthorizationError(f"{exc.code}: {exc.message}") from exc
 
@@ -340,11 +358,28 @@ def _mysql_connection_factory(connection: BusinessDatabaseConnection) -> Callabl
     return connect
 
 
-def _single_transaction_directory_scope(
+@contextmanager
+def mysql_query_scope(
     connection: BusinessDatabaseConnection,
-) -> AbstractContextManager[BusinessDirectory]:
-    """默认的解析作用域：一条连接、一个只读事务。"""
-    return single_transaction_directory(_mysql_connection_factory(connection))
+    *,
+    connect: Callable[[], pymysql.connections.Connection] | None = None,
+) -> Iterator[BusinessQueryScope]:
+    """默认作用域：一条只读连接 + 一个只读事务，供解析与最终 SQL 共用。
+
+    连接由本函数创建并负责关闭；目录绑定在它上面，不会自行关闭。
+    撤权生效边界：下一次工具调用会开启新的连接与事务，因此已提交的撤权必然可见。
+
+    `connect` 可替换连接来源（例如测试中计数，或将来的连接池）。
+    """
+    active = (connect or _mysql_connection_factory(connection))()
+    try:
+        with active.cursor() as cursor:
+            cursor.execute("SET SESSION TRANSACTION READ ONLY")
+            cursor.execute(f"SET SESSION MAX_EXECUTION_TIME = {connection.query_timeout_ms}")
+            cursor.execute("START TRANSACTION READ ONLY")
+        yield BusinessQueryScope(connection=active, directory=directory_on_connection(active))
+    finally:
+        active.close()
 
 
 def _positive_integer(value: Any, name: str) -> int:

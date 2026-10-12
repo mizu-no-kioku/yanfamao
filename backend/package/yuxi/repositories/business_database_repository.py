@@ -44,8 +44,13 @@ class BusinessDatabaseRepository:
         )
         return bool(rows)
 
-    def load_schema(self, table_names: frozenset[str]) -> dict[str, list[dict[str, Any]]]:
-        """读取授权基础表的字段和注释。"""
+    def load_schema(
+        self,
+        table_names: frozenset[str],
+        *,
+        connection: pymysql.Connection | None = None,
+    ) -> dict[str, list[dict[str, Any]]]:
+        """读取授权基础表的字段和注释。传入 `connection` 时复用调用方的连接。"""
         names = sorted(table_names)
         if not names:
             return {}
@@ -69,6 +74,7 @@ class BusinessDatabaseRepository:
             ORDER BY c.TABLE_NAME, c.ORDINAL_POSITION
             """,
             tuple(names),
+            connection=connection,
         )
         metadata: dict[str, list[dict[str, Any]]] = {}
         for row in rows:
@@ -106,20 +112,40 @@ class BusinessDatabaseRepository:
             )
         return tuple(int(row["ID"]) for row in rows)
 
-    def execute_query(self, sql: str) -> dict[str, Any]:
-        """执行已经通过安全校验和重写的查询。"""
-        with self._connection() as connection, connection.cursor() as cursor:
+    def execute_query(self, sql: str, *, connection: pymysql.Connection | None = None) -> dict[str, Any]:
+        """执行已经通过安全校验和重写的查询。
+
+        传入 `connection` 时复用它，并且**不关闭**它——由调用方负责关闭与事务边界。
+        因此权限解析与最终 SQL 可以处在同一条连接、同一个事务里。
+        游标类型显式指定为 DictCursor：借来的连接可能是按位置取值的游标类。
+        """
+        with self._session(connection) as active, active.cursor(DictCursor) as cursor:
             cursor.execute(sql)
             rows = list(cursor.fetchall())
             fields = [item[0] for item in (cursor.description or [])]
         return {"row_count": len(rows), "fields": fields, "rows": rows}
 
-    def _internal_select(self, sql: str, params: tuple[Any, ...]) -> list[dict[str, Any]]:
+    def _internal_select(
+        self,
+        sql: str,
+        params: tuple[Any, ...],
+        *,
+        connection: pymysql.Connection | None = None,
+    ) -> list[dict[str, Any]]:
         if not sql.lstrip().upper().startswith("SELECT"):
             raise ValueError("内部业务数据库方法只允许 SELECT")
-        with self._connection() as connection, connection.cursor() as cursor:
+        with self._session(connection) as active, active.cursor(DictCursor) as cursor:
             cursor.execute(sql, params)
             return list(cursor.fetchall())
+
+    @contextmanager
+    def _session(self, borrowed: pymysql.Connection | None) -> Iterator[pymysql.Connection]:
+        """借用调用方的连接时不关闭它；只有本层自建的连接才由本层关闭。"""
+        if borrowed is not None:
+            yield borrowed
+            return
+        with self._connection() as connection:
+            yield connection
 
     @contextmanager
     def _connection(self) -> Iterator[pymysql.Connection]:

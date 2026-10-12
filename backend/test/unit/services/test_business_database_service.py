@@ -11,6 +11,7 @@ from yuxi.services.business_database_service import (
     BusinessDatabaseAuthorizationError,
     BusinessDatabaseService,
     BusinessDatabaseSettings,
+    BusinessQueryScope,
 )
 
 pytestmark = pytest.mark.unit
@@ -160,11 +161,17 @@ class FakeRepository:
         self.config = config
         self.executed_sql: str | None = None
         self.directory = FakeDirectory()
+        # 作用域提供给本次调用的连接；服务必须把它透传给 schema 读取与最终执行。
+        self.scope_connection = object()
+        # 记录每次收到的连接，供断言「解析与执行同一条连接」。
+        self.seen_connections: list[object] = []
 
-    def load_schema(self, table_names: frozenset[str]):
+    def load_schema(self, table_names: frozenset[str], *, connection=None):
+        self.seen_connections.append(connection)
         return {name: SCHEMA[name] for name in table_names}
 
-    def execute_query(self, sql: str):
+    def execute_query(self, sql: str, *, connection=None):
+        self.seen_connections.append(connection)
         self.executed_sql = sql
         return {
             "row_count": 1,
@@ -197,13 +204,15 @@ def make_settings(binding: dict | None = None) -> BusinessDatabaseSettings:
 
 
 def build_service(settings: BusinessDatabaseSettings | None = None):
-    """返回服务和可观察的假 repository（其 directory 供解析器使用）。"""
+    """返回服务和可观察的假 repository（scope_connection 与 directory 也挂在它上面）。"""
     resolved = settings or make_settings()
     repository = FakeRepository(resolved.connection)
     service = BusinessDatabaseService(
         settings_loader=lambda: resolved,
         repository_factory=lambda _config: repository,
-        directory_scope=lambda _config: nullcontext(repository.directory),
+        query_scope=lambda _config: nullcontext(
+            BusinessQueryScope(connection=repository.scope_connection, directory=repository.directory)
+        ),
     )
     return service, repository
 
@@ -228,6 +237,27 @@ def test_service_executes_only_rewritten_query_and_serializes_decimal() -> None:
     assert "t_project.id in (2, 71)" in lowered
     assert "limit 20" in lowered
     assert result["rows"][0]["GENERAL_BUDGET"] == "100.00"
+
+
+def test_query_uses_the_scope_connection_for_schema_and_execution() -> None:
+    """Schema 读取与最终 SQL 必须落在作用域提供的那一条连接上。"""
+    service, repository = build_service()
+
+    service.execute_authorized_query("uid-1", "SELECT ID, PROJECT_NAME FROM t_project")
+
+    assert len(repository.seen_connections) >= 2, "应记录到 schema 读取与执行两次调用"
+    assert {id(item) for item in repository.seen_connections} == {id(repository.scope_connection)}
+
+
+def test_list_and_describe_also_use_the_scope_connection() -> None:
+    """list / describe 同样重新解析权限，并且复用同一条作用域连接。"""
+    service, repository = build_service()
+
+    service.list_authorized_tables("uid-1")
+    service.describe_authorized_table("uid-1", "t_project")
+
+    assert repository.seen_connections, "list/describe 也应通过作用域连接读 schema"
+    assert {id(item) for item in repository.seen_connections} == {id(repository.scope_connection)}
 
 
 def test_service_limits_project_member_rows_to_current_staff() -> None:
