@@ -23,8 +23,9 @@ from contextlib import asynccontextmanager
 import pytest
 import pytest_asyncio
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from yuxi.repositories.evaluation_repository import EvaluationRepository
 from yuxi.storage.postgres.manager import (
     TENANT_RUNTIME_ROLE,
     PostgresManager,
@@ -254,6 +255,43 @@ async def test_derived_table_policy_blocks_cross_tenant_reads(isolated_tenant_sc
     assert visible == ["file-a"]
 
 
+async def test_business_chain_blocks_cross_tenant_reads_four_levels_deep(isolated_tenant_schema):
+    """`tool_calls → messages → conversations → users`：四层递归，链上没有一张表有 tenant_id。
+
+    正确性完全依赖**整条链**每一环都受有效策略保护——任何一环漏建，递归就会穿透。
+    """
+
+    manager = isolated_tenant_schema
+    await _seed(
+        manager,
+        "INSERT INTO users (uid, username, password_hash, role, login_failed_count, is_deleted, tenant_id) VALUES "
+        "('u-a', 'user-a', 'x', 'user', 0, 0, 1), ('u-b', 'user-b', 'x', 'user', 0, 0, 2)",
+        "INSERT INTO projects (id, uid, selection_status, workdir_path, directory_mode) VALUES "
+        "('proj-a', 'u-a', 'selectable', '/tmp/a', 'managed'), "
+        "('proj-b', 'u-b', 'selectable', '/tmp/b', 'managed')",
+        "INSERT INTO conversations (thread_id, uid, agent_id, project_id, is_pinned) VALUES "
+        "('thread-a', 'u-a', 'default', 'proj-a', FALSE), "
+        "('thread-b', 'u-b', 'default', 'proj-b', FALSE)",
+        "INSERT INTO messages (conversation_id, role, content, delivery_status) "
+        "SELECT c.id, 'user', 'hi', 'complete' FROM conversations c WHERE c.thread_id = 'thread-a'",
+        "INSERT INTO messages (conversation_id, role, content, delivery_status) "
+        "SELECT c.id, 'user', 'hi', 'complete' FROM conversations c WHERE c.thread_id = 'thread-b'",
+        "INSERT INTO tool_calls (message_id, tool_name) "
+        "SELECT m.id, 'search' FROM messages m JOIN conversations c ON c.id = m.conversation_id "
+        "WHERE c.thread_id = 'thread-a'",
+        "INSERT INTO tool_calls (message_id, tool_name) "
+        "SELECT m.id, 'search' FROM messages m JOIN conversations c ON c.id = m.conversation_id "
+        "WHERE c.thread_id = 'thread-b'",
+    )
+
+    assert await _count_as_tenant(manager, DEFAULT_TENANT_ID, "SELECT count(*) FROM tool_calls") == 1
+    assert await _count_as_tenant(manager, DEFAULT_TENANT_ID, "SELECT count(*) FROM messages") == 1
+    assert await _count_as_tenant(manager, DEFAULT_TENANT_ID, "SELECT count(*) FROM conversations") == 1
+    assert await _count_as_tenant(manager, DEFAULT_TENANT_ID, "SELECT count(*) FROM users") == 1
+    # 反向确认：另一个租户看得到它自己那条，说明不是"全都读不到"这种假绿。
+    assert await _count_as_tenant(manager, OTHER_TENANT_ID, "SELECT count(*) FROM tool_calls") == 1
+
+
 # --------------------------------------------------------------------------------------
 # C. 混合父引用：同租户不同知识库（RLS 抓不到）+ 跨租户
 # --------------------------------------------------------------------------------------
@@ -402,6 +440,32 @@ async def test_evaluation_runs_reject_a_dataset_from_another_knowledge_base(isol
 # --------------------------------------------------------------------------------------
 # D. 空引用：允许，且删除题目触发 SET NULL 之后结果仍可读
 # --------------------------------------------------------------------------------------
+
+
+async def test_repository_reports_a_clear_error_for_a_cross_knowledge_base_dataset_item(isolated_tenant_schema):
+    """数据库触发器是强制层；repository 这一层负责给出**看得懂**的错误。
+
+    直接拿隔离 schema 的会话调 repository，不经过 `pg_manager` 单例。没有这一层的话，调用方
+    拿到的是 `IntegrityError` 加一句通用消息，看不出是哪个题目不属于哪个知识库。
+    """
+
+    manager = isolated_tenant_schema
+    await _seed(
+        manager,
+        "INSERT INTO knowledge_bases (kb_id, name, kb_type, tenant_id) VALUES "
+        "('kb-a', 'A 的库', 'milvus', 1), ('kb-b', '丁的库', 'milvus', 1)",
+        "INSERT INTO evaluation_datasets (dataset_id, kb_id, name) VALUES ('ds-b', 'kb-b', 'B 集')",
+        "INSERT INTO evaluation_dataset_items (item_id, dataset_id, kb_id, item_index, query_text) "
+        "VALUES ('item-b', 'ds-b', 'kb-b', 0, 'q')",
+        "INSERT INTO evaluation_runs (run_id, name, kb_id) VALUES ('run-a', 'A 跑', 'kb-a')",
+    )
+
+    factory = async_sessionmaker(manager.async_engine, expire_on_commit=False)
+    async with factory() as session:
+        with pytest.raises(ValueError, match="不一致"):
+            await EvaluationRepository.upsert_run_item_in_session(
+                session, "run-a", 0, {"dataset_item_id": "item-b", "query_text": "q"}
+            )
 
 
 async def test_evaluation_run_item_allows_a_null_dataset_item(isolated_tenant_schema):

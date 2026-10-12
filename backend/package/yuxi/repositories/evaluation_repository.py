@@ -171,12 +171,38 @@ class EvaluationRepository:
                 await session.delete(record)
 
     @staticmethod
+    async def _assert_run_item_references_share_knowledge_base(
+        session, run_id: str, data: dict[str, Any]
+    ) -> None:
+        """数据库触发器是强制层，这里只是为了给出**看得懂的错误**。
+
+        触发器抛的是 `IntegrityError` 加一句通用消息，调用方看不出是哪个题目不属于哪个知识库。
+        行自身的知识库由**不可空**的 `run_id` 决定（`dataset_item_id` 可空且 `ON DELETE SET NULL`），
+        所以这里比对的是"题目所在库"与"本次运行所在库"。
+        """
+
+        dataset_item_id = data.get("dataset_item_id")
+        if not dataset_item_id:
+            return
+        run_kb = await session.scalar(select(EvaluationRun.kb_id).where(EvaluationRun.run_id == run_id))
+        if run_kb is None:
+            return
+        item_kb = await session.scalar(
+            select(EvaluationDatasetItem.kb_id).where(EvaluationDatasetItem.item_id == dataset_item_id)
+        )
+        if item_kb is not None and item_kb != run_kb:
+            raise ValueError(
+                f"评估题目 {dataset_item_id} 属于知识库 {item_kb}，与本次运行的知识库 {run_kb} 不一致"
+            )
+
+    @staticmethod
     async def upsert_run_item_in_session(
         session,
         run_id: str,
         item_index: int,
         data: dict[str, Any],
     ) -> EvaluationRunItem:
+        await EvaluationRepository._assert_run_item_references_share_knowledge_base(session, run_id, data)
         record = await session.scalar(
             select(EvaluationRunItem)
             .where(EvaluationRunItem.run_id == run_id, EvaluationRunItem.item_index == item_index)
