@@ -10,13 +10,17 @@ RLS 抓不到（两边都可见），只有引用一致性约束能抓；跨租�
 - 预期被 SQL 拒绝的用例会让事务进入失败态，因此每个"应当被拒"的语句都开**自己的事务**，
   不会污染后续断言。
 
-隔离方式照 `test_tenant_backfill.py` 的先例：共享库里的随机 schema + `search_path`，
-三个 session 级 autouse fixture 由本文件覆盖，不需要 TEST_USERNAME/TEST_PASSWORD。
+隔离方式照 `test_tenant_backfill.py` 的先例：随机 schema + `search_path`，三个 session 级 autouse
+fixture 由本文件覆盖，不需要 TEST_USERNAME/TEST_PASSWORD。
+
+**但连接来源是 `POSTGRES_TEST_URL`（独立实例），不是 `POSTGRES_URL`**：本文件的夹具会执行
+实例级全局 DDL（`CREATE ROLE yuxi_app`、`ALTER ROLE`、`GRANT ... ON SCHEMA public`），
+跑在共享开发实例上会改到共享角色与公共 schema，隔离 schema 挡不住。起测试实例：
+`docker compose --profile test-db up -d postgres-test`。缺配置或目标核对失败**直接报错，不 skip**。
 """
 
 from __future__ import annotations
 
-import os
 import uuid
 from contextlib import asynccontextmanager
 
@@ -31,6 +35,8 @@ from yuxi.storage.postgres.manager import (
     PostgresManager,
 )
 from yuxi.storage.postgres.tenant_context import DEFAULT_TENANT_ID
+
+from _tenant_schema_test_db import create_test_admin_engine, tenant_schema_url
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
 
@@ -72,11 +78,11 @@ async def isolated_tenant_schema():
     """
 
     schema = f"tenant_guardrail_{uuid.uuid4().hex[:16]}"
-    admin_engine = create_async_engine(os.environ["POSTGRES_URL"], pool_pre_ping=True)
+    admin_engine = await create_test_admin_engine()
     async with admin_engine.begin() as connection:
         await connection.execute(text(f'CREATE SCHEMA "{schema}"'))
     scoped_engine = create_async_engine(
-        os.environ["POSTGRES_URL"],
+        tenant_schema_url(),
         pool_pre_ping=True,
         connect_args={"server_settings": {"search_path": schema}},
     )

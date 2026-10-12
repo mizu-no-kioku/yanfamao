@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import uuid
 
 import pytest
@@ -13,6 +12,8 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from yuxi.storage.postgres.manager import BUSINESS_SCHEMA_VERSION, KNOWLEDGE_SCHEMA_VERSION, PostgresManager
 from yuxi.storage.postgres.models_knowledge import KnowledgeBase
+
+from _tenant_schema_test_db import create_test_admin_engine, tenant_schema_url
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
 
@@ -65,11 +66,11 @@ def _scoped_manager(engine) -> PostgresManager:
 async def _create_isolated_manager(prefix: str):
     """创建位于独立 PostgreSQL Schema 的 manager 与清理句柄。"""
     schema = f"{prefix}_{uuid.uuid4().hex[:16]}"
-    admin_engine = create_async_engine(os.environ["POSTGRES_URL"], pool_pre_ping=True)
+    admin_engine = await create_test_admin_engine()
     async with admin_engine.begin() as connection:
         await connection.execute(text(f'CREATE SCHEMA "{schema}"'))
     scoped_engine = create_async_engine(
-        os.environ["POSTGRES_URL"],
+        tenant_schema_url(),
         pool_pre_ping=True,
         connect_args={"server_settings": {"search_path": schema}},
     )
@@ -86,7 +87,7 @@ async def _drop_isolated_schema(schema: str, admin_engine, scoped_engine) -> Non
 
 async def test_schema_migration_lock_serializes_real_postgres_sessions() -> None:
     """两个 migrator 竞争同一 advisory lock 时只允许一个进入临界区。"""
-    engine = create_async_engine(os.environ["POSTGRES_URL"], pool_pre_ping=True)
+    engine = await create_test_admin_engine()
     manager = _scoped_manager(engine)
     first_entered = asyncio.Event()
     release_first = asyncio.Event()

@@ -1,13 +1,17 @@
 """默认租户建立、归属根回填，以及插入路径的租户填充。
 
-隔离 schema 上跑，不依赖运行中的 API，因此不需要 TEST_USERNAME/TEST_PASSWORD，
-只需要容器内的 POSTGRES_URL。三个 session 级 autouse fixture 由本文件覆盖，
-照 test_schema_migration_version.py 的先例。
+隔离 schema 上跑，不依赖运行中的 API，因此不需要 TEST_USERNAME/TEST_PASSWORD。
+
+**连接来源是 `POSTGRES_TEST_URL`（独立实例），不是 `POSTGRES_URL`**：本文件的夹具会执行
+实例级全局 DDL（`CREATE ROLE yuxi_app`、`ALTER ROLE`、`GRANT ... ON SCHEMA public`），
+跑在共享开发实例上会改到共享角色与公共 schema。起测试实例：
+`docker compose --profile test-db up -d postgres-test`。缺配置或核对失败**直接报错，不 skip**。
+
+三个 session 级 autouse fixture 由本文件覆盖，照 test_schema_migration_version.py 的先例。
 """
 
 from __future__ import annotations
 
-import os
 import uuid
 
 import pytest
@@ -18,6 +22,8 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from yuxi.storage.postgres.manager import DEFAULT_TENANT_ID, TENANT_ROOT_TABLES, PostgresManager
 from yuxi.storage.postgres.models_business import Department
 from yuxi.storage.postgres.tenant_context import use_tenant
+
+from _tenant_schema_test_db import create_test_admin_engine, tenant_schema_url
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
 
@@ -50,11 +56,11 @@ def _scoped_manager(engine) -> PostgresManager:
 @pytest_asyncio.fixture()
 async def isolated_tenant_schema():
     schema = f"tenant_backfill_{uuid.uuid4().hex[:16]}"
-    admin_engine = create_async_engine(os.environ["POSTGRES_URL"], pool_pre_ping=True)
+    admin_engine = await create_test_admin_engine()
     async with admin_engine.begin() as connection:
         await connection.execute(text(f'CREATE SCHEMA "{schema}"'))
     scoped_engine = create_async_engine(
-        os.environ["POSTGRES_URL"],
+        tenant_schema_url(),
         pool_pre_ping=True,
         connect_args={"server_settings": {"search_path": schema}},
     )

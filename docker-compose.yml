@@ -10,6 +10,12 @@ x-api-worker-env: &api-worker-env
   # 迁移与 DDL 仍走上面的 POSTGRES_URL（owner）。角色由 storage-migrator 幂等创建。
   POSTGRES_APP_PASSWORD: ${POSTGRES_APP_PASSWORD:-postgres}
   POSTGRES_APP_URL: ${POSTGRES_APP_URL:-postgresql+asyncpg://yuxi_app:${POSTGRES_APP_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-yuxi}}
+  # 租户集成测试的连接来源：指向**独立实例**，测试代码**不会回退**到 POSTGRES_URL。
+  # 那些用例会执行实例级全局 DDL（CREATE ROLE yuxi_app、ALTER ROLE、GRANT ... ON SCHEMA public），
+  # 跑在开发实例上会改到共享角色与公共 schema。
+  # 起法：docker compose --profile test-db up -d postgres-test
+  POSTGRES_TEST_DB: ${POSTGRES_TEST_DB:-yuxi_test}
+  POSTGRES_TEST_URL: ${POSTGRES_TEST_URL:-postgresql+asyncpg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres-test:5432/${POSTGRES_TEST_DB:-yuxi_test}}
   REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
   NEO4J_URI: ${NEO4J_URI:-bolt://graph:7687}
   NEO4J_USERNAME: ${NEO4J_USERNAME:-neo4j}
@@ -465,12 +471,12 @@ services:
     environment:
       - POSTGRES_USER=${POSTGRES_USER:-postgres}
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-postgres}
-      - POSTGRES_DB=${POSTGRES_DB:-yuxi}
+      - POSTGRES_DB=${POSTGRES_TEST_DB:-yuxi_test}
       - TZ=${TZ:-Asia/Shanghai}
     tmpfs:
       - /var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-yuxi} || exit 1"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_TEST_DB:-yuxi_test} || exit 1"]
       interval: 5s
       timeout: 3s
       retries: 30
