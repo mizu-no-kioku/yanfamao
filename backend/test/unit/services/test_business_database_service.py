@@ -59,6 +59,13 @@ SCHEMA = {
             "COLUMN_TYPE": "int",
             "COLUMN_COMMENT": "状态",
         },
+        {
+            "TABLE_NAME": "t_project",
+            "TABLE_COMMENT": "项目表",
+            "COLUMN_NAME": "ENABLE_STATUS",
+            "COLUMN_TYPE": "int",
+            "COLUMN_COMMENT": "启用状态",
+        },
     ],
     "t_project_user": [
         {
@@ -95,6 +102,13 @@ SCHEMA = {
             "COLUMN_NAME": "OPERATER_STATUS",
             "COLUMN_TYPE": "int",
             "COLUMN_COMMENT": "状态",
+        },
+        {
+            "TABLE_NAME": "t_project_user",
+            "TABLE_COMMENT": "项目人员表",
+            "COLUMN_NAME": "ENABLE_STATUS",
+            "COLUMN_TYPE": "int",
+            "COLUMN_COMMENT": "启用状态",
         },
     ],
 }
@@ -216,6 +230,39 @@ def test_service_keeps_internal_scope_columns_out_of_visible_schema() -> None:
     assert repository.executed_sql is not None
     assert "t_project.tenant_id = 1" in repository.executed_sql.lower()
     assert "t_project.id in (2, 71)" in repository.executed_sql.lower()
+
+
+def test_service_hides_internal_status_columns_from_schema() -> None:
+    """状态列是守卫内部列，模型不得看见。
+
+    原业务库用 9999 表示启用；模型一旦看见 ENABLE_STATUS 就会按常识猜 = 1，
+    把本该返回 14 个项目的查询答成 0。
+    """
+    service, _ = build_service()
+    for table in ("t_project", "t_project_user"):
+        names = {column["name"] for column in service.describe_authorized_table("uid-1", table)["columns"]}
+        assert "OPERATER_STATUS" not in names
+        assert "ENABLE_STATUS" not in names
+
+
+def test_service_rejects_query_referencing_internal_status_column() -> None:
+    """模型显式引用状态列必须被拒，且不得有任何 SQL 落到数据库。"""
+    service, repository = build_service()
+    with pytest.raises(PolicyViolation) as exc:
+        service.execute_authorized_query("uid-1", "SELECT ID FROM t_project WHERE OPERATER_STATUS > 0")
+    assert exc.value.code == "COLUMN_NOT_ALLOWED"
+    assert repository.executed_sql is None
+
+
+def test_service_still_injects_status_predicate_after_hiding_the_column() -> None:
+    """隐藏状态列不得削弱强制：守卫仍须自行注入 OPERATER_STATUS > 0。
+
+    这条与上面两条构成一对——隐藏可见性，但不放松执行。
+    """
+    service, repository = build_service()
+    service.execute_authorized_query("uid-1", "SELECT ID, PROJECT_NAME FROM t_project")
+    assert repository.executed_sql is not None
+    assert "operater_status > 0" in repository.executed_sql.lower()
 
 
 def test_service_rejects_unmapped_uid_before_database_access() -> None:

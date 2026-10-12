@@ -36,6 +36,10 @@ PERMANENTLY_DENIED_COLUMNS = frozenset(
     }
 )
 PERMANENTLY_DENIED_SUFFIXES = ("_URL", "_ANNEX_ID")
+# 守卫内部列：守卫需要它们来注入有效状态条件，但模型不得看见、也不得在
+# SELECT/WHERE/HAVING 中引用。原业务库用 9999 表示启用（与 t_user_login_log.STATE 同风格），
+# 模型一旦看见就会按常识猜 =1，把结果清空——2026-10-12 实测两个问题都因此答 0。
+INTERNAL_STATUS_COLUMNS = frozenset({"ENABLE_STATUS", "OPERATER_STATUS"})
 
 
 class BusinessDatabaseConfigurationError(RuntimeError):
@@ -254,7 +258,7 @@ class BusinessDatabaseService:
         if missing_tables:
             raise BusinessDatabaseConfigurationError("授权表不存在：" + ", ".join(sorted(missing_tables)))
         safe_metadata = _filter_metadata(raw_metadata, {})
-        metadata = _filter_metadata(safe_metadata, identity.allowed_columns)
+        metadata = _without_internal_columns(_filter_metadata(safe_metadata, identity.allowed_columns))
         table_columns = {
             table_name: frozenset(str(column["COLUMN_NAME"]) for column in columns)
             for table_name, columns in safe_metadata.items()
@@ -297,6 +301,23 @@ class BusinessDatabaseService:
             )
         )
         return settings, repository, PreparedBusinessDatabaseAccess(identity, metadata, guard)
+
+
+def _without_internal_columns(
+    metadata: dict[str, list[dict[str, Any]]],
+) -> dict[str, list[dict[str, Any]]]:
+    """从模型可见 schema 中移除守卫内部列。
+
+    只在构造 selectable_columns 与对外 schema 时使用；table_columns 必须保留这些列，
+    否则守卫无法注入 OPERATER_STATUS > 0。
+    """
+    stripped: dict[str, list[dict[str, Any]]] = {}
+    for table_name, columns in metadata.items():
+        visible = [column for column in columns if str(column["COLUMN_NAME"]).upper() not in INTERNAL_STATUS_COLUMNS]
+        if not visible:
+            raise BusinessDatabaseConfigurationError(f"表 {table_name} 没有可授权字段")
+        stripped[table_name] = visible
+    return stripped
 
 
 def _filter_metadata(
