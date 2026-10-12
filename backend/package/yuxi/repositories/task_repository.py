@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from contextlib import asynccontextmanager
 from collections.abc import Awaitable, Callable
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -59,18 +59,14 @@ class TaskRepository:
         """从完整 Task 表计算列表摘要，不受返回 limit 影响。"""
         async with pg_manager.get_async_session_context() as session:
             ownership_filter = (
-                (TaskRecord.payload["operator_id"].as_string() == operator_id)
-                if operator_id is not None
-                else None
+                (TaskRecord.payload["operator_id"].as_string() == operator_id) if operator_id is not None else None
             )
             status_stmt = select(TaskRecord.status, func.count()).group_by(TaskRecord.status)
             type_stmt = select(TaskRecord.type, func.count()).group_by(TaskRecord.type)
             if ownership_filter is not None:
                 status_stmt = status_stmt.where(ownership_filter)
                 type_stmt = type_stmt.where(ownership_filter)
-            status_rows = (
-                await session.execute(status_stmt)
-            ).all()
+            status_rows = (await session.execute(status_stmt)).all()
             type_rows = (await session.execute(type_stmt)).all()
             total = sum(int(count) for _value, count in status_rows)
             filtered_total = total

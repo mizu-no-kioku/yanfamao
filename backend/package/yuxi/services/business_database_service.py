@@ -8,12 +8,12 @@ import time
 from collections.abc import Callable, Mapping
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
-from datetime import date, datetime, time as datetime_time
+from datetime import date, datetime
+from datetime import time as datetime_time
 from decimal import Decimal
 from typing import Any
 
 import pymysql
-
 from yuxi.nl2sql import errors as nl2sql_errors
 from yuxi.nl2sql.directory import BusinessDirectory
 from yuxi.nl2sql.mysql_directory import single_transaction_directory
