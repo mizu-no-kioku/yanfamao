@@ -25,13 +25,17 @@ async def pg_pool():
     pg_manager._initialized = False
     pg_manager.async_engine = None
     pg_manager.AsyncSession = None
+    pg_manager.RuntimeSession = None
     pg_manager.initialize()
     await pg_manager.ensure_knowledge_schema()
     yield
     await pg_manager.async_engine.dispose()
+    if pg_manager.runtime_engine is not None:
+        await pg_manager.runtime_engine.dispose()
     pg_manager._initialized = False
     pg_manager.async_engine = None
     pg_manager.AsyncSession = None
+    pg_manager.RuntimeSession = None
 
 
 @pytest.mark.integration

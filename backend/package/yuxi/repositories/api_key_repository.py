@@ -112,17 +112,22 @@ class APIKeyRepository:
         """在幂等锁内创建或重放同一 API Key 事实。"""
 
         bind = self.db_session.get_bind()
-        if bind.dialect.name == "postgresql":
-            await self.db_session.execute(
-                text("SELECT pg_advisory_xact_lock(hashtext(:scope))"),
-                {"scope": f"api-key:{request_id}"},
-            )
 
         subject = await self.db_session.scalar(
             select(User).where(User.id == user_id, User.is_deleted == 0).with_for_update()
         )
         if subject is None:
             raise APIKeySubjectUnavailable("关联的用户不存在")
+
+        # 幂等锁按 (租户, request_id)：两个租户各自生成同一个 request_id 是正常的，
+        # 用全局锁会让它们互相阻塞。租户取自关联用户——API Key 直接绑定用户与其租户，
+        # 不取调用方自报的租户。
+        if bind.dialect.name == "postgresql":
+            await self.db_session.execute(
+                text("SELECT pg_advisory_xact_lock(hashtext(:scope))"),
+                {"scope": f"api-key:{subject.tenant_id}:{request_id}"},
+            )
+
         if department_id is not None and department_id != subject.department_id:
             raise APIKeyDepartmentConflict("API Key 部门必须与关联用户部门一致")
 
@@ -133,7 +138,9 @@ class APIKeyRepository:
             expires_at=expires_at,
             created_by=created_by,
         )
-        existing = await self.db_session.scalar(select(APIKey).where(APIKey.request_id == request_id))
+        existing = await self.db_session.scalar(
+            select(APIKey).where(APIKey.request_id == request_id, APIKey.tenant_id == subject.tenant_id)
+        )
         if existing is not None:
             expected = existing.intent_hash == intent_hash
             if existing.intent_hash is None:
@@ -166,6 +173,8 @@ class APIKeyRepository:
             department_id=department_id,
             expires_at=expires_at,
             created_by=created_by,
+            # 归属取自关联用户，与幂等查重/加锁用的是同一个租户来源。
+            tenant_id=subject.tenant_id,
         )
         self.db_session.add(api_key)
         await self.db_session.flush()

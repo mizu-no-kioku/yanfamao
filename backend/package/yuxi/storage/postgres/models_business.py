@@ -1139,6 +1139,17 @@ class APIKey(Base):
     """API Key 模型"""
 
     __tablename__ = "api_keys"
+    __table_args__ = (
+        # 幂等键按租户唯一：两个租户各自生成同一个 request_id 是正常的，全局唯一会误判重复。
+        # 必须是**部分**索引——存量行的 request_id 可能为 NULL。
+        Index(
+            "uq_api_keys_tenant_request_id",
+            "tenant_id",
+            "request_id",
+            unique=True,
+            postgresql_where=text("request_id IS NOT NULL"),
+        ),
+    )
     tenant_id = Column(
         Integer,
         nullable=False,
@@ -1153,7 +1164,7 @@ class APIKey(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     key_hash = Column(String(64), nullable=False, unique=True, index=True)
     key_prefix = Column(String(16), nullable=False)
-    request_id = Column(String(64), nullable=True, unique=True, index=True)
+    request_id = Column(String(64), nullable=True, index=True)
     intent_hash = Column(String(64), nullable=True)
     name = Column(String(100), nullable=False)
 

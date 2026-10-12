@@ -216,3 +216,49 @@ async def test_default_tenant_sequence_is_advanced_past_the_seeded_row(isolated_
         ).scalar()
 
     assert next_id > DEFAULT_TENANT_ID
+
+
+async def test_set_config_local_is_transaction_scoped(isolated_tenant_schema):
+    """set_config(..., true) 在事务结束后失效——这正是注入必须挂在 after_begin 的原因。"""
+    manager = isolated_tenant_schema
+    async with manager.async_engine.begin() as connection:
+        await connection.execute(text("SELECT set_config('app.tenant_id', '9', true)"))
+        inside = (await connection.execute(text("SELECT current_setting('app.tenant_id', true)"))).scalar()
+
+    async with manager.async_engine.begin() as connection:
+        after = (await connection.execute(text("SELECT current_setting('app.tenant_id', true)"))).scalar()
+
+    assert inside == "9"
+    assert after in (None, "")
+
+
+async def test_runtime_session_injects_the_tenant_into_every_transaction(isolated_tenant_schema):
+    """通过运行时会话拿到的每个事务都带租户，且会话中途 commit 之后仍在。
+
+    挂在会话开始（而不是事务开始）会让第二次查询失去上下文——表现为功能报错
+    （RLS 查不到数据）而不是越权，但同样是故障。
+    """
+    manager = isolated_tenant_schema
+    manager.runtime_engine = manager.async_engine
+    manager._install_tenant_context_hook()
+
+    async with manager.get_async_session_context() as session:
+        first = (await session.execute(text("SELECT current_setting('app.tenant_id', true)"))).scalar()
+        await session.commit()
+        second = (await session.execute(text("SELECT current_setting('app.tenant_id', true)"))).scalar()
+
+    assert first == str(DEFAULT_TENANT_ID)
+    assert second == str(DEFAULT_TENANT_ID)
+
+
+async def test_runtime_session_follows_use_tenant(isolated_tenant_schema):
+    """认证计划会把宿主 Claim 解析出的租户经 use_tenant 注入，运行时会话必须读到它。"""
+    manager = isolated_tenant_schema
+    manager.runtime_engine = manager.async_engine
+    manager._install_tenant_context_hook()
+
+    with use_tenant(42):
+        async with manager.get_async_session_context() as session:
+            seen = (await session.execute(text("SELECT current_setting('app.tenant_id', true)"))).scalar()
+
+    assert seen == "42"

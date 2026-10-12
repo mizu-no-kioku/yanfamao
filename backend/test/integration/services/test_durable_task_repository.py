@@ -71,6 +71,9 @@ async def durable_task_schema(monkeypatch):
     PostgresManager.__init__(manager)
     manager.async_engine = scoped_engine
     manager.AsyncSession = async_sessionmaker(scoped_engine, class_=AsyncSession, expire_on_commit=False)
+    # 业务会话走 RuntimeSession；这里一并指到隔离 engine 并装上租户注入钩子。
+    manager.runtime_engine = scoped_engine
+    manager._install_tenant_context_hook()
     manager._initialized = True
     monkeypatch.setattr(task_repository_module, "pg_manager", manager)
     monkeypatch.setattr(evaluation_repository_module, "pg_manager", manager)

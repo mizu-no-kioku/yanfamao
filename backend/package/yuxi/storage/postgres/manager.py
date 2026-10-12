@@ -6,8 +6,9 @@ from contextlib import asynccontextmanager
 
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from psycopg_pool import AsyncConnectionPool
-from sqlalchemy import text
+from sqlalchemy import event, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.orm import Session as SyncSession
 from yuxi.config import get_int_env
 from yuxi.storage.postgres.models_business import (
     AGENT_RUN_SHAPE_CONSTRAINT_NAME,
@@ -30,7 +31,7 @@ from yuxi.utils import logger
 from yuxi.utils.singleton import SingletonMeta
 
 AGENT_RUN_TERMINAL_STATUS_SQL = ", ".join(f"'{status}'" for status in AGENT_RUN_TERMINAL_STATUSES)
-BUSINESS_SCHEMA_VERSION = 12
+BUSINESS_SCHEMA_VERSION = 13
 KNOWLEDGE_SCHEMA_VERSION = 2
 SCHEMA_VERSION_TABLE = "yuxi_schema_migrations"
 # 默认租户常量从 tenant_context 再导出：models_* 与 manager 都要用，来源只此一处。
@@ -155,6 +156,56 @@ TENANT_CONSTRAINT_SCHEMA_STATEMENTS: tuple[str, ...] = (
         "CREATE UNIQUE INDEX IF NOT EXISTS uq_users_tenant_external_identity "
         "ON users(tenant_id, external_issuer, external_subject) WHERE external_subject IS NOT NULL;",
     ),
+)
+TENANT_RUNTIME_ROLE = "yuxi_app"
+
+
+def _sql_literal(value: str) -> str:
+    """把值转成 PostgreSQL 字符串字面量。DDL 不支持绑定参数，只能自己转义。"""
+
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _tenant_role_statements() -> tuple[str, ...]:
+    """运行时角色的登录凭据与属性。
+
+    非 superuser、无 BYPASSRLS、且不是表 owner——前两条才是 RLS 对它生效的保证
+    （superuser 与 BYPASSRLS 角色永远绕过 RLS，连 FORCE 也压不住）；FORCE 只是防
+    "运行时被跑成 owner"的冗余保险。
+
+    属性每次收敛，密码只在创建时设置。
+    """
+
+    password = _sql_literal(os.getenv("POSTGRES_APP_PASSWORD") or "postgres")
+    return (
+        f"""
+        DO $$
+        BEGIN
+            IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{TENANT_RUNTIME_ROLE}') THEN
+                CREATE ROLE {TENANT_RUNTIME_ROLE} LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE
+                    PASSWORD {password};
+            END IF;
+        END $$
+        """,
+        # 属性每次收敛：不收敛的话，一个被改成 SUPERUSER / BYPASSRLS 的存量角色会一直绕过
+        # RLS，而迁移重放不会把它拉回来。
+        f"ALTER ROLE {TENANT_RUNTIME_ROLE} WITH LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE",
+        # 密码**不**在这里重设：迁移会被频繁重放（容器重跑、测试跑两遍），用环境变量反复写
+        # 会把运维改过的凭据冲掉——测试环境没有该变量时会回落成默认值，那是一次静默的凭据
+        # 降级。轮换是独立的显式操作。
+    )
+
+
+TENANT_ROLE_GRANT_SCHEMA_STATEMENTS: tuple[str, ...] = (
+    f"GRANT USAGE ON SCHEMA public TO {TENANT_RUNTIME_ROLE}",
+    # 必须授全部表，不只是归属根：应用要查 messages / conversations / knowledge_files 等
+    # 派生表，只授归属根会得到 permission denied。RLS 仍在行级兜底。
+    f"GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO {TENANT_RUNTIME_ROLE}",
+    f"GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO {TENANT_RUNTIME_ROLE}",
+    # 迁移之后新建的表也要能访问，否则下一次加表就 permission denied。
+    f"ALTER DEFAULT PRIVILEGES IN SCHEMA public "
+    f"GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO {TENANT_RUNTIME_ROLE}",
+    f"ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE, SELECT ON SEQUENCES TO {TENANT_RUNTIME_ROLE}",
 )
 AGENT_RUN_LEASE_SCHEMA_STATEMENTS = (
     "ALTER TABLE IF EXISTS agent_runs ADD COLUMN IF NOT EXISTS worker_id VARCHAR(128)",
@@ -465,6 +516,11 @@ class PostgresManager(metaclass=SingletonMeta):
     def __init__(self):
         self.async_engine = None
         self.AsyncSession = None
+        # 运行时业务连接：与迁移/DDL 用的 async_engine 分开，走 yuxi_app 角色。
+        self.runtime_engine = None
+        self.RuntimeSession = None
+        # 测试可观测的钩子；生产是空操作。
+        self.on_tenant_context_applied = lambda _tenant_id: None
         self.langgraph_pool = None
         self.langgraph_checkpointer = None
         self._langgraph_checkpointer_setup = False
@@ -484,16 +540,19 @@ class PostgresManager(metaclass=SingletonMeta):
             return
 
         try:
+            engine_kwargs = {
+                "json_serializer": lambda obj: json.dumps(obj, ensure_ascii=False),
+                "json_deserializer": json.loads,
+                "pool_pre_ping": True,
+                "pool_recycle": 1800,
+                "pool_size": get_int_env("POSTGRES_POOL_SIZE", 10),
+                "max_overflow": get_int_env("POSTGRES_MAX_OVERFLOW", 20, minimum=0),
+                "pool_timeout": get_int_env("POSTGRES_POOL_TIMEOUT_SECONDS", 30),
+            }
             # 创建异步 SQLAlchemy 引擎
             self.async_engine = create_async_engine(
                 db_url,
-                json_serializer=lambda obj: json.dumps(obj, ensure_ascii=False),
-                json_deserializer=json.loads,
-                pool_pre_ping=True,
-                pool_recycle=1800,
-                pool_size=get_int_env("POSTGRES_POOL_SIZE", 10),
-                max_overflow=get_int_env("POSTGRES_MAX_OVERFLOW", 20, minimum=0),
-                pool_timeout=get_int_env("POSTGRES_POOL_TIMEOUT_SECONDS", 30),
+                **engine_kwargs,
             )
 
             # 创建异步会话工厂
@@ -502,6 +561,15 @@ class PostgresManager(metaclass=SingletonMeta):
                 class_=AsyncSession,
                 expire_on_commit=False,
             )
+
+            # 运行时业务连接：走 yuxi_app（非 superuser、无 BYPASSRLS、不是表 owner），
+            # RLS 因此对它自动生效。没配置 POSTGRES_APP_URL 时回落 owner——此时 RLS 不生效，
+            # 由集成测试的角色守卫用例在真库上标记这一点。
+            runtime_url = os.getenv("POSTGRES_APP_URL") or db_url
+            self.runtime_engine = create_async_engine(runtime_url, **engine_kwargs)
+            # 注入挂在**事务**边界：set_config(..., true) 是事务局部的，挂在会话开始的话，
+            # 会话中途 commit（auth_middleware 会这么做）之后后续查询就失去租户上下文。
+            self._install_tenant_context_hook()
 
             # ==========================================
             # 2. 为 LangGraph 专门初始化一个原生 psycopg_pool
@@ -700,6 +768,8 @@ class PostgresManager(metaclass=SingletonMeta):
                 *USER_IDENTITY_SCHEMA_STATEMENTS,
                 *TENANT_BACKFILL_SCHEMA_STATEMENTS,
                 *TENANT_CONSTRAINT_SCHEMA_STATEMENTS,
+                *_tenant_role_statements(),
+                *TENANT_ROLE_GRANT_SCHEMA_STATEMENTS,
             ):
                 await conn.execute(text(statement))
 
@@ -1668,11 +1738,98 @@ class PostgresManager(metaclass=SingletonMeta):
         self.initialize()  # 确保已初始化
         return self.AsyncSession()
 
+    def _install_tenant_context_hook(self) -> None:
+        """给运行时会话派生一个专属 Session 子类并挂上租户注入，然后重建会话工厂。
+
+        不能挂在 `AsyncSession.sync_session_class` 上：那是全局的 `Session`，会把注入施加
+        到迁移/owner 会话以及 SQLite 单测会话上。专属子类把注册范围限制在运行时。
+        """
+
+        sync_session_class = type("TenantScopedSyncSession", (SyncSession,), {})
+        event.listen(sync_session_class, "after_begin", self._apply_tenant_context)
+        self.RuntimeSession = async_sessionmaker(
+            bind=self.runtime_engine,
+            class_=AsyncSession,
+            sync_session_class=sync_session_class,
+            expire_on_commit=False,
+        )
+
+    def _apply_tenant_context(self, session, transaction, connection) -> None:
+        """在事务开始时把租户写进数据库会话。
+
+        `set_config('app.tenant_id', ..., true)` 的 `true` 表示只在当前事务内有效，
+        所以它必须挂在事务边界（`after_begin`）而不是会话开始——会话中途 commit 之后
+        事务结束，设置随之失效，下一次事务会重新注入。
+        """
+
+        tenant_id = current_tenant_id()
+        connection.execute(
+            text("SELECT set_config('app.tenant_id', :tenant_id, true)"),
+            {"tenant_id": str(tenant_id)},
+        )
+        self.on_tenant_context_applied(tenant_id)
+
+    async def require_restricted_runtime_role(self) -> None:
+        """拒绝以不受限角色承载业务流量。
+
+        superuser、BYPASSRLS 角色永远绕过 RLS（连 FORCE 也压不住），表 owner 默认也绕过。
+        这三条任一成立，租户边界就是静默失效的——不报错、不告警，只是没有了。所以它必须在
+        启动/readiness 上显式失败，而不是靠某条测试护栏在事后发现。
+        """
+
+        self.initialize()
+        async with self.runtime_engine.connect() as connection:
+            role = (
+                await connection.execute(
+                    text(
+                        "SELECT current_user AS role_name, rolsuper, rolbypassrls "
+                        "FROM pg_roles WHERE rolname = current_user"
+                    )
+                )
+            ).one()
+            table_owner = (
+                await connection.execute(
+                    text("SELECT tableowner FROM pg_tables WHERE schemaname = 'public' AND tablename = 'users'")
+                )
+            ).scalar()
+
+        problems = []
+        if role.rolsuper:
+            problems.append("superuser")
+        if role.rolbypassrls:
+            problems.append("BYPASSRLS")
+        if table_owner == role.role_name:
+            problems.append("受保护表的 owner")
+        if problems:
+            raise RuntimeError(
+                f"运行时数据库角色不足以承载租户隔离：{role.role_name} 是 " + "、".join(problems)
+            )
+
+    @asynccontextmanager
+    async def get_owner_session_context(self):
+        """迁移与运维用的会话：走 owner 连接，不受 RLS 约束、可执行 DDL。
+
+        业务代码一律走 `get_async_session_context`（运行时角色 + 租户上下文）。迁移器必须
+        用这一个：否则它会以运行时角色连接，既做不了 DDL，也会被 RLS 挡在半路。
+        """
+
+        self.initialize()
+        session = self.AsyncSession()
+        try:
+            yield session
+            await session.commit()
+        except Exception as e:
+            await session.rollback()
+            logger.error(f"PostgreSQL owner operation failed: {e}")
+            raise
+        finally:
+            await session.close()
+
     @asynccontextmanager
     async def get_async_session_context(self):
         """获取异步数据库会话的上下文管理器"""
         self.initialize()  # 确保已初始化
-        session = self.AsyncSession()
+        session = self.RuntimeSession()
         try:
             yield session
             await session.commit()
@@ -1688,11 +1845,16 @@ class PostgresManager(metaclass=SingletonMeta):
         if self.async_engine:
             await self.async_engine.dispose()
 
+        if self.runtime_engine:
+            await self.runtime_engine.dispose()
+
         if self.langgraph_pool:
             await self.langgraph_pool.close()
 
         self.async_engine = None
         self.AsyncSession = None
+        self.runtime_engine = None
+        self.RuntimeSession = None
         self.langgraph_pool = None
         self.langgraph_checkpointer = None
         self._langgraph_checkpointer_setup = False

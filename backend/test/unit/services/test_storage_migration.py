@@ -50,6 +50,7 @@ async def test_storage_migration_reads_legacy_schema_before_cutover(monkeypatch)
         ensure_knowledge_schema=lambda: _record(calls, "ensure_knowledge_schema"),
         setup_langgraph_checkpointer=lambda: _record(calls, "setup_langgraph_checkpointer"),
         get_async_session_context=session_context,
+        get_owner_session_context=session_context,
         close=lambda: _record(calls, "close"),
     )
     workdirs = (V071WorkdirBinding("workdir-1", "user-1"),)
@@ -124,6 +125,7 @@ async def test_storage_migration_rejects_v071_schema_without_quiescence_proof(mo
         ensure_knowledge_schema=lambda: _record(calls, "knowledge_schema"),
         setup_langgraph_checkpointer=lambda: _record(calls, "checkpoint"),
         get_async_session_context=session_context,
+        get_owner_session_context=session_context,
         close=lambda: _record(calls, "close"),
     )
     monkeypatch.setattr(storage_migration, "pg_manager", manager)
@@ -174,6 +176,7 @@ async def test_current_schema_skips_schema_ddl(monkeypatch):
         ensure_knowledge_schema=lambda: _record(calls, "knowledge_schema"),
         setup_langgraph_checkpointer=lambda: _record(calls, "checkpoint"),
         get_async_session_context=session_context,
+        get_owner_session_context=session_context,
         close=lambda: _record(calls, "close"),
     )
     monkeypatch.setattr(storage_migration, "pg_manager", manager)
@@ -225,6 +228,7 @@ async def test_main_rejects_unsupported_business_schema_before_ddl(monkeypatch, 
             {"business": unsupported_version, "knowledge": storage_migration.KNOWLEDGE_SCHEMA_VERSION}
         ),
         get_async_session_context=session_context,
+        get_owner_session_context=session_context,
         close=lambda: _record(calls, "close"),
     )
     monkeypatch.setattr(storage_migration, "pg_manager", manager)
@@ -271,6 +275,7 @@ async def test_supported_legacy_business_schema_is_converged_and_versioned_as_cu
         ensure_knowledge_schema=lambda: _record(calls, "knowledge_schema"),
         setup_langgraph_checkpointer=lambda: _record(calls, "checkpoint"),
         get_async_session_context=session_context,
+        get_owner_session_context=session_context,
         close=lambda: _record(calls, "close"),
     )
     monkeypatch.setattr(storage_migration, "pg_manager", manager)
@@ -327,6 +332,7 @@ async def test_failed_business_migration_does_not_record_version(monkeypatch):
         ensure_knowledge_schema=lambda: _record(calls, "knowledge_schema"),
         setup_langgraph_checkpointer=fail_checkpoint_setup,
         get_async_session_context=session_context,
+        get_owner_session_context=session_context,
         close=lambda: _record(calls, "close"),
     )
     monkeypatch.setattr(storage_migration, "pg_manager", manager)
@@ -373,6 +379,7 @@ async def test_current_schema_does_not_rewrite_workdir_data(monkeypatch):
         ensure_knowledge_schema=lambda: _record(calls, "knowledge_schema"),
         setup_langgraph_checkpointer=lambda: _record(calls, "checkpoint"),
         get_async_session_context=session_context,
+        get_owner_session_context=session_context,
         close=lambda: _record(calls, "close"),
     )
     monkeypatch.setattr(storage_migration, "pg_manager", manager)

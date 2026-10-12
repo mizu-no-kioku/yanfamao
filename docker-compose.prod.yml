@@ -8,6 +8,10 @@ x-api-worker-env: &api-worker-env
   RAPIDOCR_MODEL_DIR: /home/yuxi/.cache/rapidocr/models
   YUXI_INSTANCE_ID: ${YUXI_INSTANCE_ID:?Set YUXI_INSTANCE_ID in .env.prod}
   POSTGRES_URL: ${POSTGRES_URL:-postgresql+asyncpg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env.prod}@postgres:5432/${POSTGRES_DB:-yuxi}}
+  # 运行时业务连接：yuxi_app 非 superuser、无 BYPASSRLS、不是表 owner，RLS 对它自动生效。
+  # 迁移与 DDL 仍走上面的 POSTGRES_URL（owner）。角色由 storage-migrator 幂等创建。
+  POSTGRES_APP_PASSWORD: ${POSTGRES_APP_PASSWORD:?Set POSTGRES_APP_PASSWORD in .env.prod}
+  POSTGRES_APP_URL: ${POSTGRES_APP_URL:-postgresql+asyncpg://yuxi_app:${POSTGRES_APP_PASSWORD:?Set POSTGRES_APP_PASSWORD in .env.prod}@postgres:5432/${POSTGRES_DB:-yuxi}}
   REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
   RUN_CANCEL_KEY_TTL_SECONDS: ${RUN_CANCEL_KEY_TTL_SECONDS:-1800}
   RUN_EVENTS_STREAM_TTL_SECONDS: ${RUN_EVENTS_STREAM_TTL_SECONDS:-7200}

@@ -78,7 +78,7 @@ def _require_quiescence_proof() -> None:
 
 async def _converge_database_state(*, fail_nonterminal_runs: bool) -> None:
     """导入历史系统配置；仅在已停机的旧布局切换中收敛非终态 Run。"""
-    async with pg_manager.get_async_session_context() as session:
+    async with pg_manager.get_owner_session_context() as session:
         if fail_nonterminal_runs:
             await AgentRunRepository(session).fail_nonterminal_for_storage_migration()
         await ensure_options_in_db(session)
@@ -106,7 +106,7 @@ async def main() -> None:
     pg_manager.initialize()
     try:
         async with pg_manager.schema_migration_lock():
-            async with pg_manager.get_async_session_context() as session:
+            async with pg_manager.get_owner_session_context() as session:
                 workdir_plan = await read_v071_workdir_plan(session)
             migrates_workdirs = workdir_plan.requires_cutover or bool(workdir_plan.workdirs)
             requires_quiescence = (
@@ -125,7 +125,7 @@ async def main() -> None:
                 "business",
                 business_version,
                 BUSINESS_SCHEMA_VERSION,
-                upgrade_from=(2, 7, 8, 9, 10, 11),
+                upgrade_from=(2, 7, 8, 9, 10, 11, 12),
             )
             knowledge_version = versions.get("knowledge")
             _require_supported_version(
@@ -139,7 +139,7 @@ async def main() -> None:
                 await pg_manager.create_business_tables()
             if migrates_workdirs:
                 await asyncio.to_thread(import_v071_workdirs, workdir_plan.workdirs, workdir_plan.conversations)
-                async with pg_manager.get_async_session_context() as session:
+                async with pg_manager.get_owner_session_context() as session:
                     for statement in V071_WORKDIR_CUTOVER_STATEMENTS:
                         await session.execute(text(statement))
                     await rewrite_v071_workdir_paths(session)
@@ -172,7 +172,7 @@ async def main() -> None:
                 legacy_config_file.unlink()
             if migrates_workdirs:
                 await asyncio.to_thread(cleanup_v071_thread_sources, workdir_plan.conversations)
-            async with pg_manager.get_async_session_context() as session:
+            async with pg_manager.get_owner_session_context() as session:
                 await migrate_shared_skills(session)
             mark_v071_skills_migrated()
             await asyncio.to_thread(migrate_runtime_storage_identity)

@@ -65,6 +65,8 @@ async def _startup(app: FastAPI) -> None:
     # Schema 只由 Compose 中的 storage-migrator 修改；运行进程仅校验兼容版本。
     pg_manager.initialize()
     await pg_manager.require_current_schema()
+    # 运行时连接必须受限，否则 RLS 静默失效——这条要挡住起服，不能只靠事后测试发现。
+    await pg_manager.require_restricted_runtime_role()
 
     from yuxi.config.options import (
         ensure_options_in_db,

@@ -6,6 +6,7 @@ import asyncio
 import os
 
 import pytest
+import pytest_asyncio
 from sqlalchemy import delete
 
 from yuxi.knowledge.eval.service import EvaluationService
@@ -32,6 +33,20 @@ def cleanup_test_knowledge_resources():
 @pytest.fixture(scope="session", autouse=True)
 def cleanup_test_sandboxes():
     yield
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def _fresh_pg_manager_per_test():
+    """每个用例结束后关掉全局池。
+
+    pytest 的 event loop 是 function 级的，而 asyncpg 连接绑在**创建它的 loop** 上。
+    共享池被上一个用例归还的连接会在这个用例的另一个 loop 里被取出来，触发
+    `Future attached to a different loop`，清理时再报 `Event loop is closed`。
+    关掉池（并把 manager 复位）让下一个用例在自己的 loop 里重建连接。
+    """
+
+    yield
+    await pg_manager.close()
 
 
 def _gate_identity(kind: str = "success") -> tuple[str, str]:

@@ -1561,6 +1561,8 @@ async def _worker_startup(ctx):
     ctx["worker_id"] = WORKER_ID
     pg_manager.initialize()
     await pg_manager.require_current_schema()
+    # 同 API：运行时角色不受限就等于没有租户边界。
+    await pg_manager.require_restricted_runtime_role()
     async with pg_manager.get_async_session_context() as session:
         from yuxi.config.options import (
             ensure_options_in_db,

@@ -176,6 +176,35 @@ async def test_api_key_request_id_is_unique_per_tenant(tenant_scoped_schema):
             await session.commit()
 
 
+async def test_api_key_repository_idempotency_is_tenant_scoped(tenant_scoped_schema):
+    """repository 级验证完整幂等链路：同租户重放、跨租户互不命中。
+
+    只插两条 ORM 记录证明不了链路——加锁 scope、查重条件与新记录的归属都要走同一条路径。
+    """
+    from yuxi.repositories.api_key_repository import APIKeyRepository
+
+    factory = tenant_scoped_schema
+    async with factory() as session:
+        user_a = User(uid="repo-u-a", username="repo-user-a", password_hash="x", tenant_id=1)
+        user_b = User(uid="repo-u-b", username="repo-user-b", password_hash="x", tenant_id=2)
+        session.add_all([user_a, user_b])
+        await session.commit()
+        user_a_id, user_b_id = user_a.id, user_b.id
+
+    common = {"request_id": "shared-request", "name": "k", "department_id": None, "expires_at": None, "created_by": "1"}
+
+    async with factory() as session:
+        repository = APIKeyRepository(session)
+        first = await repository.create(key_hash="repo-hash-a", key_prefix="yxkey_a", user_id=user_a_id, **common)
+        replay = await repository.create(key_hash="repo-hash-a", key_prefix="yxkey_a", user_id=user_a_id, **common)
+        assert replay.id == first.id
+
+        other = await repository.create(key_hash="repo-hash-b", key_prefix="yxkey_b", user_id=user_b_id, **common)
+        assert other.id != first.id
+        assert other.tenant_id == 2
+        assert first.tenant_id == 1
+
+
 async def test_legacy_global_department_name_index_is_dropped(tenant_scoped_schema):
     """旧的全局唯一索引必须被删掉，否则跨租户同名部门仍会被拒。"""
     factory = tenant_scoped_schema
