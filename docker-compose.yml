@@ -16,6 +16,8 @@ x-api-worker-env: &api-worker-env
   # 起法：docker compose --profile test-db up -d postgres-test
   POSTGRES_TEST_DB: ${POSTGRES_TEST_DB:-yuxi_test}
   POSTGRES_TEST_URL: ${POSTGRES_TEST_URL:-postgresql+asyncpg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres-test:5432/${POSTGRES_TEST_DB:-yuxi_test}}
+  # 测试 worker 的独立 Redis。子进程必须**显式**收到它，不得继承开发配置（REDIS_URL）。
+  REDIS_TEST_URL: ${REDIS_TEST_URL:-redis://redis-test:6379/0}
   REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
   NEO4J_URI: ${NEO4J_URI:-bolt://graph:7687}
   NEO4J_USERNAME: ${NEO4J_USERNAME:-neo4j}
@@ -466,6 +468,10 @@ services:
     # 数据目录挂 tmpfs，容器一停数据即失，天然就是"全新库"。
     profiles: ["test-db"]
     image: postgres:16
+    # 实例标记，命令行设置（pg_settings.source = 'command line'）。
+    # 它是**测试部署契约**，不是实例唯一身份——不同实例也能设同值，所以只用作**拒绝**依据。
+    # 由命令行设定，运行期 SET / ALTER SYSTEM 都不算数，防误连守卫会核对 source。
+    command: ["postgres", "-c", "cluster_name=yuxi-test-instance"]
     ports:
       - "127.0.0.1:${YUXI_POSTGRES_TEST_PORT:-6433}:5432"
     environment:
@@ -477,6 +483,30 @@ services:
       - /var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_TEST_DB:-yuxi_test} || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    networks:
+      - app-network
+    restart: "no"
+
+  redis-test:
+    # 测试 worker 专用的**独立 Redis 实例**。
+    #
+    # 理由不是"键硬编码导致 DB index 不可行"（同键在不同 DB 中本就是隔离的），而是**降低风险**：
+    # 少一条"某条连接路径漏传 DB index"的可能，隔离也更直观。worker 的全局健康键
+    # （yuxi:worker:health:*）与 ARQ 默认队列 arq:queue 都不带前缀开关，独立实例让它们天然不相互影响。
+    #
+    # 跨轮复用，因此**同一时刻只允许一个使用全局健康键的测试 worker**：harness 须加互斥。
+    # 起法：docker compose --profile test-db up -d redis-test
+    profiles: ["test-db"]
+    image: redis:7.4.10-alpine
+    ports:
+      - "127.0.0.1:${YUXI_REDIS_TEST_PORT:-6479}:6379"
+    tmpfs:
+      - /data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       timeout: 3s
       retries: 30

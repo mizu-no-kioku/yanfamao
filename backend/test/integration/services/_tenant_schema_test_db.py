@@ -47,6 +47,10 @@ def expected_test_database_name() -> str:
     return os.environ.get("POSTGRES_TEST_DB", "yuxi_test").strip() or "yuxi_test"
 
 
+def expected_cluster_marker() -> str:
+    return os.environ.get("POSTGRES_TEST_CLUSTER_MARKER", "yuxi-test-instance").strip() or "yuxi-test-instance"
+
+
 def _target(raw: str) -> tuple[str | None, int | None, str | None]:
     url = make_url(raw)
     return url.host, url.port, url.database
@@ -59,11 +63,20 @@ def _describe(raw: str) -> str:
     return f"{host}:{port}/{database}"
 
 
-async def assert_target_is_the_test_instance() -> None:
-    """核对连接目标确实是独立测试实例。每个进程只做一次。"""
+async def _read_cluster_marker(connection) -> tuple[str | None, str | None]:
+    """读实例标记及其来源。单独成函数是为了让负向测试能替换它。"""
+
+    row = (
+        await connection.execute(text("SELECT setting, source FROM pg_settings WHERE name = 'cluster_name'"))
+    ).one_or_none()
+    return (row.setting, row.source) if row is not None else (None, None)
+
+
+async def assert_target_is_the_test_instance(*, force: bool = False) -> None:
+    """核对连接目标确实是独立测试实例。每个进程只做一次（`force=True` 供负向测试）。"""
 
     global _verified
-    if _verified:
+    if _verified and not force:
         return
 
     raw = tenant_schema_url()
@@ -80,6 +93,7 @@ async def assert_target_is_the_test_instance() -> None:
     try:
         async with engine.connect() as connection:
             actual = (await connection.execute(text("SELECT current_database()"))).scalar()
+            marker = await _read_cluster_marker(connection)
     finally:
         await engine.dispose()
 
@@ -87,6 +101,25 @@ async def assert_target_is_the_test_instance() -> None:
         raise RuntimeError(
             f"POSTGRES_TEST_URL 连到的库是 {actual}，期望专用测试库 {expected}（目标 {_describe(raw)}）"
         )
+
+    # 实例标记：专用库名挡不住"开发实例上恰好也有同名库"，目标比较也挡不住**连接别名**
+    # （hosts / DNS / 端口转发指向同一实例）。标记由命令行设定，因此只认 source='command line'——
+    # 运行期 SET 或 ALTER SYSTEM 设的标记不算数。
+    #
+    # 注意：标记是**测试部署契约**，不是实例唯一身份。不同实例也能设同一个值，所以它只用来**拒绝**，
+    # 不能反过来当作"同一个实例"的证明。
+    expected_marker = expected_cluster_marker()
+    setting, source = marker
+    if setting != expected_marker:
+        raise RuntimeError(
+            f"测试实例标记不符：cluster_name={setting!r}，期望 {expected_marker!r}（目标 {_describe(raw)}）。"
+            "实例标记由命令行设置，缺标记说明这不是测试实例。"
+        )
+    if source != "command line":
+        raise RuntimeError(
+            f"测试实例标记来源不是命令行（source={source!r}）——标记可能被运行期设置过，拒绝执行。"
+        )
+
     _verified = True
 
 
