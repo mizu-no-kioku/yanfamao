@@ -23,7 +23,7 @@ docker compose exec -T api uv run --no-sync pytest test/integration/storage_migr
 **前提：`REDIS_TEST_URL` 必须在 api 容器里**（测试 worker 用它连独立 Redis）。compose 里已经声明；
 改过 compose 的**环境变量**后必须 `up -d` 重建容器，`restart` 不生效——否则这一步会硬失败并告诉你去重建。
 
-## 两轮分别断言什么
+## 四组分别断言什么
 
 **第一轮：空库完整迁移**（`test_empty_database_migration.py`）
 
@@ -50,12 +50,38 @@ docker compose exec -T api uv run --no-sync pytest test/integration/storage_migr
 | worker 也没写到临时根之外（cwd 诱饵为空、沙箱端点改道） | `test_the_worker_does_not_write_outside_the_round_root` |
 | 同一时刻只允许一个测试 worker（全局健康键） | `test_the_round_mutex_refuses_a_second_worker` |
 
-**第三组：脚手架自身**（`test_round_scaffolding.py`）
+**第三组：补发**时机**（`test_durable_task_republish.py`，Step D）**
+
+两个场景只差两件事——意图相对 worker 启动的时刻，与注入的周期：
+
+| 场景 | 意图创建于 | 注入的 `TASK_RECONCILIATION_SECONDS` | 唯一能救它的路径 |
+|---|---|---|---|
+| 启动补发 | worker 启动**之前**（`managed_worker_round` 的 `prepare` 钩子） | `3600`（周期等于不发生） | `_worker_startup` 的 `reconcile_and_publish_tasks()` |
+| 周期补发 | worker **就绪之后** | `1` | `_reconcile_durable_tasks_forever()` 的 tick |
+
+| 断言 | 依据 |
+|---|---|
+| 启动前落库的 pending 意图被推到 `success` | `test_startup_reconciliation_republishes_...` |
+| 就绪后落库的 pending 意图被推到 `success` | `test_periodic_reconciliation_republishes_...` |
+
+两条都**读库**判终态：`pending → running → success`（`attempt_count == 1`）与领域 success hook
+写下的数据集 `build_metadata.status == "completed"`。**日志不算证据**——它只说明"收敛循环跑了"。
+`attempt_count == 1` 同时排除了"被收敛循环直接判失败"那条路径（`fail_pending` 不增加 attempt_count）。
+
+**周期设成 3600 不是顺手调大超时**：它让两条路径不可能互相冒充。已用**差分变异探针**实测：
+注释掉启动收敛 → 只有启动场景红；注释掉周期收敛 → 只有周期场景红。
+
+**第四组：脚手架自身**（`test_round_scaffolding.py`）
 
 守卫是否**接线**且**每次核对**（不缓存——缓存过的版本只记部分输入，"测试 URL 不变、`REDIS_URL`
 被换成同一目标"就能绕过）、报错不泄漏凭证、租约必需且原子释放并自动续期、
 **真实场景下丢锁会回收整组并把本轮判失败**、组长先退出/后代忽略 TERM 时的整组回收、
 回收返回后日志已写完、以及"断言失败也要保留产物"的判定。
+
+另含**等待期间的三项健康核对**（`assert_round_health`）：租约未丢 / 无后台回收错误 /
+**worker 仍存活**。第三项区分了两种"进程不在了"：本轮主动停它（`stop_worker_round` 先置
+`stopping`）是预期的；它自己提前退出则**立刻**失败，而不是等到业务超时——超时会把
+"进程崩了"报告成"业务没收敛"。
 
 失败时保留本轮临时根与日志，并在输出里打印路径与日志尾部；成功则整根删除。
 **保留与否看 pytest 的判定结果**，不只看子进程退出码——退出码 0 只说明"跑完了"。
@@ -69,12 +95,19 @@ docker compose exec -T api uv run --no-sync pytest test/integration/storage_migr
   由"诱饵 cwd 必须为空"这条来兜（相对路径默认值会落在那里）。
 - **隔离边界只说被显式指定的那些**：四个连接、五个文件根、导入路径，以及被改道到
   `http://127.0.0.1:1` 的沙箱 provisioner（真走到沙箱会立刻失败，不会打到开发 provisioner）。
-  Neo4j / Milvus / MinIO **没有**隔离——本轮不投递任何 job，因此不作那些方面的声明。
+  Neo4j / Milvus / MinIO **没有**隔离。
+  Step D 起本轮**会投递 job**（`dataset_generation`），所以"不投递 job"这句已经作废；
+  之所以仍然安全，是因为探针意图的 payload 是 `count=0`，`_generate_dataset_task` 在
+  `existing_count (0) >= total_count (0)` 处**短路返回**，既不查 Milvus 也不调 LLM。
+  这是**路径选择**而不是隔离：换一个 `count > 0` 的意图，本轮就会打到开发的 Milvus 上。
 - 这一步应称为**「带已满足身份前置条件的完整入口验收」**，不是身份迁移本身的证据：运行身份迁移
   （`.v072-runtime-identity`）在 api 容器里是**预置**的（该容器以 `1000:1000` 运行，而迁移步骤要求
   root）。预置是如实陈述的条件：标记内容 `UID:GID` 的**两个值都被核对**，且临时根的归属被断言过。
   身份迁移本身需要在可控的 root 环境里另行验收。
 - **迁移轮次断言"库是空的"，所以每跑一轮都要先重建 `postgres-test`**；第二轮（worker）本身不要求
   空库，但复用同一套 session 前置，因此整目录一起跑时前置仍然是"全新库"。
-- Step D（启动补发 / 周期补发两个场景）**未做**：本轮只证明"能起、能归属、能回收"，
-  还没有断言补发时机。`TASK_RECONCILIATION_SECONDS` 也还没改成 env 驱动。
+- **`services/` 里那条同名旧用例仍依赖共享 worker 容器的周期**。
+  `test_durable_task_worker_path.py::test_shipping_worker_periodic_reconciliation_recovers_pending_publication`
+  的窗口已改为**由周期推导**（`TASK_RECONCILIATION_SECONDS × 2 + 余量`，原为写死的 15s = 周期的一半，
+  实测 4 次里红 2 次），但它的**确定性仍受容器 loop 相位影响**，只是窗口现在覆盖得住。
+  真正的紧证据是上面第三组的两个场景。

@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import os
+import uuid
 
 import pytest
 import pytest_asyncio
 from sqlalchemy import delete
+
+from yuxi.services.task_queue_service import TASK_RECONCILIATION_SECONDS
 
 from yuxi.knowledge.eval.service import EvaluationService
 from yuxi.repositories.evaluation_repository import EvaluationRepository
@@ -49,9 +52,20 @@ async def _fresh_pg_manager_per_test():
     await pg_manager.close()
 
 
+# 每次**运行**唯一的标识。缺省值原先写死成 `local`，于是跨运行复用同一个 kb_id，
+# 本轮的判定会受上一轮残留行的影响。CI 用 `DURABLE_TASK_GATE_ID` 显式给每轮唯一值。
+_RUN_SUFFIX = os.getenv("DURABLE_TASK_GATE_ID", "").replace("-", "_")[:24] or uuid.uuid4().hex[:12]
+
+# 等待窗口**由周期推导**，不写死。这条用例依赖周期补发（见下面那条的 docstring），而
+# `_reconcile_durable_tasks_forever()` 是「先睡后做」，所以窗口必须覆盖至少一个完整周期；
+# 原先的 150 × 0.1s = 15s 只有周期（30s）的一半，恰好落在 50% 的通过率上。
+# 这不是"延长超时取绿灯"：窗口跟着周期走，周期改大窗口自动跟上。
+_WAIT_WINDOW_SECONDS = TASK_RECONCILIATION_SECONDS * 2 + 15.0
+_POLL_SECONDS = 0.1
+
+
 def _gate_identity(kind: str = "success") -> tuple[str, str]:
-    suffix = os.getenv("DURABLE_TASK_GATE_ID", "local").replace("-", "_")[:24]
-    return f"kb_task_worker_{suffix}_{kind}", f"durable-task-worker-{suffix}-{kind}"
+    return f"kb_task_worker_{_RUN_SUFFIX}_{kind}", f"durable-task-worker-{_RUN_SUFFIX}-{kind}"
 
 
 async def _delete_gate_facts(kb_id: str) -> None:
@@ -91,8 +105,15 @@ async def test_prepare_task_with_failed_initial_arq_publication(monkeypatch) -> 
     assert (dataset.build_metadata or {}).get("status") == "pending"
 
 
-async def test_shipping_worker_startup_recovers_pending_publication() -> None:
-    """由真实 worker startup publisher 恢复前一进程遗留的 pending intent。"""
+async def test_shipping_worker_periodic_reconciliation_recovers_pending_publication() -> None:
+    """真实 worker 的**周期**收敛恢复前一用例遗留的 pending intent。
+
+    名字里的 `periodic` 是这条用例的实际语义，不是修饰：意图是在 worker（容器）**早已启动
+    之后**才落库的，`_worker_startup` 的那次收敛早已发生，唯一能救它的是
+    `_reconcile_durable_tasks_forever()` 的那次 tick。旧名字写成 `startup_recovers`，
+    与它真正依赖的路径相反——那个名字现在留给
+    `storage_migration/test_durable_task_republish.py` 里真正"启动前落库"的场景。
+    """
     kb_id, _dataset_name = _gate_identity()
     datasets = await EvaluationRepository().list_datasets(kb_id)
     assert len(datasets) == 1
@@ -101,14 +122,17 @@ async def test_shipping_worker_startup_recovers_pending_publication() -> None:
     assert task_id
 
     try:
-        for _attempt in range(150):
+        for _attempt in range(int(_WAIT_WINDOW_SECONDS / _POLL_SECONDS)):
             task = await TaskRepository().get_by_id(task_id)
             dataset = await EvaluationRepository().get_dataset(dataset.dataset_id)
             if task and task.status == "success" and (dataset.build_metadata or {}).get("status") == "completed":
                 break
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(_POLL_SECONDS)
         else:
-            raise AssertionError("Durable Task did not converge through worker startup publication")
+            raise AssertionError(
+                f"Durable Task 没有通过**周期**补发收敛：等了 {_WAIT_WINDOW_SECONDS:g} 秒"
+                f"（= {TASK_RECONCILIATION_SECONDS:g} 秒周期 × 2 + 余量）"
+            )
 
         assert task.attempt_count == 1
         assert task.worker_id is None
