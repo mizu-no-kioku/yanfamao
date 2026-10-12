@@ -63,6 +63,11 @@ docker compose exec -T api uv run --no-sync pytest test/integration/storage_migr
 |---|---|
 | 启动前落库的 pending 意图被推到 `success` | `test_startup_reconciliation_republishes_...` |
 | 就绪后落库的 pending 意图被推到 `success` | `test_periodic_reconciliation_republishes_...` |
+| 业务断言在轮次内失败时，临时根与日志仍在 | `test_a_failing_business_assertion_inside_the_round_keeps_the_scene` |
+
+**业务断言写在 `async with` 里面**，不是外面：收尾要看得到断言抛出的异常才会保留现场；
+写在外面的话，收尾已按"轮次正常"删掉临时根，核心断言失败时反而没有日志可看。第三条用例
+用**真实的业务断言失败**（把意图的 `type` 换成不注册的类型 → 收敛判成 `failed`）把这条钉住。
 
 两条都**读库**判终态：`pending → running → success`（`attempt_count == 1`）与领域 success hook
 写下的数据集 `build_metadata.status == "completed"`。**日志不算证据**——它只说明"收敛循环跑了"。
@@ -106,8 +111,14 @@ docker compose exec -T api uv run --no-sync pytest test/integration/storage_migr
   身份迁移本身需要在可控的 root 环境里另行验收。
 - **迁移轮次断言"库是空的"，所以每跑一轮都要先重建 `postgres-test`**；第二轮（worker）本身不要求
   空库，但复用同一套 session 前置，因此整目录一起跑时前置仍然是"全新库"。
+- **第三组的两个场景是"补发时机"的证据，不是多租户验收证据**。它们是在 `rls_enabled=0` 的
+  测试实例上取得的；探针用 owner 连接写前置数据，那只是**安排测试前置条件**的手段。
+  版本 14 落地后要证明的是**受限 worker 的租户隔离**：worker 走 `yuxi_app`、任务**携带并恢复**
+  正确的租户上下文、正常租户的任务能完成、**缺上下文 / 跨租户**的任务被拒绝。
 - **`services/` 里那条同名旧用例仍依赖共享 worker 容器的周期**。
   `test_durable_task_worker_path.py::test_shipping_worker_periodic_reconciliation_recovers_pending_publication`
   的窗口已改为**由周期推导**（`TASK_RECONCILIATION_SECONDS × 2 + 余量`，原为写死的 15s = 周期的一半，
   实测 4 次里红 2 次），但它的**确定性仍受容器 loop 相位影响**，只是窗口现在覆盖得住。
-  真正的紧证据是上面第三组的两个场景。
+  更根本的是：它依赖**前一个用例**留下的状态与**共享 worker 容器**，因此**不是独立、
+  完全隔离的测试**——窗口扩大只是把等待预算改成与周期匹配。本轮的主要证据是上面第三组的
+  两个场景，那条旧用例不是。

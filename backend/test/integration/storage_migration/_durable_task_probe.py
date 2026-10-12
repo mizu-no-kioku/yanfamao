@@ -40,6 +40,11 @@ TERMINAL_TASK_STATUSES = {"success", "failed", "cancelled"}
 EXPECTED_TERMINAL_STATUS = "success"
 EXPECTED_DATASET_STATUS = "completed"
 
+# 一个**不注册**的类型：收敛循环会把这种 pending 意图明确判成 `failed`
+# （`publish_pending_tasks` 重建不出 Handler 时走 `fail_pending`），因此它提供了一条
+# "仍然终态、但不是 success" 的确定性路径——负向用例靠它驱动一次**真实的**业务断言失败。
+UNKNOWN_TASK_TYPE = "part2_probe_unregistered_task_type"
+
 SESSION_SUFFIX = os.environ.get("DURABLE_TASK_GATE_ID", "").strip().replace("-", "_")[:10] or uuid.uuid4().hex[:10]
 
 
@@ -90,8 +95,12 @@ async def _session_factory():
     return engine, async_sessionmaker(engine, expire_on_commit=False)
 
 
-async def insert_pending_intent(probe: ProbeTask) -> None:
-    """写知识库 + 数据集 + **pending** Task 行，**不发布**——这就是"worker 挂了留下的意图"。"""
+async def insert_pending_intent(probe: ProbeTask, *, task_type: str = "dataset_generation") -> None:
+    """写知识库 + 数据集 + **pending** Task 行，**不发布**——这就是"worker 挂了留下的意图"。
+
+    `task_type` 只给负向用例用（见 `UNKNOWN_TASK_TYPE`）：换成一个不注册的类型，收敛循环
+    会把这条意图判成 `failed`，于是负向用例能让**真实的业务断言**失败。
+    """
 
     engine, factory = await _session_factory()
     try:
@@ -125,7 +134,7 @@ async def insert_pending_intent(probe: ProbeTask) -> None:
                 TaskRecord(
                     id=probe.task_id,
                     name="生成评估数据集",
-                    type="dataset_generation",
+                    type=task_type,
                     status="pending",
                     message="任务等待 worker 执行",
                     payload=_pending_payload(probe),

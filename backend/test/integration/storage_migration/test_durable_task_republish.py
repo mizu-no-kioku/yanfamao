@@ -19,9 +19,18 @@
 ## 单次绿不算证据
 
 这一整条链的原始缺陷就是"约 50% 通过"。README 里写了连续重跑的命令。
+
+## 业务断言必须写在 `async with` **里面**
+
+轮次的收尾（`managed_worker_round`）要看得到断言抛出的异常，才会保留临时根与日志。断言写在
+上下文之外的话，收尾已经按"轮次正常"把现场删了，核心断言失败时反而**没有证据可看**——
+这正是四轮审查反复要求的那条"失败保留现场"。第三条用例把这个行为钉住。
 """
 
 from __future__ import annotations
+
+import shutil
+from pathlib import Path
 
 import pytest
 
@@ -74,15 +83,16 @@ async def test_startup_reconciliation_republishes_an_intent_committed_before_sta
             )
             metadata = await probe_module.read_dataset_metadata(probe.dataset_id)
 
-        assert state["status"] == probe_module.EXPECTED_TERMINAL_STATUS, (
-            f"启动补发把意图推到了 {state['status']}（error={state['error']!r}），不是期望的 success"
-        )
-        # attempt_count == 1：证明它被**消费过一次**，而不是被收敛循环直接判失败（那条路径
-        # 不会增加 attempt_count，`fail_pending` 只写 status/error）。
-        assert state["attempt_count"] == 1, f"attempt_count={state['attempt_count']}，不是恰好执行一次"
-        assert (metadata or {}).get("status") == probe_module.EXPECTED_DATASET_STATUS, (
-            f"领域 success hook 没有把数据集收敛到 completed：{metadata!r}"
-        )
+            # 三条业务断言都写在 `async with` **里面**：收尾要看得到异常才会保留现场。
+            assert state["status"] == probe_module.EXPECTED_TERMINAL_STATUS, (
+                f"启动补发把意图推到了 {state['status']}（error={state['error']!r}），不是期望的 success"
+            )
+            # attempt_count == 1：证明它被**消费过一次**，而不是被收敛循环直接判失败（那条路径
+            # 不会增加 attempt_count，`fail_pending` 只写 status/error）。
+            assert state["attempt_count"] == 1, f"attempt_count={state['attempt_count']}，不是恰好执行一次"
+            assert (metadata or {}).get("status") == probe_module.EXPECTED_DATASET_STATUS, (
+                f"领域 success hook 没有把数据集收敛到 completed：{metadata!r}"
+            )
     finally:
         await probe_module.delete_probe_rows(probe)
 
@@ -99,9 +109,11 @@ async def test_periodic_reconciliation_republishes_an_intent_committed_after_sta
             failed_tests=session_failed_tests,
         ) as round_:
             # 就绪之后再落库：这条顺序本身就是本用例的意图，启动补发对它无能为力。
+            # 这里**不**断言"刚插入时是 pending"：周期是 1 秒，插入与读取之间 worker 完全可能
+            # 已经补发、消费甚至完成，那条断言会因为**正常行为**而红。未发布的属性由插入路径
+            # 本身保证（探针从不发布），路径区分由上面的差分变异探针证明。
             assert round_.worker_id is not None, "worker 没就绪，本用例的前提不成立"
             await probe_module.insert_pending_intent(probe)
-            assert (await probe_module.read_task_state(probe.task_id))["status"] == "pending"
 
             state = await worker_round_module.wait_for_round_result(
                 round_,
@@ -112,12 +124,57 @@ async def test_periodic_reconciliation_republishes_an_intent_committed_after_sta
             )
             metadata = await probe_module.read_dataset_metadata(probe.dataset_id)
 
-        assert state["status"] == probe_module.EXPECTED_TERMINAL_STATUS, (
-            f"周期补发把意图推到了 {state['status']}（error={state['error']!r}），不是期望的 success"
-        )
-        assert state["attempt_count"] == 1, f"attempt_count={state['attempt_count']}，不是恰好执行一次"
-        assert (metadata or {}).get("status") == probe_module.EXPECTED_DATASET_STATUS, (
-            f"领域 success hook 没有把数据集收敛到 completed：{metadata!r}"
-        )
+            assert state["status"] == probe_module.EXPECTED_TERMINAL_STATUS, (
+                f"周期补发把意图推到了 {state['status']}（error={state['error']!r}），不是期望的 success"
+            )
+            assert state["attempt_count"] == 1, f"attempt_count={state['attempt_count']}，不是恰好执行一次"
+            assert (metadata or {}).get("status") == probe_module.EXPECTED_DATASET_STATUS, (
+                f"领域 success hook 没有把数据集收敛到 completed：{metadata!r}"
+            )
     finally:
         await probe_module.delete_probe_rows(probe)
+
+
+async def test_a_failing_business_assertion_inside_the_round_keeps_the_scene(
+    migrated_test_database, session_failed_tests
+) -> None:
+    """业务断言在 `async with` **里面**失败时，临时根与日志必须还在。
+
+    用**真实的业务断言失败**驱动，不是注入一个假异常：意图的类型不注册，收敛循环会把它
+    判成 `failed`（`fail_pending`），于是与上面两条同一条断言会失败。若断言被写在上下文
+    之外，收尾会先按"轮次正常"删掉现场，这里就会红——这条用例钉住的正是那个位置。
+    """
+
+    probe = probe_module.new_probe_task("negative")
+    roots: list[Path] = []
+    kept_root: Path | None = None
+    try:
+        with pytest.raises(AssertionError, match="不是期望的 success"):
+            async with managed_worker_round(
+                prepare=lambda: probe_module.insert_pending_intent(
+                    probe, task_type=probe_module.UNKNOWN_TASK_TYPE
+                ),
+                env_overrides=_period_override(STARTUP_SCENARIO_PERIOD),
+                failed_tests=session_failed_tests,
+            ) as round_:
+                roots.append(round_.root)
+                state = await worker_round_module.wait_for_round_result(
+                    round_,
+                    lambda: probe_module.read_task_state(probe.task_id),
+                    terminal=_terminal,
+                    timeout_seconds=RUN_TIMEOUT_SECONDS,
+                    description="未注册类型应被收敛循环判成 failed",
+                )
+                assert state["status"] == probe_module.EXPECTED_TERMINAL_STATUS, (
+                    f"不是期望的 success（实际 {state['status']}，error={state['error']!r}）"
+                )
+
+        assert roots, "用例没有真正进入轮次"
+        kept_root = roots[0]
+        assert kept_root.is_dir(), "业务断言失败之后现场被删了"
+        assert (kept_root / "worker.log").is_file(), "日志也被删了"
+    finally:
+        await probe_module.delete_probe_rows(probe)
+        # 这条用例是**故意**失败的，现场由它自己清掉（保留是给真失败用的）。
+        if kept_root is not None:
+            shutil.rmtree(kept_root, ignore_errors=True)

@@ -19,10 +19,12 @@ TASK_RECONCILIATION_SECONDS_ENV = "TASK_RECONCILIATION_SECONDS"
 def reconciliation_seconds_from_env(raw: str | None) -> float:
     """解析 pending 意图补发周期：缺省 30，必须是**有限正数**。
 
-    三种坏值都不会自己报错，只会让周期补发静默失效，所以这里一律硬失败：
-    `nan` 会让 `asyncio.sleep` 立刻返回（收敛循环退化成忙等）、`inf` 与 `<= 0` 会让它永不醒来，
-    非数字则说明配置打错了。回落到默认值同样不可接受——"我注入了 1 秒"变成静默的 30 秒，
-    正是这一步要根除的"看起来生效其实没有"。
+    坏值一律硬失败，因为它们在运行期的表现既不可预期也不显眼——**异常、无效等待、或高频循环**，
+    而它们都不会让"周期补发坏了"这件事自己浮出来。本机 Python 3.13.16 实测四种表现各不相同：
+    `sleep(0)` / `sleep(-1)` 只是让出执行权就立刻返回（微秒级），`sleep(nan)` 直接抛
+    `ValueError: Invalid delay: NaN`，`sleep(inf)` 则永不醒来——所以这里的判据是"有限且为正"，
+    而不是给某一种坏值编一句行为描述。回落到默认值同样不可接受——"我注入了 1 秒"变成静默的
+    30 秒，正是这一步要根除的"看起来生效其实没有"。
     """
 
     if raw is None or not raw.strip():
@@ -37,7 +39,7 @@ def reconciliation_seconds_from_env(raw: str | None) -> float:
     if not math.isfinite(value) or value <= 0:
         raise RuntimeError(
             f"{TASK_RECONCILIATION_SECONDS_ENV}={raw!r} 必须是有限正数——"
-            "NaN 会让 asyncio.sleep 立刻返回（循环变忙等），±inf 与 ≤0 会让补发永不发生。"
+            "非有限值或非正周期会造成异常、无效等待或高频循环，因此启动时拒绝。"
         )
     return value
 
