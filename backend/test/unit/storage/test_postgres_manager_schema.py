@@ -370,6 +370,83 @@ def test_business_schema_version_is_thirteen():
     assert manager_module.BUSINESS_SCHEMA_VERSION == 13
 
 
+@pytest.mark.asyncio
+async def test_rls_policies_cover_roots_and_derived_tables():
+    """归属根按列比较，派生表按递归 EXISTS；两侧都同时定义 USING 与 WITH CHECK。"""
+    async with _recording_manager() as (manager, connection):
+        await manager.ensure_tenant_schema()
+
+    statements = "\n".join(connection.statements)
+    for table in TENANT_ROOT_TABLES:
+        assert f"ALTER TABLE IF EXISTS {table} ENABLE ROW LEVEL SECURITY" in statements, table
+        assert f"ALTER TABLE IF EXISTS {table} FORCE ROW LEVEL SECURITY" in statements, table
+        assert f"CREATE POLICY tenant_isolation ON {table}" in statements, table
+
+    assert "USING (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::int)" in statements
+    assert (
+        "EXISTS (SELECT 1 FROM conversations AS parent_row WHERE parent_row.id = messages.conversation_id)"
+        in statements
+    )
+    # 初稿的写法会把前缀拼两次，生成不存在的列。
+    assert "parent_row.parent_row." not in statements
+
+
+def test_derived_table_parents_match_real_foreign_keys():
+    """父表与连接列必须与真库 FK 一致。
+
+    初稿把 tool_calls 的父写成 conversations（真实父是 messages）、把 knowledge_chunks 的
+    父列写成 id（真实是 file_id）；写错的策略会创建失败或恒不匹配。
+    """
+    from yuxi.storage.postgres.manager import DERIVED_TABLE_PARENTS
+
+    assert DERIVED_TABLE_PARENTS["tool_calls"] == ("messages", "message_id", "id")
+    assert DERIVED_TABLE_PARENTS["knowledge_chunks"] == ("knowledge_files", "file_id", "file_id")
+    assert DERIVED_TABLE_PARENTS["subagent_threads"] == ("conversations", "parent_conversation_id", "id")
+
+
+def test_every_derived_parent_chain_terminates_in_an_ownership_root():
+    """递归 EXISTS 的正确性依赖整条父链都受有效 RLS 保护。
+
+    链上每一环要么是归属根（有直接策略），要么自己也在 DERIVED_TABLE_PARENTS 里（有 EXISTS
+    策略）。任何一环缺失，递归就会漏——这才是"整条链受保护"，而不是"策略建过一遍"。
+    """
+    from yuxi.storage.postgres.manager import DERIVED_TABLE_PARENTS
+
+    for table, (parent, _local_key, _parent_key) in DERIVED_TABLE_PARENTS.items():
+        seen: set[str] = set()
+        current = parent
+        while current in DERIVED_TABLE_PARENTS:
+            assert current not in seen, f"{table} 的父链成环：{current}"
+            seen.add(current)
+            current = DERIVED_TABLE_PARENTS[current][0]
+        assert current in TENANT_ROOT_TABLES, f"{table} 的父链终止于 {current}，它不是归属根、没有策略"
+
+
+def test_every_model_table_is_covered_by_a_tenant_policy_or_an_explicit_exception():
+    """独立于策略映射的覆盖检查：从模型枚举全部表，逐张确认已受保护或是有理由的例外。
+
+    只检查"已列出的表"抓不到漏表——图谱四表与评估四表就曾整片漏掉，而运行时账号对这些表
+    有全表权限，没有策略就等于一个直接的读写缺口。
+    """
+    from yuxi.storage.postgres.manager import DERIVED_TABLE_PARENTS
+
+    protected = set(TENANT_ROOT_TABLES) | set(DERIVED_TABLE_PARENTS)
+    all_tables = set(BusinessBase.metadata.tables) | set(KnowledgeBase.metadata.tables)
+    exceptions = {
+        # tenants 是平台级实体，它本身就是租户的定义，不按租户隔离。
+        "tenants",
+        # 这三张是「平台默认 + 租户覆盖」表：策略形状不同（读 = 自己 + NULL，写 = 只能写自己），
+        # 由「每租户系统配置」那个计划实现。**在它落地前，这三张表对运行时角色是完全开放的**
+        # ——这是已知且被记名的缺口，不是遗漏。
+        "model_providers",
+        "mcp_servers",
+        "config_options",
+    }
+
+    uncovered = sorted(all_tables - protected - exceptions)
+    assert not uncovered, f"这些表既没有租户策略、也没有例外理由：{uncovered}"
+
+
 def test_default_tenant_constants_are_stable():
     """默认租户常量是认证计划接入前的唯一租户来源，取值不能被随手改动。"""
     from yuxi.storage.postgres import manager as manager_module

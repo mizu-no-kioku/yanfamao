@@ -40,11 +40,18 @@ def _manager_with_runtime_engine(engine) -> PostgresManager:
 
 
 async def test_guard_rejects_a_superuser_runtime_role():
-    """以 owner 连接必须被拒——这正是「未配置 POSTGRES_APP_URL」时的回退结果。"""
+    """以 owner 连接必须被拒——这正是「未配置 POSTGRES_APP_URL」时的回退结果。
+
+    同时钉住「查全部基表的 owner」这条：只查 users 的话，运行时不巧拥有的另一张表会静默
+    失去 RLS 保护。postgres 拥有 public 下的全部基表，所以这里必须同时报出所有权。
+    """
     engine = create_async_engine(os.environ["POSTGRES_URL"], pool_pre_ping=True)
     try:
-        with pytest.raises(RuntimeError, match="不足以承载租户隔离"):
+        with pytest.raises(RuntimeError, match="不足以承载租户隔离") as excinfo:
             await _manager_with_runtime_engine(engine).require_restricted_runtime_role()
+        message = str(excinfo.value)
+        assert "superuser" in message
+        assert "拥有基表" in message
     finally:
         await engine.dispose()
 

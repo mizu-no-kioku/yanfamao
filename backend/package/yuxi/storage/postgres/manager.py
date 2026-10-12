@@ -157,6 +157,79 @@ TENANT_CONSTRAINT_SCHEMA_STATEMENTS: tuple[str, ...] = (
         "ON users(tenant_id, external_issuer, external_subject) WHERE external_subject IS NOT NULL;",
     ),
 )
+RLS_TENANT_PREDICATE = "tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::int"
+# 派生表 -> (父表, 本表连接列, 父表连接列)。列名对着真库的 FK 约束核对过，不是照模型猜的
+# （计划初稿把 tool_calls 的父写成 conversations、把 knowledge_chunks 的父列写成 id，都错）。
+DERIVED_TABLE_PARENTS: dict[str, tuple[str, str, str]] = {
+    "projects": ("users", "uid", "uid"),
+    "conversations": ("users", "uid", "uid"),
+    "user_config": ("users", "uid", "uid"),
+    "agent_envs": ("users", "uid", "uid"),
+    "messages": ("conversations", "conversation_id", "id"),
+    "conversation_stats": ("conversations", "conversation_id", "id"),
+    "subagent_threads": ("conversations", "parent_conversation_id", "id"),
+    "tool_calls": ("messages", "message_id", "id"),
+    "message_feedbacks": ("messages", "message_id", "id"),
+    "agent_run_attempts": ("agent_runs", "run_id", "id"),
+    "scheduled_agent_runs": ("scheduled_agent_jobs", "job_id", "id"),
+    "knowledge_files": ("knowledge_bases", "kb_id", "kb_id"),
+    "knowledge_chunks": ("knowledge_files", "file_id", "file_id"),
+    # 图谱四表与评估四表都有直接的 kb_id，漏掉它们等于给运行时账号留一个直接读写缺口。
+    "knowledge_graph_entities": ("knowledge_bases", "kb_id", "kb_id"),
+    "knowledge_graph_entity_mentions": ("knowledge_bases", "kb_id", "kb_id"),
+    "knowledge_graph_triples": ("knowledge_bases", "kb_id", "kb_id"),
+    "knowledge_graph_triple_mentions": ("knowledge_bases", "kb_id", "kb_id"),
+    "evaluation_datasets": ("knowledge_bases", "kb_id", "kb_id"),
+    "evaluation_dataset_items": ("knowledge_bases", "kb_id", "kb_id"),
+    "evaluation_runs": ("knowledge_bases", "kb_id", "kb_id"),
+    # 主归属链必须走**不可空**的引用：`dataset_item_id` 可空、且删除数据集题目时是
+    # ON DELETE SET NULL——拿它做父链，NULL 会让 WITH CHECK 拒掉合法插入，删除题目后
+    # 结果行还会被读不到。`run_id` 是 NOT NULL + ON DELETE CASCADE，链继续经
+    # evaluation_runs.kb_id 到归属根。
+    "evaluation_run_items": ("evaluation_runs", "run_id", "run_id"),
+}
+# 派生表策略：只向父表问「这一行属于当前租户吗」，不自己拼父表的 tenant_id——多数父表本身
+# 也是派生表（tool_calls → messages → conversations → users），它们没有 tenant_id 列。
+#
+# 这里依赖 PostgreSQL 的语义：**子查询里的父表同样受它自己的策略约束**，所以 EXISTS 只会
+# 匹配到当前租户的父行。
+#
+# 正确性的关键是**整条父链都受有效 RLS 保护**，而不只是"策略建过一遍"：链上任何一环缺策略，
+# 递归就会漏。这条不能靠读代码确认，必须由集成用例用多级链的跨租户负向场景证明。
+_RLS_EXISTS_TEMPLATE = (
+    "EXISTS (SELECT 1 FROM {parent} AS parent_row WHERE parent_row.{parent_key} = {table}.{local_key})"
+)
+
+
+def _derived_policy_statements() -> tuple[str, ...]:
+    statements: list[str] = []
+    for table, (parent, local_key, parent_key) in DERIVED_TABLE_PARENTS.items():
+        predicate = _RLS_EXISTS_TEMPLATE.format(parent=parent, parent_key=parent_key, table=table, local_key=local_key)
+        statements += [
+            f"ALTER TABLE IF EXISTS {table} ENABLE ROW LEVEL SECURITY",
+            f"ALTER TABLE IF EXISTS {table} FORCE ROW LEVEL SECURITY",
+            f"DROP POLICY IF EXISTS tenant_isolation ON {table}",
+            f"CREATE POLICY tenant_isolation ON {table} USING ({predicate}) WITH CHECK ({predicate})",
+        ]
+    return tuple(statements)
+
+
+RLS_POLICY_SCHEMA_STATEMENTS: tuple[str, ...] = (
+    tuple(
+        statement
+        for table in TENANT_ROOT_TABLES
+        for statement in (
+            f"ALTER TABLE IF EXISTS {table} ENABLE ROW LEVEL SECURITY",
+            # FORCE 压住表 owner；superuser 仍会绕过，所以真正的保证是运行时角色非 owner
+            # （由 require_restricted_runtime_role 在启动上挡）。
+            f"ALTER TABLE IF EXISTS {table} FORCE ROW LEVEL SECURITY",
+            f"DROP POLICY IF EXISTS tenant_isolation ON {table}",
+            f"CREATE POLICY tenant_isolation ON {table} USING ({RLS_TENANT_PREDICATE}) "
+            f"WITH CHECK ({RLS_TENANT_PREDICATE})",
+        )
+    )
+    + _derived_policy_statements()
+)
 TENANT_RUNTIME_ROLE = "yuxi_app"
 
 
@@ -770,6 +843,7 @@ class PostgresManager(metaclass=SingletonMeta):
                 *TENANT_CONSTRAINT_SCHEMA_STATEMENTS,
                 *_tenant_role_statements(),
                 *TENANT_ROLE_GRANT_SCHEMA_STATEMENTS,
+                *RLS_POLICY_SCHEMA_STATEMENTS,
             ):
                 await conn.execute(text(statement))
 
@@ -1787,22 +1861,33 @@ class PostgresManager(metaclass=SingletonMeta):
                     )
                 )
             ).one()
-            table_owner = (
+            # 查**全部**基表，不是只查 users：只查一张表时，只要运行时不巧拥有另一张表，
+            # 那条表的 RLS 就静默失效。用 pg_has_role 而不是比较名字——通过角色成员关系
+            # 继承来的所有权同样会绕过 RLS。
+            owned_tables = (
                 await connection.execute(
-                    text("SELECT tableowner FROM pg_tables WHERE schemaname = 'public' AND tablename = 'users'")
+                    text(
+                        "SELECT c.relname FROM pg_class c "
+                        "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                        "WHERE n.nspname = 'public' AND c.relkind = 'r' "
+                        "AND pg_has_role(current_user, c.relowner, 'USAGE') "
+                        "ORDER BY c.relname"
+                    )
                 )
-            ).scalar()
+            ).scalars().all()
 
         problems = []
         if role.rolsuper:
             problems.append("superuser")
         if role.rolbypassrls:
             problems.append("BYPASSRLS")
-        if table_owner == role.role_name:
-            problems.append("受保护表的 owner")
+        if owned_tables:
+            shown = "、".join(owned_tables[:5])
+            more = f" 等 {len(owned_tables)} 张表" if len(owned_tables) > 5 else ""
+            problems.append(f"拥有基表（{shown}{more}）")
         if problems:
             raise RuntimeError(
-                f"运行时数据库角色不足以承载租户隔离：{role.role_name} 是 " + "、".join(problems)
+                f"运行时数据库角色不足以承载租户隔离：{role.role_name} 是 " + "；".join(problems)
             )
 
     @asynccontextmanager
