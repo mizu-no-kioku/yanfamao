@@ -30,7 +30,7 @@ import redis as redis_lib
 import _migration_round as migration_round_module
 import _worker_round as worker_round_module
 from _round_process import CapturedProcess, spawn_captured
-from _worker_round import HEALTH_KEYS, WorkerRoundMutex
+from _worker_round import HEALTH_KEYS, WorkerRound, WorkerRoundMutex
 
 pytestmark = [pytest.mark.integration]
 
@@ -264,10 +264,51 @@ def test_losing_the_lease_reaps_the_real_worker_and_fails_the_round(migrated_tes
     finally:
         # 判定为"应保留"之后，本用例自己把它清掉：它是自检用例，不是真失败。
         if round_ is not None:
-            worker_round_module.stop_worker_round(round_, keep_artifacts=False)
+            worker_round_module.stop_worker_round(round_)
+            shutil.rmtree(round_.root, ignore_errors=True)
         mutex.__exit__(None, None, None)
         client.delete(worker_round_module.MUTEX_KEY)
         client.close()
+
+
+def test_a_lease_loss_discovered_during_the_final_reap_still_keeps_the_scene(tmp_path: Path, monkeypatch) -> None:
+    """收尾窗口里才发现的丢锁也必须保留现场——判定要排在回收**之后**。
+
+    这条用例把丢锁**注入到回收过程内部**：旧写法在调用清理函数之前就把 `must_keep_artifacts()`
+    算好了，于是会先删目录、随后才报丢锁；现场没了，报错也就无从复现。
+    """
+
+    root = migration_round_module.new_round_root()
+    roots, child_cwd = migration_round_module.build_round_roots(root)
+    round_ = WorkerRound(root=root, roots=roots, child_cwd=child_cwd, env={}, log_path=root / "worker.log")
+    round_.log_path.write_text("scene\n", encoding="utf-8")
+    captured = _spawn_sleeper(tmp_path, "import time; time.sleep(120)")
+    round_.captured = captured
+
+    original_reap = CapturedProcess.reap
+    original_decide = worker_round_module.must_keep_artifacts
+    order: list[str] = []
+
+    def reap_discovering_a_lost_lease(self, **kwargs):
+        order.append("reap")
+        round_.lease_lost = True  # 看门狗在收尾窗口里发现丢锁
+        return original_reap(self, **kwargs)
+
+    def decide_recording(watched: WorkerRound) -> bool:
+        order.append("decide")
+        return original_decide(watched)
+
+    monkeypatch.setattr(CapturedProcess, "reap", reap_discovering_a_lost_lease)
+    monkeypatch.setattr(worker_round_module, "must_keep_artifacts", decide_recording)
+    try:
+        with pytest.raises(RuntimeError, match="丢掉了互斥租约"):
+            worker_round_module.close_worker_round(round_, failed_tests=[])
+        # 顺序本身是这条用例的重点：判定早于回收的话，看门狗在收尾窗口里的发现会被漏掉。
+        assert order == ["reap", "decide"], f"保留判定没有排在回收之后：{order}"
+        assert round_.root.is_dir(), "报错之前就把现场删了"
+        assert round_.log_path.is_file(), "日志也被删了"
+    finally:
+        shutil.rmtree(round_.root, ignore_errors=True)
 
 
 # ---------------------------------------------------------------- 进程：持续日志与整组回收

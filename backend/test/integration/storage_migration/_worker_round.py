@@ -43,6 +43,7 @@ import shutil
 import sys
 import threading
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
@@ -473,18 +474,36 @@ def raise_if_round_failed(round_: WorkerRound) -> None:
     )
 
 
-def stop_worker_round(round_: WorkerRound, *, keep_artifacts: bool) -> None:
-    """整组回收；`keep_artifacts` 为真时保留日志与临时产物并打印路径与日志尾部。"""
+def stop_worker_round(round_: WorkerRound) -> None:
+    """停看门狗并整组回收。**不做清理判定**——判定的时机由 `close_worker_round` 保证。"""
 
     _stop_lease_watchdog(round_)
     if round_.captured is not None:
         round_.captured.reap()
 
-    if not keep_artifacts:
+
+def close_worker_round(round_: WorkerRound, *, failed_tests: Sequence[str]) -> None:
+    """收尾并上报，顺序**固定**在这里，调用方无法搞反：
+
+    1. 停看门狗并回收整组（看门狗在这期间仍可能发现丢锁，所以判定必须排在它后面）；
+    2. 用**最终的**轮次状态 + pytest 判定结果决定清理还是保留；
+    3. 保留时先把现场打出来，再报本轮失败。
+
+    旧写法把 `must_keep_artifacts()` 当作参数传给清理函数，求值发生在停止看门狗**之前**：
+    看门狗在 join 窗口里发现丢锁、而清理已经按旧状态决定删目录，就会出现
+    "现场已删、随后才报丢锁"——与"先保留现场，再报失败"正好相反。
+    """
+
+    stop_worker_round(round_)
+
+    keep = bool(failed_tests) or must_keep_artifacts(round_)
+    if not keep:
         shutil.rmtree(round_.root, ignore_errors=True)
         return
+
     print(f"[part2] 本轮 worker 产物保留（returncode={round_.returncode}，worker_id={round_.worker_id}）")
     print(f"[part2] 临时根：{round_.root}")
     print(round_.log_tail())
+    raise_if_round_failed(round_)
 
 

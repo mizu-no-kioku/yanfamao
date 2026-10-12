@@ -104,9 +104,6 @@ def worker_round(migrated_test_database: MigrationRound) -> Iterator[WorkerRound
         try:
             yield round_
         finally:
-            # 顺序是有意的：先回收整组、先保留产物，再报错——失败时现场还在。
-            worker_round_module.stop_worker_round(
-                round_,
-                keep_artifacts=keep_artifacts(round_failed=worker_round_module.must_keep_artifacts(round_)),
-            )
-            worker_round_module.raise_if_round_failed(round_)
+            # 收尾顺序（停看门狗 → 回收 → 判定保留/清理 → 上报失败）由 `close_worker_round`
+            # 内部固定：在这里自己组合"先判定再回收"会让判定早于看门狗的最后一瞥。
+            worker_round_module.close_worker_round(round_, failed_tests=_FAILED_TESTS)
