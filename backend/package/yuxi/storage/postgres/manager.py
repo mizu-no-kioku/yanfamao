@@ -230,6 +230,97 @@ RLS_POLICY_SCHEMA_STATEMENTS: tuple[str, ...] = (
     )
     + _derived_policy_statements()
 )
+# 引用一致性：一行不能同时挂在**两个不同知识库**的父行上。
+#
+# 与 RLS 的分工是明确的：RLS 管租户可见性，这里管知识库归属自洽。**同租户、不同知识库**的组合
+# RLS 抓不到（两边的行都可见），只有这里能抓；跨租户的组合两层都会拒绝。
+#
+# 子表 -> ((本表列, 父表, 父表键), ...)。列名对着真库的 FK 与 information_schema 核对过：
+# `knowledge_graph_triples` 的实体列是 `source_entity_id` / `target_entity_id`（不是 subject/object）。
+TENANT_REFERENCE_RULES: dict[str, tuple[tuple[str, str, str], ...]] = {
+    "knowledge_files": (("parent_id", "knowledge_files", "file_id"),),
+    "knowledge_chunks": (("file_id", "knowledge_files", "file_id"),),
+    "knowledge_graph_entity_mentions": (
+        ("entity_id", "knowledge_graph_entities", "entity_id"),
+        ("file_id", "knowledge_files", "file_id"),
+        ("chunk_id", "knowledge_chunks", "chunk_id"),
+    ),
+    "knowledge_graph_triples": (
+        ("source_entity_id", "knowledge_graph_entities", "entity_id"),
+        ("target_entity_id", "knowledge_graph_entities", "entity_id"),
+    ),
+    "knowledge_graph_triple_mentions": (
+        ("triple_id", "knowledge_graph_triples", "triple_id"),
+        ("file_id", "knowledge_files", "file_id"),
+        ("chunk_id", "knowledge_chunks", "chunk_id"),
+    ),
+    "evaluation_dataset_items": (("dataset_id", "evaluation_datasets", "dataset_id"),),
+    "evaluation_runs": (("dataset_id", "evaluation_datasets", "dataset_id"),),
+    "evaluation_run_items": (("dataset_item_id", "evaluation_dataset_items", "item_id"),),
+}
+# 行自身知识库的来源。绝大多数表直接有 `kb_id` 列；`evaluation_run_items` 没有，只能经**不可空**的
+# `run_id` 取——这正是它的主归属链走 Run 而不是可空的 `dataset_item_id` 的原因。
+TENANT_REFERENCE_ROW_KB: dict[str, str] = {
+    "evaluation_run_items": "(SELECT kb_id FROM evaluation_runs WHERE run_id = NEW.run_id)",
+}
+TENANT_REFERENCE_DEFAULT_ROW_KB = "NEW.kb_id"
+
+
+def _reference_consistency_statements() -> tuple[str, ...]:
+    """为每张混合父引用表生成一个 BEFORE INSERT OR UPDATE 触发器。
+
+    **为什么用触发器而不是复合外键**（裁决）：`evaluation_run_items` 没有 `kb_id` 列，复合外键
+    要么给它加一个冗余列（与「派生表靠外键链，不冗余列」冲突），要么两套机制并存；三个可空引用
+    （`evaluation_run_items.dataset_item_id`、`evaluation_runs.dataset_id`、`knowledge_files.parent_id`）
+    在复合外键下需要 PG15+ 的 `ON DELETE SET NULL (列清单)`，否则普通 `SET NULL` 会把新加的 kb 列
+    一并置空；而**创建复合外键会校验存量行**，在有数据的库上可能把迁移卡死——触发器只作用于新写入。
+    触发器还是唯一不用在 ORM `create_all` 与手写 DDL 两条路径各改一遍的形态。
+
+    函数按默认 `SECURITY INVOKER` 运行：父行被 RLS 挡住时子查询返回 NULL，`IS DISTINCT FROM`
+    判定为不一致从而拒绝，与「RLS 一律 fail-closed」一致。
+    """
+
+    statements: list[str] = []
+    for table, rules in TENANT_REFERENCE_RULES.items():
+        row_kb = TENANT_REFERENCE_ROW_KB.get(table, TENANT_REFERENCE_DEFAULT_ROW_KB)
+        checks = "\n".join(
+            f"""
+                IF NEW.{local_key} IS NOT NULL THEN
+                    IF (SELECT parent_row.kb_id FROM {parent} AS parent_row
+                        WHERE parent_row.{parent_key} = NEW.{local_key}) IS DISTINCT FROM row_kb THEN
+                        RAISE EXCEPTION
+                            'reference consistency violated - {table}.{local_key} belongs to another knowledge base'
+                            USING ERRCODE = '23514';
+                    END IF;
+                END IF;"""
+            for local_key, parent, parent_key in rules
+        )
+        function = f"enforce_{table}_tenant_reference_consistency"
+        statements += [
+            f"""
+            CREATE OR REPLACE FUNCTION {function}() RETURNS trigger AS $$
+            DECLARE
+                row_kb VARCHAR(80);
+            BEGIN
+                row_kb := {row_kb};
+                -- 取不到行自身的 kb 时交给外键报错：BEFORE 触发器先于外键检查运行，在这里抛
+                -- 「引用不一致」会把「父行不存在」这个更准确的原因盖掉。
+                IF row_kb IS NULL THEN
+                    RETURN NEW;
+                END IF;
+                {checks}
+                RETURN NEW;
+            END;
+            $$ LANGUAGE plpgsql
+            """,
+            f"DROP TRIGGER IF EXISTS {function} ON {table}",
+            f"CREATE TRIGGER {function} BEFORE INSERT OR UPDATE ON {table} "
+            f"FOR EACH ROW EXECUTE FUNCTION {function}()",
+        ]
+    return tuple(statements)
+
+
+TENANT_REFERENCE_CONSISTENCY_STATEMENTS: tuple[str, ...] = _reference_consistency_statements()
 TENANT_RUNTIME_ROLE = "yuxi_app"
 
 
@@ -862,6 +953,19 @@ class PostgresManager(metaclass=SingletonMeta):
         self._check_initialized()
         async with self.async_engine.begin() as conn:
             for statement in RLS_POLICY_SCHEMA_STATEMENTS:
+                await conn.execute(text(statement))
+
+    async def ensure_tenant_reference_consistency(self) -> None:
+        """建立引用一致性触发器：一行不能同时挂在两个不同知识库的父行上。
+
+        与 `ensure_tenant_rls()` 分开：RLS 管租户可见性，这里管知识库归属自洽。幂等
+        （`CREATE OR REPLACE FUNCTION` + `DROP TRIGGER IF EXISTS`）。与策略语句一样**不加**
+        `to_regclass` 守卫——缺表时显式失败能暴露建表顺序错误。
+        """
+
+        self._check_initialized()
+        async with self.async_engine.begin() as conn:
+            for statement in TENANT_REFERENCE_CONSISTENCY_STATEMENTS:
                 await conn.execute(text(statement))
 
     async def upgrade_knowledge_schema_v1_to_v2(self) -> None:
