@@ -1,15 +1,19 @@
 from __future__ import annotations
 
+import re
+from contextlib import nullcontext
 from decimal import Decimal
 
 import pytest
-
+from yuxi.nl2sql.table_policy import MAX_ROWS_CODE_UPPER_BOUND
 from yuxi.repositories.business_database_repository import BusinessDatabaseConnection
 from yuxi.services.business_database_security import PolicyViolation
 from yuxi.services.business_database_service import (
     BusinessDatabaseAuthorizationError,
+    BusinessDatabaseConfigurationError,
     BusinessDatabaseService,
     BusinessDatabaseSettings,
+    BusinessQueryScope,
 )
 
 pytestmark = pytest.mark.unit
@@ -59,6 +63,13 @@ SCHEMA = {
             "COLUMN_TYPE": "int",
             "COLUMN_COMMENT": "状态",
         },
+        {
+            "TABLE_NAME": "t_project",
+            "TABLE_COMMENT": "项目表",
+            "COLUMN_NAME": "ENABLE_STATUS",
+            "COLUMN_TYPE": "int",
+            "COLUMN_COMMENT": "启用状态",
+        },
     ],
     "t_project_user": [
         {
@@ -96,8 +107,53 @@ SCHEMA = {
             "COLUMN_TYPE": "int",
             "COLUMN_COMMENT": "状态",
         },
+        {
+            "TABLE_NAME": "t_project_user",
+            "TABLE_COMMENT": "项目人员表",
+            "COLUMN_NAME": "ENABLE_STATUS",
+            "COLUMN_TYPE": "int",
+            "COLUMN_COMMENT": "启用状态",
+        },
     ],
 }
+
+
+class FakeDirectory:
+    """实现解析器依赖的只读目录协议，不连数据库。"""
+
+    def __init__(self) -> None:
+        self.projects: tuple[int, ...] = (2, 71)
+        self.active_user = True
+        self.tenants: tuple[int, ...] = (1,)
+        self.staff_ids: tuple[int, ...] = (13,)
+        self.role_relations: tuple[int, ...] = (3001,)
+        self.active_roles: tuple[int, ...] = (3001,)
+        self.menu_ids: frozenset[int] = frozenset({253})
+        self.menu_codes: frozenset[str] = frozenset({"AI"})
+
+    def find_active_user(self, user_id: int) -> bool:
+        return self.active_user
+
+    def find_tenants_for_user(self, user_id: int) -> tuple[int, ...]:
+        return self.tenants
+
+    def find_active_staff_ids(self, user_id: int, tenant_id: int) -> tuple[int, ...]:
+        return self.staff_ids
+
+    def find_role_relation_ids(self, user_id: int, tenant_id: int) -> tuple[int, ...]:
+        return self.role_relations
+
+    def find_active_role_ids(self, role_ids: tuple[int, ...]) -> tuple[int, ...]:
+        return tuple(role_id for role_id in role_ids if role_id in self.active_roles)
+
+    def find_menu_ids(self, role_ids: tuple[int, ...], tenant_id: int) -> frozenset[int]:
+        return self.menu_ids
+
+    def find_menu_codes(self, role_ids: tuple[int, ...], tenant_id: int) -> frozenset[str]:
+        return self.menu_codes
+
+    def find_authorized_project_ids(self, tenant_id: int, staff_id: int) -> tuple[int, ...]:
+        return self.projects
 
 
 class FakeRepository:
@@ -105,22 +161,19 @@ class FakeRepository:
 
     def __init__(self, config: BusinessDatabaseConnection):
         self.config = config
-        self.identity_valid = True
-        self.project_ids = (2, 71)
         self.executed_sql: str | None = None
+        self.directory = FakeDirectory()
+        # 作用域提供给本次调用的连接；服务必须把它透传给 schema 读取与最终执行。
+        self.scope_connection = object()
+        # 记录每次收到的连接，供断言「解析与执行同一条连接」。
+        self.seen_connections: list[object] = []
 
-    def validate_staff_identity(self, tenant_id: int, staff_id: int) -> bool:
-        assert (tenant_id, staff_id) == (1, 13)
-        return self.identity_valid
-
-    def load_schema(self, table_names: frozenset[str]):
+    def load_schema(self, table_names: frozenset[str], *, connection=None):
+        self.seen_connections.append(connection)
         return {name: SCHEMA[name] for name in table_names}
 
-    def list_project_ids(self, tenant_id: int, staff_id: int, *, allow_all_projects: bool):
-        assert (tenant_id, staff_id, allow_all_projects) == (1, 13, False)
-        return self.project_ids
-
-    def execute_query(self, sql: str):
+    def execute_query(self, sql: str, *, connection=None):
+        self.seen_connections.append(connection)
         self.executed_sql = sql
         return {
             "row_count": 1,
@@ -129,7 +182,7 @@ class FakeRepository:
         }
 
 
-def make_settings(identity: dict | None = None) -> BusinessDatabaseSettings:
+def make_settings(binding: dict | None = None, *, max_rows: int = 20) -> BusinessDatabaseSettings:
     """构造不含真实凭据的测试配置。"""
     return BusinessDatabaseSettings(
         connection=BusinessDatabaseConnection(
@@ -141,25 +194,26 @@ def make_settings(identity: dict | None = None) -> BusinessDatabaseSettings:
             query_timeout_ms=1000,
         ),
         identities={
-            "uid-1": identity
+            "uid-1": binding
             or {
+                "business_user_id": 17,
                 "tenant_id": 1,
-                "staff_id": 13,
-                "allowed_tables": ["t_project", "t_project_user"],
-                "allow_all_projects": False,
-                "allow_project_member_rows": False,
             }
         },
-        max_rows=20,
+        max_rows=max_rows,
     )
 
 
 def build_service(settings: BusinessDatabaseSettings | None = None):
-    """返回服务和可观察的假 repository。"""
-    repository = FakeRepository((settings or make_settings()).connection)
+    """返回服务和可观察的假 repository（scope_connection 与 directory 也挂在它上面）。"""
+    resolved = settings or make_settings()
+    repository = FakeRepository(resolved.connection)
     service = BusinessDatabaseService(
-        settings_loader=lambda: settings or make_settings(),
+        settings_loader=lambda: resolved,
         repository_factory=lambda _config: repository,
+        query_scope=lambda _config: nullcontext(
+            BusinessQueryScope(connection=repository.scope_connection, directory=repository.directory)
+        ),
     )
     return service, repository
 
@@ -182,8 +236,30 @@ def test_service_executes_only_rewritten_query_and_serializes_decimal() -> None:
     lowered = repository.executed_sql.lower()
     assert "t_project.tenant_id = 1" in lowered
     assert "t_project.id in (2, 71)" in lowered
-    assert "limit 20" in lowered
+    # 必须精确落在 LIMIT 20，而不是被 `"limit 20" in "limit 200"` 这种子串巧合蒙混过关。
+    assert re.search(r"\blimit 20\b(?!\d)", lowered), "环境变量行数上限必须真正落到生成的 LIMIT 上"
     assert result["rows"][0]["GENERAL_BUDGET"] == "100.00"
+
+
+def test_query_uses_the_scope_connection_for_schema_and_execution() -> None:
+    """Schema 读取与最终 SQL 必须落在作用域提供的那一条连接上。"""
+    service, repository = build_service()
+
+    service.execute_authorized_query("uid-1", "SELECT ID, PROJECT_NAME FROM t_project")
+
+    assert len(repository.seen_connections) >= 2, "应记录到 schema 读取与执行两次调用"
+    assert {id(item) for item in repository.seen_connections} == {id(repository.scope_connection)}
+
+
+def test_list_and_describe_also_use_the_scope_connection() -> None:
+    """list / describe 同样重新解析权限，并且复用同一条作用域连接。"""
+    service, repository = build_service()
+
+    service.list_authorized_tables("uid-1")
+    service.describe_authorized_table("uid-1", "t_project")
+
+    assert repository.seen_connections, "list/describe 也应通过作用域连接读 schema"
+    assert {id(item) for item in repository.seen_connections} == {id(repository.scope_connection)}
 
 
 def test_service_limits_project_member_rows_to_current_staff() -> None:
@@ -199,12 +275,10 @@ def test_service_limits_project_member_rows_to_current_staff() -> None:
 def test_service_keeps_internal_scope_columns_out_of_visible_schema() -> None:
     settings = make_settings(
         {
+            "business_user_id": 17,
             "tenant_id": 1,
-            "staff_id": 13,
             "allowed_tables": ["t_project"],
             "allowed_columns": {"t_project": ["PROJECT_NAME"]},
-            "allow_all_projects": False,
-            "allow_project_member_rows": False,
         }
     )
     service, repository = build_service(settings)
@@ -218,6 +292,39 @@ def test_service_keeps_internal_scope_columns_out_of_visible_schema() -> None:
     assert "t_project.id in (2, 71)" in repository.executed_sql.lower()
 
 
+def test_service_hides_internal_status_columns_from_schema() -> None:
+    """状态列是守卫内部列，模型不得看见。
+
+    原业务库用 9999 表示启用；模型一旦看见 ENABLE_STATUS 就会按常识猜 = 1，
+    把本该返回 14 个项目的查询答成 0。
+    """
+    service, _ = build_service()
+    for table in ("t_project", "t_project_user"):
+        names = {column["name"] for column in service.describe_authorized_table("uid-1", table)["columns"]}
+        assert "OPERATER_STATUS" not in names
+        assert "ENABLE_STATUS" not in names
+
+
+def test_service_rejects_query_referencing_internal_status_column() -> None:
+    """模型显式引用状态列必须被拒，且不得有任何 SQL 落到数据库。"""
+    service, repository = build_service()
+    with pytest.raises(PolicyViolation) as exc:
+        service.execute_authorized_query("uid-1", "SELECT ID FROM t_project WHERE OPERATER_STATUS > 0")
+    assert exc.value.code == "COLUMN_NOT_ALLOWED"
+    assert repository.executed_sql is None
+
+
+def test_service_still_injects_status_predicate_after_hiding_the_column() -> None:
+    """隐藏状态列不得削弱强制：守卫仍须自行注入 OPERATER_STATUS > 0。
+
+    这条与上面两条构成一对——隐藏可见性，但不放松执行。
+    """
+    service, repository = build_service()
+    service.execute_authorized_query("uid-1", "SELECT ID, PROJECT_NAME FROM t_project")
+    assert repository.executed_sql is not None
+    assert "operater_status > 0" in repository.executed_sql.lower()
+
+
 def test_service_rejects_unmapped_uid_before_database_access() -> None:
     service, _ = build_service()
     with pytest.raises(BusinessDatabaseAuthorizationError, match="尚未绑定"):
@@ -225,28 +332,141 @@ def test_service_rejects_unmapped_uid_before_database_access() -> None:
 
 
 def test_service_rejects_invalid_staff_binding() -> None:
+    """员工编号由解析器推导；该租户下没有有效员工时应拒绝。"""
     service, repository = build_service()
-    repository.identity_valid = False
-    with pytest.raises(BusinessDatabaseAuthorizationError, match="员工"):
+    repository.directory.staff_ids = ()
+    with pytest.raises(BusinessDatabaseAuthorizationError, match="IDENTITY_STAFF_MISSING"):
         service.list_authorized_tables("uid-1")
 
 
 def test_service_rejects_queries_when_user_has_no_projects() -> None:
     service, repository = build_service()
-    repository.project_ids = ()
-    with pytest.raises(PolicyViolation) as caught:
+    repository.directory.projects = ()
+    with pytest.raises(BusinessDatabaseAuthorizationError, match="NO_PROJECT_ACCESS"):
         service.execute_authorized_query("uid-1", "SELECT ID FROM t_project")
-    assert caught.value.code == "NO_PROJECT_ACCESS"
 
 
-def test_settings_reject_unaudited_table() -> None:
+def test_service_rejects_function_gate_denial() -> None:
+    """没有 AI 功能菜单的身份必须被拒绝，且不得产生任何 SQL。"""
+    service, repository = build_service()
+    repository.directory.menu_ids = frozenset({900, 901})
+    with pytest.raises(BusinessDatabaseAuthorizationError, match="FUNCTION_GATE_DENIED"):
+        service.execute_authorized_query("uid-1", "SELECT ID FROM t_project")
+    assert repository.executed_sql is None
+
+
+def test_env_table_narrowing_cannot_widen_beyond_grant() -> None:
+    """环境变量层只能收紧：不在授权范围内的表取不到，收紧到空即拒绝。"""
     settings = make_settings(
         {
+            "business_user_id": 17,
             "tenant_id": 1,
-            "staff_id": 13,
             "allowed_tables": ["t_user"],
-            "allow_all_projects": False,
         }
     )
-    with pytest.raises(RuntimeError, match="尚未完成权限审计"):
-        settings.resolve_identity("uid-1")
+    service, _ = build_service(settings)
+    with pytest.raises(BusinessDatabaseAuthorizationError, match="FUNCTION_GATE_DENIED"):
+        service.list_authorized_tables("uid-1")
+
+
+# --- YUXI_BUSINESS_DB_MAX_ROWS 必须真正参与求交，且只能收紧 ---
+
+
+def test_settings_from_env_reads_max_rows(monkeypatch) -> None:
+    """环境变量必须被解析进 settings，而不是解析后无人使用。"""
+    monkeypatch.setenv("YUXI_BUSINESS_DB_HOST", "db.example.test")
+    monkeypatch.setenv("YUXI_BUSINESS_DB_USER", "readonly")
+    monkeypatch.setenv("YUXI_BUSINESS_DB_PASSWORD", "placeholder")
+    monkeypatch.setenv("YUXI_BUSINESS_DB_NAME", "business")
+    monkeypatch.setenv("YUXI_BUSINESS_DB_IDENTITIES_JSON", '{"uid-1":{"business_user_id":17}}')
+    monkeypatch.setenv("YUXI_BUSINESS_DB_MAX_ROWS", "37")
+
+    settings = BusinessDatabaseSettings.from_env()
+
+    assert settings.max_rows == 37
+
+
+def test_service_applies_env_max_rows_to_query_limit() -> None:
+    """环境变量上限必须端到端落到最终 SQL 的 LIMIT 与返回的 limit 上。"""
+    service, repository = build_service(make_settings(max_rows=20))
+
+    result = service.execute_authorized_query("uid-1", "SELECT ID, PROJECT_NAME FROM t_project")
+
+    assert result["limit"] == 20
+    assert repository.executed_sql is not None
+    assert re.search(r"\blimit 20\b(?!\d)", repository.executed_sql.lower())
+
+
+def test_service_env_max_rows_above_code_bound_cannot_widen() -> None:
+    """环境变量配置成大于代码上限时不得扩权，被压回代码上限。"""
+    service, repository = build_service(make_settings(max_rows=1000))
+
+    result = service.execute_authorized_query("uid-1", "SELECT ID, PROJECT_NAME FROM t_project")
+
+    assert result["limit"] == MAX_ROWS_CODE_UPPER_BOUND
+    assert repository.executed_sql is not None
+    assert re.search(rf"\blimit {MAX_ROWS_CODE_UPPER_BOUND}\b(?!\d)", repository.executed_sql.lower())
+
+
+# --- 环境变量层只能收紧：配置清洗与行范围 ---
+
+
+@pytest.mark.parametrize("blank_tables", [["   "], ["", "  "], ["\t"]])
+def test_allowed_tables_blank_after_cleaning_is_configuration_error(blank_tables) -> None:
+    """声明了 allowed_tables 却清洗为空，必须按配置错误拒绝。
+
+    回退成「不限制」等于把一次配置笔误静默放大成放行，与「只能收紧」的语义相反。
+    """
+    settings = make_settings({"business_user_id": 17, "tenant_id": 1, "allowed_tables": blank_tables})
+
+    with pytest.raises(BusinessDatabaseConfigurationError):
+        settings.resolve_binding("uid-1")
+
+
+def test_allowed_tables_cleaned_names_are_lowercased() -> None:
+    settings = make_settings({"business_user_id": 17, "tenant_id": 1, "allowed_tables": [" T_Project "]})
+
+    binding = settings.resolve_binding("uid-1")
+
+    assert binding.allowed_tables == frozenset({"t_project"})
+
+
+def test_allowed_tables_absent_means_no_narrowing() -> None:
+    """未声明 allowed_tables 才表示不额外收紧。"""
+    binding = make_settings({"business_user_id": 17, "tenant_id": 1}).resolve_binding("uid-1")
+
+    assert binding.allowed_tables is None
+
+
+@pytest.mark.parametrize("bad_columns", [{"t_project": ["  "]}, {"  ": ["ID"]}])
+def test_allowed_columns_blank_entries_are_configuration_error(bad_columns) -> None:
+    """allowed_columns 的空表名或空字段名同样按配置错误拒绝，不静默丢弃。"""
+    settings = make_settings({"business_user_id": 17, "tenant_id": 1, "allowed_columns": bad_columns})
+
+    with pytest.raises(BusinessDatabaseConfigurationError):
+        settings.resolve_binding("uid-1")
+
+
+def test_deprecated_allow_project_member_rows_is_rejected() -> None:
+    """已删除的环境变量开关必须显式报错，而不是被静默忽略。
+
+    静默忽略会让管理员以为「放开成员行范围」已生效，实际仍被 STAFF_ID 限定；
+    要查看其他项目成员，必须由 RBAC/YAML 资源授权表达，而不是环境变量扩权。
+    """
+    settings = make_settings({"business_user_id": 17, "tenant_id": 1, "allow_project_member_rows": True})
+
+    with pytest.raises(BusinessDatabaseConfigurationError, match="allow_project_member_rows"):
+        settings.resolve_binding("uid-1")
+
+
+def test_env_cannot_cancel_staff_row_scope() -> None:
+    """环境变量无权取消 STAFF_ID 行范围：成员行仍被限定为当前员工。"""
+    service, repository = build_service()
+
+    service.execute_authorized_query(
+        "uid-1",
+        "SELECT p.ID, pu.STAFF_ID FROM t_project p JOIN t_project_user pu ON pu.PROJECT_ID = p.ID",
+    )
+
+    assert repository.executed_sql is not None
+    assert "pu.staff_id = 13" in repository.executed_sql.lower()

@@ -860,9 +860,7 @@ class MilvusGraphService:
 
         effective_filters = filters or {}
         if effective_filters.get("entity_attributes") and not await self.attributes_ready(effective_kb_id):
-            raise GraphAttributesNotReadyError(
-                "该图谱尚未回填筛选属性，请先执行图谱属性回填后再按实体属性筛选"
-            )
+            raise GraphAttributesNotReadyError("该图谱尚未回填筛选属性，请先执行图谱属性回填后再按实体属性筛选")
 
         label = safe_neo4j_label(effective_kb_id)
         bounded_depth = max(1, min(max_depth, MAX_SUBGRAPH_DEPTH))
@@ -980,14 +978,10 @@ class MilvusGraphService:
             if row["value"] not in values_by_name[row["name"]]:
                 values_by_name[row["name"]].append(row["value"])
         text_values = [row["text"] for row in relation_attributes if row["text"] is not None]
-        extractor_values = sorted(
-            {row["extractor_type"] for row in relation_attributes if row["extractor_type"]}
-        )
+        extractor_values = sorted({row["extractor_type"] for row in relation_attributes if row["extractor_type"]})
         return {
             "entity_types": [row["entity_type"] for row in entity_types],
-            "entity_attributes": [
-                {"name": name, "values": values} for name, values in sorted(values_by_name.items())
-            ],
+            "entity_attributes": [{"name": name, "values": values} for name, values in sorted(values_by_name.items())],
             "relation_types": [row["relation_type"] for row in relation_types if row["relation_type"]],
             "relation_attributes": [
                 {"name": "text", "values": text_values},
@@ -1002,8 +996,7 @@ class MilvusGraphService:
         with self.driver.session() as session:
             entity_types = list(
                 session.run(
-                    f"MATCH (e:Entity:MilvusKB:`{label}`) "
-                    "RETURN DISTINCT e.label AS entity_type ORDER BY entity_type"
+                    f"MATCH (e:Entity:MilvusKB:`{label}`) RETURN DISTINCT e.label AS entity_type ORDER BY entity_type"
                 )
             )
             entity_attributes = list(
@@ -1352,9 +1345,7 @@ class MilvusGraphService:
         if unhandled_names:
             raise ValueError(f"不支持的关系属性名：{'、'.join(unhandled_names)}")
         if any(condition["name"] == "text" for condition in relation_attributes):
-            predicates.append(
-                "all(v IN $relation_attr_text WHERE toLower(coalesce(r.text, '')) CONTAINS toLower(v))"
-            )
+            predicates.append("all(v IN $relation_attr_text WHERE toLower(coalesce(r.text, '')) CONTAINS toLower(v))")
         if any(condition["name"] == "extractor_type" for condition in relation_attributes):
             predicates.append("all(v IN $relation_attr_extractor_type WHERE r.extractor_type = v)")
         return predicates
