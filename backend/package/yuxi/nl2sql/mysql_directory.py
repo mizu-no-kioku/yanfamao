@@ -1,16 +1,19 @@
 """BusinessDirectory 的 MySQL 实现。
 
-**一致性边界**：默认构造（`MySqlBusinessDirectory(connect)`）下，每次查询各自开一条
-新连接、用完即关——一次 `resolve_query_policy` 的多步读取来自不同时刻，**没有共享快照**。
-需要解析内部一致性的调用方应当用 `single_transaction_directory()`：它把整次解析绑定到
-同一条连接、同一个只读事务，配合 MySQL 可重复读得到一致快照。
+**一致性边界**：目录与它绑定的那条连接共享快照。
+`directory_on_connection(connection)` 把目录绑到调用方已开启的连接与只读事务上，
+且目录内的方法不会关闭它——`mysql_query_scope` 正是这样让权限解析、Schema 读取
+与最终业务 SQL 共处同一条连接、同一个只读事务，配合 MySQL 可重复读得到一致快照。
+
+默认构造（`MySqlBusinessDirectory(connect)`）下每次查询各自开一条新连接、用完即关，
+一次 `resolve_query_policy` 的多步读取来自不同时刻，**没有共享快照**；
+只适用于不需要解析内部一致性的场景（如只读对账）。
 
 关键：角色基数走 `tb_user_enterprise_role_tenant` 的原始行，
 不 JOIN 角色—菜单表——否则一个多菜单角色会被放大成上百行。
 """
 
-from collections.abc import Callable, Iterator, Sequence
-from contextlib import contextmanager
+from collections.abc import Callable, Sequence
 
 import pymysql
 
@@ -207,7 +210,7 @@ class _SharedConnection:
         return getattr(self._connection, name)
 
     def close(self) -> None:
-        """不关闭：由 single_transaction_directory 负责。"""
+        """不关闭：由外层作用域（`mysql_query_scope`）负责关闭。"""
 
 
 def directory_on_connection(connection: "pymysql.connections.Connection") -> MySqlBusinessDirectory:
@@ -217,23 +220,3 @@ def directory_on_connection(connection: "pymysql.connections.Connection") -> MyS
     因此调用方可以让权限解析与最终 SQL 共处同一条连接、同一个事务。
     """
     return MySqlBusinessDirectory(lambda: _SharedConnection(connection))
-
-
-@contextmanager
-def single_transaction_directory(connect: ConnectionFactory) -> Iterator[MySqlBusinessDirectory]:
-    """把一次权限解析绑定到同一条连接、同一个只读事务。
-
-    MySQL 默认可重复读：事务内的多次读取命中同一快照，因此身份、角色、菜单与
-    项目范围来自同一时刻，不会拼出一个跨时刻的策略。
-
-    注意：本上下文只覆盖**解析**。业务查询的执行仍走仓库自己的连接，
-    因此「解析与执行同一快照」尚未满足——那需要执行也接入这条事务。
-    """
-    connection = connect()
-    try:
-        with connection.cursor() as cursor:
-            cursor.execute("SET SESSION TRANSACTION READ ONLY")
-            cursor.execute("START TRANSACTION READ ONLY")
-        yield directory_on_connection(connection)
-    finally:
-        connection.close()

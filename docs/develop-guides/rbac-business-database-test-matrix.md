@@ -103,6 +103,9 @@
 
 ## 尚未完成
 
-- `MySqlBusinessDirectory` 仍是每条查询各开一条连接，多步解析会读到跨时刻状态。
-  spec 要求「解析必须在一个连接、一个事务内完成」，**该接口需被替换**。
 - 环境变量层目前只在 `ty2` 上启用；其余账号按 YAML 授权全量放行。
+- 行范围不接受环境变量放宽：成员表固定为当前员工，`allow_project_member_rows` 已删除。
+  如需查看其他项目成员，须先设计 RBAC/YAML 资源授权，当前尚未提供。
+- 解析与执行同连接、同事务已由 `mysql_query_scope` + `directory_on_connection` 满足
+  （见 `backend/test/integration/nl2sql/test_query_scope_single_transaction.py`）；
+  `MySqlBusinessDirectory` 的默认构造仍每次查询各开一条连接，只用于不需要解析内部一致性的只读对账。

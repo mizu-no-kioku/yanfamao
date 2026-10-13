@@ -1,5 +1,11 @@
 """worker 启动等待 PostgreSQL 就绪：有上限、可观测、正常路径不被拖慢。
 
+分类必须按生产真实异常判定。SQLAlchemy 引擎抛出的**不是** asyncpg 异常本身：
+方言先把 asyncpg 异常翻译成 `AsyncAdapt_asyncpg_dbapi.*`，引擎再用
+`DBAPIError.instance` 包装成 `sqlalchemy.exc.*`。因此本文件的用例通过
+`sqlalchemy_wrapped()` 复刻这两步真实包装，而不是向被测函数直接抛裸 asyncpg 异常
+（那种「抛什么就捕什么」的循环自证无法发现生产路径上的漏判）。
+
 项目 logger 是 loguru，不进入 stdlib logging，因此这里直接替换 worker 模块的
 logger 为记录桩，按 loguru 的 `{}` 风格格式化后断言——比 caplog 更直接。
 """
@@ -8,9 +14,34 @@ from __future__ import annotations
 
 import asyncio
 
+import asyncpg
 import pytest
+from sqlalchemy.dialects.postgresql.asyncpg import AsyncAdapt_asyncpg_dbapi
+from sqlalchemy.exc import DBAPIError
 
 from yuxi.services import run_worker
+
+_DBAPI = AsyncAdapt_asyncpg_dbapi(asyncpg)
+
+
+def sqlalchemy_wrapped(asyncpg_error: BaseException) -> BaseException:
+    """按 SQLAlchemy asyncpg 方言的真实路径把 asyncpg 异常包装成引擎会抛出的异常。
+
+    与 `AsyncAdapt_asyncpg_dbapi._handle_exception` + `DBAPIError.instance` 等价：
+    先按 MRO 命中方言翻译表得到 `AsyncAdapt_asyncpg_dbapi.*`，再按 MRO 名称查找
+    包装成 `sqlalchemy.exc.*`。被测函数看到的就是生产里真实抛出的类型。
+    """
+    translate = _DBAPI._asyncpg_error_translate
+    translated = None
+    for super_ in type(asyncpg_error).__mro__:
+        if super_ in translate:
+            translated = translate[super_](f"{type(asyncpg_error)}: {asyncpg_error}")
+            break
+    assert translated is not None, f"asyncpg 异常未被方言翻译：{type(asyncpg_error)}"
+    translated.__cause__ = asyncpg_error
+    wrapped = DBAPIError.instance("SELECT 1", None, translated, _DBAPI.Error)
+    assert isinstance(wrapped, DBAPIError), f"未按预期包装为 DBAPIError：{wrapped!r}"
+    return wrapped
 
 
 class RecordingLogger:
@@ -48,22 +79,106 @@ class FakeClock:
         self.now += seconds
 
 
-class FakeCannotConnectNow(Exception):
-    """替代 asyncpg 的「数据库正在启动」异常。"""
-
-
 @pytest.fixture
 def env(monkeypatch):
-    """提供假时钟与记录型 logger，并清掉可能影响结果的环境变量。"""
+    """提供假时钟与记录型 logger，并清掉可能影响结果的环境变量。
+
+    刻意**不**替换分类函数：分类必须由被测代码的真实实现决定，
+    否则测试只是把断言抄了一遍实现。
+    """
     clock = FakeClock()
     logger = RecordingLogger()
     monkeypatch.setattr(run_worker.time, "monotonic", clock.monotonic)
     monkeypatch.setattr(run_worker.asyncio, "sleep", clock.sleep)
     monkeypatch.setattr(run_worker, "logger", logger)
-    monkeypatch.setattr(run_worker, "_transient_database_errors", lambda: (FakeCannotConnectNow,))
     monkeypatch.delenv("YUXI_WORKER_DB_READY_TIMEOUT_SECONDS", raising=False)
     monkeypatch.delenv("YUXI_WORKER_DB_READY_INTERVAL_SECONDS", raising=False)
     return clock, logger
+
+
+def _raiser(exc: BaseException, attempts: list[int], *, fail_times: int = 10**9):
+    """返回一个前 `fail_times` 次抛 `exc` 的 async 桩。"""
+
+    async def call() -> None:
+        attempts.append(1)
+        if len(attempts) <= fail_times:
+            raise exc
+
+    return call
+
+
+# --- 分类：真实 SQLAlchemy 包装链 ---
+
+
+@pytest.mark.parametrize(
+    ("exc_name", "label"),
+    [
+        ("CannotConnectNowError", "数据库正在启动"),
+        ("ConnectionDoesNotExistError", "连接被中断（含 pre-ping 复用失效连接）"),
+        ("AdminShutdownError", "数据库正在关闭"),
+        ("CrashShutdownError", "数据库崩溃重启中"),
+        ("TooManyConnectionsError", "连接数已满"),
+    ],
+)
+def test_wrapped_transient_errors_are_classified_transient(exc_name: str, label: str) -> None:
+    """这些经 SQLAlchemy 包装后仍必须被判为可重试。"""
+    raw = getattr(asyncpg.exceptions, exc_name)("simulated")
+    wrapped = sqlalchemy_wrapped(raw)
+
+    assert run_worker._classify_database_error(wrapped) == "transient", label
+
+
+@pytest.mark.parametrize(
+    ("exc_name", "label"),
+    [
+        ("InvalidPasswordError", "密码错误"),
+        ("InvalidCatalogNameError", "库名不存在"),
+        ("InvalidSchemaNameError", "Schema 不存在"),
+        ("UndefinedTableError", "表不存在"),
+        ("UndefinedColumnError", "字段不存在"),
+        ("InsufficientPrivilegeError", "权限不足"),
+    ],
+)
+def test_wrapped_permanent_errors_are_classified_permanent(exc_name: str, label: str) -> None:
+    """配置、认证与 Schema 类错误经包装后必须判为永久，不得重试。"""
+    raw = getattr(asyncpg.exceptions, exc_name)("simulated")
+    wrapped = sqlalchemy_wrapped(raw)
+
+    assert run_worker._classify_database_error(wrapped) == "permanent", label
+
+
+def test_outer_exception_type_alone_would_misclassify() -> None:
+    """只按最外层类型判定会漏判——这正是修复前的缺陷。
+
+    引擎把「连接已失效」包成泛化的 `DBAPIError`，它既不是
+    `asyncpg.PostgresConnectionError` 也不是 `sqlalchemy.exc.OperationalError`，
+    因此旧实现会把它当作未知错误直接失败，无法在 PostgreSQL 重启后自动恢复。
+    """
+    wrapped = sqlalchemy_wrapped(asyncpg.exceptions.ConnectionDoesNotExistError("gone"))
+
+    assert type(wrapped) is DBAPIError
+    assert not isinstance(wrapped, asyncpg.exceptions.PostgresConnectionError)
+    assert not isinstance(wrapped, run_worker.OperationalError)
+    assert run_worker._is_transient_database_error(wrapped), "必须沿 orig/cause 链判定为可重试"
+
+
+def test_wrong_password_wrapped_does_not_inherit_postgres_connection_error() -> None:
+    """文档化一个反直觉事实：密码错误并不是 `PostgresConnectionError`。
+
+    它继承自 `PostgresError`，因此任何「按 PostgresConnectionError 粗判」的写法
+    都会把密码错误误判成可重试，把部署错误拖到超时。
+    """
+    assert not issubclass(asyncpg.exceptions.InvalidPasswordError, asyncpg.exceptions.PostgresConnectionError)
+    assert not issubclass(asyncpg.exceptions.InvalidCatalogNameError, asyncpg.exceptions.PostgresConnectionError)
+    assert not issubclass(asyncpg.exceptions.CannotConnectNowError, asyncpg.exceptions.PostgresConnectionError)
+
+
+def test_unknown_exception_is_not_transient() -> None:
+    assert run_worker._classify_database_error(ValueError("schema version mismatch")) == "unknown"
+    assert not run_worker._is_transient_database_error(ValueError("schema version mismatch"))
+
+
+# --- 启动等待：行为 ---
 
 
 def test_first_attempt_success_does_not_sleep_or_warn(env, monkeypatch):
@@ -84,16 +199,11 @@ def test_first_attempt_success_does_not_sleep_or_warn(env, monkeypatch):
 
 
 def test_retries_until_database_is_ready(env, monkeypatch):
-    """数据库暂时不可用 → 有界重试 → 恢复后自动继续，并留下可观测记录。"""
+    """数据库正在启动（真实包装链）→ 有界重试 → 恢复后自动继续，并留下可观测记录。"""
     clock, logger = env
-    attempts = []
-
-    async def flaky():
-        attempts.append(1)
-        if len(attempts) < 3:
-            raise FakeCannotConnectNow("the database system is starting up")
-
-    monkeypatch.setattr(run_worker.pg_manager, "require_current_schema", flaky)
+    attempts: list[int] = []
+    wrapped = sqlalchemy_wrapped(asyncpg.exceptions.CannotConnectNowError("the database system is starting up"))
+    monkeypatch.setattr(run_worker.pg_manager, "require_current_schema", _raiser(wrapped, attempts, fail_times=2))
 
     asyncio.run(run_worker._await_database_ready())
 
@@ -103,17 +213,43 @@ def test_retries_until_database_is_ready(env, monkeypatch):
     assert any("已就绪" in w for w in logger.warnings), "恢复必须有明确记录"
 
 
+def test_stale_pooled_connection_is_retried(env, monkeypatch):
+    """pre-ping 发现连接已失效（包装成泛化 DBAPIError）属于可恢复，必须重试。"""
+    clock, _logger = env
+    attempts: list[int] = []
+    wrapped = sqlalchemy_wrapped(asyncpg.exceptions.ConnectionDoesNotExistError("connection was closed"))
+    monkeypatch.setattr(run_worker.pg_manager, "require_current_schema", _raiser(wrapped, attempts, fail_times=1))
+
+    asyncio.run(run_worker._await_database_ready())
+
+    assert len(attempts) == 2
+    assert len(clock.slept) == 1
+
+
+def test_raw_connection_refused_is_retried(env, monkeypatch):
+    """PostgreSQL 不可达（端口拒绝）在连上之前就抛出，未经包装，属于可恢复。"""
+    clock, _logger = env
+    attempts: list[int] = []
+    monkeypatch.setattr(
+        run_worker.pg_manager,
+        "require_current_schema",
+        _raiser(ConnectionRefusedError("connection refused"), attempts, fail_times=1),
+    )
+
+    asyncio.run(run_worker._await_database_ready())
+
+    assert len(attempts) == 2
+    assert len(clock.slept) == 1
+
+
 def test_timeout_raises_with_clear_error(env, monkeypatch):
     """超过上限仍不可用 → 放弃启动，日志点明上限、次数与错误类型。"""
     clock, logger = env
     monkeypatch.setenv("YUXI_WORKER_DB_READY_TIMEOUT_SECONDS", "5")
+    wrapped = sqlalchemy_wrapped(asyncpg.exceptions.CannotConnectNowError("the database system is starting up"))
+    monkeypatch.setattr(run_worker.pg_manager, "require_current_schema", _raiser(wrapped, []))
 
-    async def never_ready():
-        raise FakeCannotConnectNow("the database system is starting up")
-
-    monkeypatch.setattr(run_worker.pg_manager, "require_current_schema", never_ready)
-
-    with pytest.raises(FakeCannotConnectNow):
+    with pytest.raises(DBAPIError):
         asyncio.run(run_worker._await_database_ready())
 
     assert any("未在 5 秒内就绪" in e and "attempts=" in e for e in logger.errors), logger.errors
@@ -122,7 +258,7 @@ def test_timeout_raises_with_clear_error(env, monkeypatch):
 
 def test_non_transient_error_fails_fast(env, monkeypatch):
     """非连接类错误立即抛出，不被重试拖到超时——真问题必须立刻可见。"""
-    clock, _logger = env
+    clock, logger = env
     attempts = []
 
     async def broken():
@@ -136,91 +272,50 @@ def test_non_transient_error_fails_fast(env, monkeypatch):
 
     assert len(attempts) == 1
     assert clock.slept == []
+    assert any("classification=unknown" in e for e in logger.errors), logger.errors
 
 
-def test_cannot_connect_now_is_covered_by_transient_errors():
-    """`CannotConnectNowError` 继承自 OperatorInterventionError，必须被显式覆盖。"""
-    import asyncpg
-
-    assert asyncpg.exceptions.CannotConnectNowError in run_worker._transient_database_errors()
-
-
-def test_permanent_auth_error_fails_immediately(env, monkeypatch):
-    """密码错误等永久性配置/认证问题必须立刻失败，不得重试到超时。
-
-    这类错误重试再多次也不会好，把部署配置错误拖成 300 秒静默等待，
-    只会让排障更难。
-    """
-    clock, _logger = env
+def test_wrapped_wrong_password_fails_immediately(env, monkeypatch):
+    """密码错误经真实 SQLAlchemy 包装后必须立刻失败，不得重试到超时。"""
+    clock, logger = env
     monkeypatch.setenv("YUXI_WORKER_DB_READY_TIMEOUT_SECONDS", "300")
+    attempts: list[int] = []
+    wrapped = sqlalchemy_wrapped(asyncpg.exceptions.InvalidPasswordError("password authentication failed"))
+    monkeypatch.setattr(run_worker.pg_manager, "require_current_schema", _raiser(wrapped, attempts))
 
-    import asyncpg
-
-    attempts = []
-
-    async def wrong_password():
-        attempts.append(1)
-        raise asyncpg.exceptions.InvalidPasswordError("password authentication failed")
-
-    monkeypatch.setattr(run_worker.pg_manager, "require_current_schema", wrong_password)
-
-    with pytest.raises(asyncpg.exceptions.InvalidPasswordError):
+    with pytest.raises(DBAPIError):
         asyncio.run(run_worker._await_database_ready())
 
     assert len(attempts) == 1, f"永久性错误只应尝试一次，实际 {len(attempts)} 次"
     assert clock.slept == [], "永久性错误不得进入等待"
+    assert any("classification=permanent" in e for e in logger.errors), logger.errors
 
 
-def test_permanent_database_config_error_fails_immediately(env, monkeypatch):
-    """数据库不存在等永久性配置问题同样立刻失败。
-
-    用 asyncpg 的真实异常类型，而不是泛化 RuntimeError——以下四种情形已对
-    真实 PostgreSQL 实测：密码错误 → InvalidPasswordError、库名不存在 →
-    InvalidCatalogNameError，两者都不该重试；PostgreSQL 不可达 →
-    ConnectionRefusedError、数据库正在启动 → CannotConnectNowError，两者该重试。
-    """
+def test_wrapped_nonexistent_database_fails_immediately(env, monkeypatch):
+    """库名不存在经真实 SQLAlchemy 包装后必须立刻失败。"""
     clock, _logger = env
     monkeypatch.setenv("YUXI_WORKER_DB_READY_TIMEOUT_SECONDS", "300")
+    attempts: list[int] = []
+    wrapped = sqlalchemy_wrapped(asyncpg.exceptions.InvalidCatalogNameError('database "nonexistent" does not exist'))
+    monkeypatch.setattr(run_worker.pg_manager, "require_current_schema", _raiser(wrapped, attempts))
 
-    import asyncpg
-
-    attempts = []
-
-    async def missing_database():
-        attempts.append(1)
-        raise asyncpg.exceptions.InvalidCatalogNameError('database "nonexistent" does not exist')
-
-    monkeypatch.setattr(run_worker.pg_manager, "require_current_schema", missing_database)
-
-    with pytest.raises(asyncpg.exceptions.InvalidCatalogNameError):
+    with pytest.raises(DBAPIError):
         asyncio.run(run_worker._await_database_ready())
 
     assert len(attempts) == 1
     assert clock.slept == []
 
 
-def test_connection_refused_is_covered_by_transient_errors():
-    """PostgreSQL 不可达抛的是 ConnectionRefusedError，必须落在真实的可重试集合里。
-
-    它是 ConnectionError/OSError 的子类，因此以基类形式被覆盖——按子类关系判定。
-    """
-    assert any(issubclass(ConnectionRefusedError, item) for item in run_worker._transient_database_errors())
-
-
-def test_connection_refused_is_retried(env, monkeypatch):
-    """PostgreSQL 不可达（端口拒绝）属于可恢复，必须重试。"""
+def test_wrapped_schema_error_fails_immediately(env, monkeypatch):
+    """Schema 不符（表不存在）同样立即失败，不重试。"""
     clock, _logger = env
-    monkeypatch.setattr(run_worker, "_transient_database_errors", lambda: (ConnectionRefusedError,))
-    attempts = []
+    monkeypatch.setenv("YUXI_WORKER_DB_READY_TIMEOUT_SECONDS", "300")
+    attempts: list[int] = []
+    wrapped = sqlalchemy_wrapped(asyncpg.exceptions.UndefinedTableError('relation "schema_version" does not exist'))
+    monkeypatch.setattr(run_worker.pg_manager, "require_current_schema", _raiser(wrapped, attempts))
 
-    async def refused():
-        attempts.append(1)
-        if len(attempts) < 2:
-            raise ConnectionRefusedError("connection refused")
+    with pytest.raises(DBAPIError):
+        asyncio.run(run_worker._await_database_ready())
 
-    monkeypatch.setattr(run_worker.pg_manager, "require_current_schema", refused)
-
-    asyncio.run(run_worker._await_database_ready())
-
-    assert len(attempts) == 2
-    assert len(clock.slept) == 1
+    assert len(attempts) == 1
+    assert clock.slept == []

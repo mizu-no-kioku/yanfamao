@@ -13,7 +13,14 @@ from datetime import datetime
 
 from arq.worker import RetryJob, func
 from sqlalchemy import select, text
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import (
+    DataError,
+    IntegrityError,
+    InterfaceError,
+    NotSupportedError,
+    OperationalError,
+    ProgrammingError,
+)
 from yuxi.agents.backends.sandbox.provider import get_sandbox_provider
 from yuxi.agents.callbacks.model_request_timing import FirstModelRequestRecorder
 from yuxi.agents.mcp.service import ensure_builtin_mcp_servers_in_db
@@ -1552,25 +1559,95 @@ async def _publish_reconciliation_health() -> None:
     )
 
 
-def _transient_database_errors() -> tuple[type[BaseException], ...]:
-    """等待 PostgreSQL 期间视为「暂时不可用」的异常类型。
+def _database_error_chain(exc: BaseException) -> tuple[BaseException, ...]:
+    """展开数据库异常的真实包装链。
 
-    `CannotConnectNowError`（数据库正在启动）继承自 `OperatorInterventionError`，
-    **不是** `PostgresConnectionError`——只捕后者会恰好漏掉最常见的那一种。
-    其他异常一律不重试，避免把真正的配置或 Schema 错误拖到超时才暴露。
+    SQLAlchemy 引擎抛出的不是 asyncpg 异常本身：方言先把 asyncpg 异常翻译成
+    `AsyncAdapt_asyncpg_dbapi.*`，引擎再用 `DBAPIError.instance` 包装成
+    `sqlalchemy.exc.*`（`orig` 指向翻译后的异常，其 `__cause__` 指向原始 asyncpg 异常）。
+    只看最外层类型必然漏判，因此沿 `orig` 与 `__cause__`/`__context__` 逐层展开。
+    """
+    chain: list[BaseException] = []
+    seen: set[int] = set()
+    node: BaseException | None = exc
+    while node is not None and id(node) not in seen:
+        seen.add(id(node))
+        chain.append(node)
+        orig = getattr(node, "orig", None)
+        if isinstance(orig, BaseException) and orig is not node:
+            node = orig
+        else:
+            node = node.__cause__ or node.__context__
+    return tuple(chain)
+
+
+def _database_error_classes() -> tuple[tuple[type[BaseException], ...], tuple[type[BaseException], ...]]:
+    """返回（可重试的瞬时错误类，必须立即失败的永久错误类）。
+
+    不能按父类粗判：`CannotConnectNowError`、`AdminShutdownError` 继承自
+    `OperatorInterventionError`，而 `InvalidPasswordError`、`InvalidCatalogNameError`
+    继承自 `PostgresError`——三者都**不是** `PostgresConnectionError`。
+    只捕 `PostgresConnectionError` 会漏掉「数据库正在启动」，
+    而把 `PostgresError` 整体当瞬时错误又会让密码错误、库不存在被重试到超时。
+    因此按语义显式列举，永久错误优先。
     """
     import asyncpg
-    from sqlalchemy.exc import InterfaceError
 
-    return (
+    transient: tuple[type[BaseException], ...] = (
+        # 数据库正在启动 / 正在关闭，属于瞬时不可用
         asyncpg.exceptions.CannotConnectNowError,
-        asyncpg.PostgresConnectionError,
+        asyncpg.exceptions.OperatorInterventionError,
+        # 连接被中断、连接不存在
+        asyncpg.exceptions.PostgresConnectionError,
+        # 连接数已满，等一会儿可能就有空位
+        asyncpg.exceptions.InsufficientResourcesError,
+        # 连接已关闭
+        asyncpg.exceptions.InterfaceError,
         OperationalError,
         InterfaceError,
         ConnectionError,
         OSError,
         asyncio.TimeoutError,
     )
+    permanent: tuple[type[BaseException], ...] = (
+        # 认证失败：密码错误
+        asyncpg.exceptions.InvalidPasswordError,
+        asyncpg.exceptions.InvalidAuthorizationSpecificationError,
+        # 库名 / Schema 不存在
+        asyncpg.exceptions.InvalidCatalogNameError,
+        asyncpg.exceptions.InvalidSchemaNameError,
+        # 权限不足、表或字段不存在、语法错误——重试不会自愈
+        asyncpg.exceptions.InsufficientPrivilegeError,
+        asyncpg.exceptions.SyntaxOrAccessError,
+        asyncpg.exceptions.PostgresSyntaxError,
+        asyncpg.exceptions.DatatypeMismatchError,
+        ProgrammingError,
+        IntegrityError,
+        DataError,
+        NotSupportedError,
+    )
+    return transient, permanent
+
+
+def _classify_database_error(exc: BaseException) -> str:
+    """把数据库异常分类为 `transient` / `permanent` / `unknown`。
+
+    永久错误优先：整条包装链里只要出现配置、认证或 Schema 类错误就不再重试——
+    这类问题重试再多次也不会自愈，只会把部署错误拖成静默等待。
+    `unknown` 一律按不可重试处理，避免掩盖真正的配置问题。
+    """
+    transient, permanent = _database_error_classes()
+    chain = _database_error_chain(exc)
+    if any(isinstance(node, permanent) for node in chain):
+        return "permanent"
+    if any(isinstance(node, transient) for node in chain):
+        return "transient"
+    return "unknown"
+
+
+def _is_transient_database_error(exc: BaseException) -> bool:
+    """整条包装链是否都属于可重试的瞬时错误。"""
+    return _classify_database_error(exc) == "transient"
 
 
 async def _await_database_ready() -> None:
@@ -1579,13 +1656,15 @@ async def _await_database_ready() -> None:
     主机或 Docker 重启后，worker 可能先于 PostgreSQL 被恢复，而 Compose 的
     `depends_on` 在「恢复既有容器」时并不保证顺序。因此这里自行做有上限、可观测的
     重试，使 PostgreSQL 恢复后 worker 能自动就绪，不需要人工重启 worker。
+
+    只有瞬时错误才重试；密码错误、库不存在、Schema 不符等永久错误立即失败，
+    不让部署配置问题被静默拖到超时。
     """
     timeout_seconds = get_int_env("YUXI_WORKER_DB_READY_TIMEOUT_SECONDS", 300)
     try:
         interval_seconds = max(0.2, float(os.getenv("YUXI_WORKER_DB_READY_INTERVAL_SECONDS", "2")))
     except ValueError:
         interval_seconds = 2.0
-    transient = _transient_database_errors()
 
     deadline = time.monotonic() + timeout_seconds
     attempts = 0
@@ -1593,7 +1672,19 @@ async def _await_database_ready() -> None:
         attempts += 1
         try:
             await pg_manager.require_current_schema()
-        except transient as exc:
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            classification = _classify_database_error(exc)
+            if classification != "transient":
+                logger.error(
+                    "PostgreSQL 启动检查遇到不可重试错误，worker 立即退出：classification={} attempts={} error={}: {}",
+                    classification,
+                    attempts,
+                    type(exc).__name__,
+                    exc,
+                )
+                raise
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 logger.error(

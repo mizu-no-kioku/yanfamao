@@ -38,6 +38,10 @@ PERMANENTLY_DENIED_TABLES: frozenset[str] = frozenset(
     {"system_user", "t_user", "t_staff_wage", "t_staff_wage_benefit_config"}
 )
 
+# 行数硬上限的唯一代码来源。YAML/RBAC 授权与环境变量都只能在此基础上收紧，
+# 不得放宽——`effective_max_rows = min(代码上限, YAML 上限, 环境变量上限)`。
+MAX_ROWS_CODE_UPPER_BOUND: int = 200
+
 PERMANENTLY_DENIED_COLUMNS: frozenset[str] = frozenset(
     {
         "ACCOUNT",

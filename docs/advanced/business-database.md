@@ -16,14 +16,16 @@ YUXI_BUSINESS_DB_PASSWORD=<readonly-password>
 YUXI_BUSINESS_DB_NAME=business_database
 YUXI_BUSINESS_DB_QUERY_TIMEOUT_MS=10000
 YUXI_BUSINESS_DB_MAX_ROWS=200
-YUXI_BUSINESS_DB_IDENTITIES_JSON={"<yuxi-uid>":{"tenant_id":1,"staff_id":13,"allowed_tables":["t_project","t_project_user"],"allow_all_projects":false,"allow_project_member_rows":false}}
+YUXI_BUSINESS_DB_IDENTITIES_JSON={"<yuxi-uid>":{"business_user_id":17,"tenant_id":1}}
 ```
 
 Docker Desktop 访问宿主机数据库可使用 `host.docker.internal`；远程数据库填写 worker 可访问的主机名。连接凭据和身份映射只由服务端维护，不放入 Agent 提示词、工具参数或沙盒，也不提交到 Git。
 
-端口默认 `3306`，允许 `1–65535`；查询超时默认 `10000` 毫秒，允许 `100–60000`；返回行数默认 `200`，允许 `1–1000`。repository 将超时用于连接和读写等待，并设置 MySQL 会话查询时间上限。行数上限限制返回结果，不限制聚合查询扫描的数据量。
+端口默认 `3306`，允许 `1–65535`；查询超时默认 `10000` 毫秒，允许 `100–60000`；`YUXI_BUSINESS_DB_MAX_ROWS` 默认 `200`，配置范围 `1–1000`，但**只能收紧不能扩权**：实际生效值为 `min(代码上限 200, YAML/RBAC 授权上限, 本变量)`，填大于代码上限的值不会放宽返回行数。repository 将超时用于连接和读写等待，并设置 MySQL 会话查询时间上限。行数上限限制返回结果，不限制聚合查询扫描的数据量。
 
-身份配置中的 `allowed_tables` 默认包含两个受支持表，显式填写时必须为非空列表。`allow_all_projects` 默认为 `false`，仅允许员工参与的有效项目；设为 `true` 扩大为当前租户的全部有效项目。`allow_project_member_rows` 默认为 `false`，把项目成员表限制为当前员工；设为 `true` 允许读取授权项目内其他成员关联行。这两个开关都必须由管理员授权。
+身份配置只声明「这个 Yuxi 用户是谁」：`business_user_id` 必填，`tenant_id` 可省略——省略时由业务库按用户归属推导，用户归属多个租户时必须显式指定，不猜测。**员工编号（`staff_id`）不在此声明**，由解析器按当前租户从业务库动态推导，员工归属变化时无需改配置。租户、有效状态、授权项目与员工本人四条行范围全部由代码与 RBAC/YAML 资源授权裁决，**没有**环境变量可以取消它们。
+
+`allowed_tables` 与 `allowed_columns` 是可选收紧项，只能缩小授权：越界项被剔除，清洗后为空或剔除后无可用表/字段时按配置错误拒绝，绝不回退成「不限制」。历史配置键 `staff_id`、`allow_all_projects`、`allow_project_member_rows` 已废弃；`allow_project_member_rows` 出现即报错，因为环境变量层不得取消 `STAFF_ID` 行范围——如需查看其他项目成员，必须由 RBAC/YAML 资源授权表达。
 
 可选的 `allowed_columns` 按表进一步缩小字段范围，例如 `"allowed_columns":{"t_project":["ID","NAME"]}`；仅在真实 Schema 中存在这些字段时使用。未指定的表使用经过敏感字段过滤的 Schema。账号、密码、盐、身份证号、`PHONES`、指定附件 URL 以及以 `_URL`、`_ANNEX_ID` 结尾的字段被排除，字段白名单不能重新开放这些字段。
 
@@ -52,7 +54,7 @@ docker compose ps
 - 工具列表没有业务数据库工具：检查必填变量是否完整，并重新创建 API 和 worker。
 - “当前用户尚未绑定业务数据库身份”：核对映射键是否为当前 Yuxi uid。
 - 员工身份无效：核对 `t_staff` 中租户、员工编号和 `OPERATER_STATUS > 0`。
-- 没有可访问项目：核对有效项目及成员关联；不要通过扩大权限开关来掩盖错误绑定。
+- 没有可访问项目：核对有效项目及成员关联；不要靠放宽配置来掩盖错误绑定——行范围不接受环境变量放宽。
 - 表或安全字段缺失：核对真实基础表、`TENANT_ID`、项目关联字段，以及员工范围需要的 `STAFF_ID`。
 - 连接失败或超时：从 worker 的网络环境检查主机、端口、只读账号和 MySQL 会话能力；检查 `docker compose logs --tail 100 worker`，避免对外分享含用户数据的日志。
 

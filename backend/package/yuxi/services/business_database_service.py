@@ -56,13 +56,16 @@ class BusinessDatabaseBinding:
     只声明「这个 Yuxi 用户是谁」以及可选的环境变量收紧项。
     租户可以省略（由业务库推导），**员工编号不在此声明**——由解析器按当前租户动态推导，
     这样员工与租户的对应关系变化时不需要改配置。
+
+    这里只允许出现「收紧」项。行范围（租户、有效状态、授权项目、员工本人）由代码与
+    RBAC/YAML 资源授权共同裁决，环境变量无权取消；历史上用于放开成员行范围的
+    `allow_project_member_rows` 已删除，出现即按配置错误拒绝。
     """
 
     business_user_id: int
     tenant_id: int | None
     allowed_tables: frozenset[str] | None
     allowed_columns: dict[str, frozenset[str]]
-    allow_project_member_rows: bool
 
 
 @dataclass(frozen=True)
@@ -125,11 +128,18 @@ class BusinessDatabaseSettings:
 
         绑定只给 `business_user_id`（租户可选），**员工编号不再静态声明**——
         它由解析器按当前租户从业务库推导，员工归属变化时无需改配置。
-        `allowed_tables` / `allowed_columns` 是环境变量层，语义上只能收紧。
+        `allowed_tables` / `allowed_columns` 是环境变量层，语义上只能收紧：
+        清洗后为空的配置按错误拒绝，绝不回退成「不限制」。
         """
         raw = self.identities.get(uid)
         if not isinstance(raw, dict):
             raise BusinessDatabaseAuthorizationError("当前用户尚未绑定业务数据库身份")
+
+        if "allow_project_member_rows" in raw:
+            raise BusinessDatabaseConfigurationError(
+                "allow_project_member_rows 已废弃：环境变量层只能收紧，不能取消 STAFF_ID 行范围；"
+                "如需查看其他项目成员，请通过 RBAC/YAML 资源授权表达"
+            )
 
         business_user_id = _positive_integer(raw.get("business_user_id"), "business_user_id")
         raw_tenant = raw.get("tenant_id")
@@ -141,7 +151,9 @@ class BusinessDatabaseSettings:
             if not isinstance(configured, list) or not configured:
                 raise BusinessDatabaseConfigurationError("allowed_tables 必须是非空表名列表")
             names = frozenset(str(name).strip().lower() for name in configured if str(name).strip())
-            allowed_tables = names or None
+            if not names:
+                raise BusinessDatabaseConfigurationError("allowed_tables 清洗后为空表名列表")
+            allowed_tables = names
 
         raw_columns = raw.get("allowed_columns", {})
         if not isinstance(raw_columns, dict):
@@ -149,20 +161,20 @@ class BusinessDatabaseSettings:
         allowed_columns: dict[str, frozenset[str]] = {}
         for table_name, columns in raw_columns.items():
             normalized_table = str(table_name).strip().lower()
+            if not normalized_table:
+                raise BusinessDatabaseConfigurationError("allowed_columns 含空表名")
             if not isinstance(columns, list) or not columns:
                 raise BusinessDatabaseConfigurationError(f"表 {normalized_table} 的 allowed_columns 必须是非空列表")
-            allowed_columns[normalized_table] = frozenset(str(column).strip().upper() for column in columns)
-
-        allow_project_member_rows = raw.get("allow_project_member_rows", False)
-        if not isinstance(allow_project_member_rows, bool):
-            raise BusinessDatabaseConfigurationError("allow_project_member_rows 必须是布尔值")
+            cleaned = frozenset(str(column).strip().upper() for column in columns if str(column).strip())
+            if not cleaned:
+                raise BusinessDatabaseConfigurationError(f"表 {normalized_table} 的 allowed_columns 清洗后为空字段列表")
+            allowed_columns[normalized_table] = cleaned
 
         return BusinessDatabaseBinding(
             business_user_id=business_user_id,
             tenant_id=tenant_id,
             allowed_tables=allowed_tables,
             allowed_columns=allowed_columns,
-            allow_project_member_rows=allow_project_member_rows,
         )
 
 
@@ -279,7 +291,7 @@ class BusinessDatabaseService:
         repository = self._repository_factory(settings.connection)
 
         with self._query_scope(settings.connection) as scope:
-            resolved = self._resolve_policy(binding, scope.directory)
+            resolved = self._resolve_policy(binding, scope.directory, max_rows_env=settings.max_rows)
             policy = resolved.policy
 
             raw_metadata = repository.load_schema(policy.allowed_tables, connection=scope.connection)
@@ -291,10 +303,13 @@ class BusinessDatabaseService:
             guard = SQLSecurityGuard(policy)
             yield PreparedBusinessDatabaseAccess(resolved, metadata, guard, repository, scope.connection)
 
-    def _resolve_policy(self, binding: BusinessDatabaseBinding, directory: BusinessDirectory) -> ResolvedPolicy:
+    def _resolve_policy(
+        self, binding: BusinessDatabaseBinding, directory: BusinessDirectory, *, max_rows_env: int
+    ) -> ResolvedPolicy:
         """每次调用都重新解析身份、功能门、资源与项目范围。
 
         不缓存结果：撤权必须在下一次调用开始的新事务里可见，缓存会让旧授权继续放行。
+        `max_rows_env` 来自 `YUXI_BUSINESS_DB_MAX_ROWS`，在解析器内与代码上限、YAML 上限求交，只能收紧。
         """
         try:
             return resolve_query_policy(
@@ -302,7 +317,7 @@ class BusinessDatabaseService:
                 directory,
                 allowed_tables=binding.allowed_tables,
                 allowed_columns=binding.allowed_columns,
-                allow_project_member_rows=binding.allow_project_member_rows,
+                max_rows_env=max_rows_env,
             )
         except nl2sql_errors.PolicyDenial as exc:
             raise BusinessDatabaseAuthorizationError(f"{exc.code}: {exc.message}") from exc
@@ -338,7 +353,7 @@ def _visible_metadata(
 
 
 def _mysql_connection_factory(connection: BusinessDatabaseConnection) -> Callable[[], pymysql.connections.Connection]:
-    """解析器用的只读连接工厂。连接的真实生命周期由 single_transaction_directory 管理。"""
+    """解析器用的只读连接工厂。连接的真实生命周期由 mysql_query_scope 管理。"""
     timeout_seconds = max(1, (connection.query_timeout_ms + 999) // 1000)
 
     def connect() -> pymysql.connections.Connection:

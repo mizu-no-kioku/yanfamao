@@ -33,10 +33,11 @@ def test_business_account_cannot_write(business_directory):
 
 
 def test_test_database_config_is_independent_from_business_config():
-    """两者不得共用同一个环境变量。"""
+    """两者不得共用同一个环境变量，也不得回退到业务库配置。"""
     from yuxi.nl2sql.test_database import TEST_CONFIG_ENV
 
-    assert TEST_CONFIG_ENV != "YUXI_BUSINESS_DATABASE_CONFIG"
+    assert TEST_CONFIG_ENV == "YUXI_NL2SQL_TEST_DATABASE_CONFIG"
+    assert not TEST_CONFIG_ENV.startswith("YUXI_BUSINESS_DB_")
 
 
 def test_malformed_business_config_fails_instead_of_skipping(monkeypatch):

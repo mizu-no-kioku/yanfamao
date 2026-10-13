@@ -17,13 +17,13 @@ Yuxi 问数只开放项目与项目成员两张表，而 `QueryPolicy` 的全部
 - **身份链**：业务用户必须存在且有效；未显式给出租户时按用户归属推导，归属多个租户则拒绝而不猜测；该租户下必须恰有一个有效员工。每个拒绝都带 `nl2sql/errors.py` 的可诊断码（`IDENTITY_USER_MISSING`、`TENANT_AMBIGUOUS`、`IDENTITY_STAFF_AMBIGUOUS`、`ROLE_MISSING`、`FUNCTION_GATE_DENIED`、`NO_PROJECT_ACCESS` 等），便于审计与排障。
 - **角色基数**：只对 `tb_user_enterprise_role_tenant` 的**原始关系行**计数，不对角色—菜单 JOIN 结果计数；0 条拒绝，超过 1 条按违反唯一约束的数据异常拒绝。不实现多角色并集。
 - **功能门**：菜单 ID **253 / 254 / 238 任意命中一个**即通过，不继承父菜单。判定按 ID 而非 CODE——同码异 ID 的菜单可以冒充 CODE。`resource_policy.yaml` 的 `menu_ids` 承担资源映射与配置一致性守卫，`build_policy` 校验其取值集合必须恰为 `{253, 254, 238}`。
-- **资源与字段三层求交**：代码硬上限（`table_policy.py` 的 `TABLE_UPPER_BOUNDS`、`PERMANENTLY_DENIED_TABLES`、`PERMANENTLY_DENIED_COLUMNS`）∩ YAML/RBAC 授权（`resource_policy.yaml` 的资源码到表/列映射）∩ 环境变量层（绑定中的 `allowed_tables`、`allowed_columns`）。**环境变量层只能收缩**：越界项被剔除，剔除后没有可用表或字段即按配置错误拒绝，不静默放行。YAML 越界同样报错而非被裁剪——静默裁剪会让配置看起来生效、实际不同。
+- **资源与字段三层求交**：代码硬上限（`table_policy.py` 的 `TABLE_UPPER_BOUNDS`、`PERMANENTLY_DENIED_TABLES`、`PERMANENTLY_DENIED_COLUMNS`）∩ YAML/RBAC 授权（`resource_policy.yaml` 的资源码到表/列映射）∩ 环境变量层（绑定中的 `allowed_tables`、`allowed_columns`，以及 `YUXI_BUSINESS_DB_MAX_ROWS`）。**环境变量层只能收缩**：越界项被剔除，剔除后没有可用表或字段即按配置错误拒绝，不静默放行。行数上限同样三层求交：`effective_max_rows = min(代码上限, YAML/RBAC 上限, 环境变量上限)`，环境变量大于代码上限时被压回。YAML 越界同样报错而非被裁剪——静默裁剪会让配置看起来生效、实际不同。
 - **状态列为守卫内部列**：`TENANT_ID`、`OPERATER_STATUS`、`ENABLE_STATUS` 保留在策略的 `table_columns` 中供守卫注入条件，但不进入模型可见列 `selectable_columns`，模型显式引用即 `COLUMN_NOT_ALLOWED`。业务库用 9999 表示启用，模型按常识猜 `=1` 会把结果清空。
-- **行范围**：租户 + 有效状态 + 已授权项目。项目范围每次由员工在业务库中的真实成员关系推导，不在配置里静态声明。
+- **行范围**：租户 + 有效状态 + 已授权项目 + 员工本人。项目范围每次由员工在业务库中的真实成员关系推导，不在配置里静态声明；成员表的员工范围由代码固定为当前员工，**不接受任何环境变量取消**——要查看其他项目成员必须走 RBAC/YAML 资源授权。
 
 首期只开放 `t_project` 与 `t_project_user`。其余资源码（`HR_*`、`FINANCE_READ`、`APPLICATION_READ`、`RISK_READ`）在 YAML 中留空位；`table_policy.has_complete_row_rule` 要求租户列、项目列、状态列齐全才允许开放，缺任一项的表默认拒绝。
 
-`services/business_database_service.py` 把解析器接进服务层。`BusinessDatabaseSettings` 从环境变量读取连接参数与 `uid → business_user_id`（+ 可选 `tenant_id`）的可信绑定；**员工编号不静态声明**，由解析器按当前租户动态推导，员工归属变化时无需改配置。绑定中的 `allowed_tables`、`allowed_columns`、`allow_project_member_rows` 构成环境变量收紧层。未绑定的 uid 直接拒绝，模型、问答参数与显示名都不能推导身份。
+`services/business_database_service.py` 把解析器接进服务层。`BusinessDatabaseSettings` 从环境变量读取连接参数、`YUXI_BUSINESS_DB_MAX_ROWS` 与 `uid → business_user_id`（+ 可选 `tenant_id`）的可信绑定；**员工编号不静态声明**，由解析器按当前租户动态推导，员工归属变化时无需改配置。绑定中的 `allowed_tables`、`allowed_columns` 构成环境变量收紧层，两者清洗后为空即按配置错误拒绝。`allow_project_member_rows` 曾用于放开成员行范围，现已删除并在配置中出现即报错：环境变量层不得取消 `STAFF_ID` 行范围。未绑定的 uid 直接拒绝，模型、问答参数与显示名都不能推导身份。
 
 `agents/toolkits/business_database/` 暴露三个 `buildin` 工具：`list_business_database_tables`、`describe_business_database_table`、`query_business_database`。当前 Yuxi `uid` 由服务端 `ToolRuntime` 提供，模型与前端不能提交 `uid`、`tenant_id` 或 `staff_id`。模型可见 Schema 由策略的 `selectable_columns` 裁剪，服务层不另推一套口径——否则会出现「守卫按策略校验、Schema 按另一套展示」。
 
@@ -64,8 +64,7 @@ Yuxi 问数只开放项目与项目成员两张表，而 `QueryPolicy` 的全部
 
 **同事务重查与撤权生效**（此前的 `Not run` 项已转为已验证）：
 
-- `backend/test/integration/nl2sql/test_query_scope_single_transaction.py` 覆盖「解析与最终 SQL 落在同一条只读连接、同一个只读事务」。
-- `backend/test/integration/nl2sql/test_revocation_takes_effect.py` 在**隔离测试库**（`yuxi-mysql-test-1` / `nl2sql_test`）用可写控制账号真实撤销角色后验证：授权时可查询，撤销角色后**下一次查询即被拒绝**（`ROLE_INACTIVE`），恢复后重新可用。真实业务库 `r_d_test` 是只读的，无法在其中制造撤权，测试库缺失配置时用例 skip 且**不回退连接业务库**，不修改 `r_d_test`。
+- `backend/test/integration/nl2sql/test_query_scope_single_transaction.py` 覆盖「解析与最终 SQL 落在同一条只读连接、同一个只读事务」，并在**隔离测试库**（`yuxi-mysql-test-1` / `nl2sql_test`）用可写控制账号真实撤销角色后验证撤权边界：`test_revocation_is_denied_on_the_next_call` 证明授权时可查询、撤销角色后**下一次查询即被拒绝**（`ROLE_INACTIVE`），`test_restoring_the_role_restores_access` 证明恢复后重新可用。真实业务库 `r_d_test` 是只读的，无法在其中制造撤权，测试库缺失配置时用例 skip 且**不回退连接业务库**，不修改 `r_d_test`。
 
 **RBAC 四场景**（`docs/develop-guides/rbac-business-database-test-matrix.md`）：
 
@@ -85,3 +84,16 @@ Yuxi 问数只开放项目与项目成员两张表，而 `QueryPolicy` 的全部
 **静态检查**：`uv run ruff check` 与 `uv run ruff format --check` 覆盖本次新增 Python 文件并通过；`python scripts/verify_engineering_contracts.py` 通过。
 
 未覆盖：真实业务库的 Schema 漂移、生产数据规模下的性能，以及 `ty1` 偶发答 0 的复现均仍为 Not run。
+
+### 复审后的加固（2026-10-13，同一运行态）
+
+针对 `gitee/main...b2df1df` 复审发现的问题做测试先行修复，每个缺陷都先有能在修复前失败的用例：
+
+- **行数上限三层求交**：`YUXI_BUSINESS_DB_MAX_ROWS` 此前解析后从未被消费。现在 `effective_max_rows = min(代码上限 200, YAML/RBAC 上限, 环境变量上限)`，环境变量只能收紧。真实业务库实测（`ty1`）：未设置 → `limit=200, rows=14`；`=5` → `limit=5, rows=5`；`=1000` → `limit=200, rows=14`（被压回，未扩权）。
+- **worker 异常分类按真实包装链判定**：`DBAPIError.orig` + `__cause__`/`__context__` 逐层展开，永久错误优先。真实 PostgreSQL 实测：密码错误 → `classification=permanent`、`attempts=1`、0.03s 内退出；库不存在 → `classification=permanent`；`postgres` 容器停止 → 启动 → 恢复期间依次记录 `gaierror`、`ConnectionRefusedError` 两次可重试告警，第 4 次尝试 `READY_OK`（8.2s），无需人工重启 worker。
+- **配置层只能收紧**：`allowed_tables` 清洗后为空、`allowed_columns` 空表名/空字段名一律按配置错误拒绝，不再回退成「不限制」；`allow_project_member_rows` 已删除，出现即报错（环境变量层不得取消 `STAFF_ID` 行范围）。
+- **拒绝文案**：返回给模型的只有稳定错误码 + 通用说明（`FUNCTION_GATE_DENIED: 当前角色没有 AI 问数功能权限…`），表名/列名/菜单 ID 只进服务端日志。四账号回归实测文案已不含内部标识。
+- **状态列**：守卫改为按策略声明的 `status_scope_columns`（来自 `TableBound.status_column`）注入，不再硬编码 `OPERATER_STATUS`。
+- **死代码**：删除无人调用的 `single_transaction_directory`，并修正指向它的过时注释与文档。
+
+同轮门禁：全量 `test/unit` 2701 passed、58 skipped、0 failed；`test/integration/nl2sql` 20 passed、3 skipped；`ruff check` 与 `ruff format --check`（锁定 0.16.4）对改动文件通过；`scripts/verify_engineering_contracts.py` 通过。四账号回归 `ty1=14`、`ty2=3`（`GENERAL_BUDGET` → `COLUMN_NOT_ALLOWED`、`t_project_user` → `TABLE_NOT_ALLOWED`）、`ty3=FUNCTION_GATE_DENIED`、`ty4=NO_PROJECT_ACCESS`，与上表一致。

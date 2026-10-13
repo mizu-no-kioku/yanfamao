@@ -1,10 +1,14 @@
 """解析器产出完整 QueryPolicy：表、字段、行范围与上限全部来自代码裁决。"""
 
+from types import MappingProxyType
+
 import pytest
 
-from yuxi.nl2sql import errors
+from yuxi.nl2sql import errors, policy_resolver
 from yuxi.nl2sql.policy_resolver import resolve_query_policy
 from yuxi.nl2sql.principal import BusinessPrincipal
+from yuxi.nl2sql.resource_policy import ResourceGrant
+from yuxi.nl2sql.table_policy import MAX_ROWS_CODE_UPPER_BOUND, TABLE_UPPER_BOUNDS
 
 
 class FakeDirectory:
@@ -147,10 +151,81 @@ def test_env_narrowing_that_empties_a_table_is_denied():
         )
 
 
-def test_staff_scope_columns_default_to_current_staff():
-    """默认把成员行限定为本人；显式放开时才给空。"""
-    default = resolve_query_policy(BusinessPrincipal(user_id=1001), FakeDirectory())
-    assert dict(default.policy.staff_scope_columns) == {"t_project_user": "STAFF_ID"}
+def test_policy_declares_status_scope_columns_from_table_bounds():
+    """状态列由代码上限（`TableBound.status_column`）声明，守卫据此注入。
 
-    opened = resolve_query_policy(BusinessPrincipal(user_id=1001), FakeDirectory(), allow_project_member_rows=True)
-    assert opened.policy.staff_scope_columns == {}
+    不硬编码 `OPERATER_STATUS`：状态列是每张表各自的上限，换表或换列时
+    必须由策略跟着变，而不是让守卫继续注入一个不存在的列。
+    """
+    resolved = resolve_query_policy(BusinessPrincipal(user_id=1001), FakeDirectory())
+    assert dict(resolved.policy.status_scope_columns) == {
+        "t_project": "OPERATER_STATUS",
+        "t_project_user": "OPERATER_STATUS",
+    }
+
+
+def test_status_scope_columns_absent_when_table_not_granted():
+    resolved = resolve_query_policy(BusinessPrincipal(user_id=1001), FakeDirectory(), allowed_tables=["t_project"])
+    assert dict(resolved.policy.status_scope_columns) == {"t_project": "OPERATER_STATUS"}
+
+
+def test_staff_scope_columns_always_limit_member_rows_to_current_staff():
+    """成员行范围由代码裁决，环境变量无权取消。
+
+    要查看其他项目成员，必须由 RBAC/YAML 资源授权表达，而不是环境变量扩权——
+    因此这里同时确认「放开开关」已不存在。
+    """
+    resolved = resolve_query_policy(BusinessPrincipal(user_id=1001), FakeDirectory())
+    assert dict(resolved.policy.staff_scope_columns) == {"t_project_user": "STAFF_ID"}
+
+    with pytest.raises(TypeError):
+        resolve_query_policy(BusinessPrincipal(user_id=1001), FakeDirectory(), allow_project_member_rows=True)
+
+
+def test_staff_scope_is_absent_when_member_table_not_granted():
+    """成员表不在授权范围内时不应凭空产生行范围条目。"""
+    resolved = resolve_query_policy(BusinessPrincipal(user_id=1001), FakeDirectory(), allowed_tables=["t_project"])
+    assert resolved.policy.staff_scope_columns == {}
+
+
+# --- 环境变量行数上限（YUXI_BUSINESS_DB_MAX_ROWS）必须真正参与求交且只能收紧 ---
+
+
+def test_default_max_rows_is_the_code_upper_bound():
+    """未提供环境变量上限时，行数上限等于代码上限。"""
+    resolved = resolve_query_policy(BusinessPrincipal(user_id=1001), FakeDirectory())
+    assert resolved.policy.max_rows == MAX_ROWS_CODE_UPPER_BOUND
+
+
+def test_env_max_rows_tightens_below_code_bound():
+    """环境变量小于代码上限时必须生效——这正是它此前被完全忽略的地方。"""
+    resolved = resolve_query_policy(BusinessPrincipal(user_id=1001), FakeDirectory(), max_rows_env=50)
+    assert resolved.policy.max_rows == 50
+
+
+def test_env_max_rows_cannot_widen_above_code_bound():
+    """环境变量大于代码上限时被压回代码上限，绝不扩权。"""
+    resolved = resolve_query_policy(BusinessPrincipal(user_id=1001), FakeDirectory(), max_rows_env=1000)
+    assert resolved.policy.max_rows == MAX_ROWS_CODE_UPPER_BOUND
+
+
+def test_effective_max_rows_is_three_way_intersection(monkeypatch):
+    """effective_max_rows = min(代码上限, YAML/RBAC 上限, 环境变量上限)。"""
+    bound = TABLE_UPPER_BOUNDS["t_project"]
+    grant = ResourceGrant(
+        resource_code="AI_QA_USE",
+        tables=frozenset({"t_project"}),
+        columns=MappingProxyType({"t_project": bound.columns}),
+        max_rows=30,
+    )
+    monkeypatch.setattr(policy_resolver, "resolve_grants", lambda codes: (grant,))
+
+    # YAML 比环境变量紧 → 取 YAML
+    tighter_yaml = resolve_query_policy(BusinessPrincipal(user_id=1001), FakeDirectory(), max_rows_env=200)
+    assert tighter_yaml.policy.max_rows == 30
+    # 环境变量比 YAML 紧 → 取环境变量
+    tighter_env = resolve_query_policy(BusinessPrincipal(user_id=1001), FakeDirectory(), max_rows_env=10)
+    assert tighter_env.policy.max_rows == 10
+    # 环境变量试图扩权 → 仍取 YAML
+    widening_env = resolve_query_policy(BusinessPrincipal(user_id=1001), FakeDirectory(), max_rows_env=999)
+    assert widening_env.policy.max_rows == 30

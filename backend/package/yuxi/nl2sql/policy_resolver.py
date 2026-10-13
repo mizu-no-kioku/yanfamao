@@ -8,6 +8,7 @@ from yuxi.nl2sql.directory import BusinessDirectory
 from yuxi.nl2sql.principal import BusinessPrincipal
 from yuxi.nl2sql.resource_policy import AI_GATE_MENU_IDS, MENU_TO_RESOURCES, resolve_grants
 from yuxi.nl2sql.table_policy import (
+    MAX_ROWS_CODE_UPPER_BOUND,
     PERMANENTLY_DENIED_COLUMNS,
     PERMANENTLY_DENIED_TABLES,
     TABLE_UPPER_BOUNDS,
@@ -111,7 +112,7 @@ def resolve_query_policy(
     *,
     allowed_tables: Collection[str] | None = None,
     allowed_columns: Mapping[str, Collection[str]] | None = None,
-    allow_project_member_rows: bool = False,
+    max_rows_env: int | None = None,
 ) -> ResolvedPolicy:
     """完整解析：身份 → 功能门 → 资源 → 行权限 → QueryPolicy。
 
@@ -121,6 +122,12 @@ def resolve_query_policy(
 
     它们只影响 `selectable_columns`（模型可见列）。`table_columns` 始终保留授权列，
     含租户/状态等守卫内部列——守卫要靠它们注入条件，缺了会直接拒绝。
+
+    行数上限同样是三层求交：`effective_max_rows = min(代码上限, YAML/RBAC 上限, 环境变量上限)`。
+    `max_rows_env` 是环境变量层，**只能收紧**：大于代码上限时被压回，不会扩权。
+
+    行范围（租户、有效状态、授权项目、员工本人）全部由代码与 RBAC/YAML 授权裁决，
+    **没有**任何环境变量可以取消员工行范围——要查看其他项目成员必须走资源授权。
     """
     subject = resolve_business_subject(principal, directory)
     role_ids = resolve_function_gate(subject, directory)
@@ -129,12 +136,17 @@ def resolve_query_policy(
     grants = resolve_grants(resource_codes)
     granted_tables: set[str] = set()
     granted_columns: dict[str, frozenset[str]] = {}
-    max_rows = 200
+    effective_max_rows = MAX_ROWS_CODE_UPPER_BOUND
     for grant in grants:
         granted_tables |= grant.tables
         for table, columns in grant.columns.items():
             granted_columns[table] = granted_columns.get(table, frozenset()) | columns
-        max_rows = min(max_rows, grant.max_rows)
+        effective_max_rows = min(effective_max_rows, grant.max_rows)
+
+    if max_rows_env is not None:
+        if not isinstance(max_rows_env, int) or isinstance(max_rows_env, bool) or max_rows_env <= 0:
+            raise ValueError("max_rows_env 必须是正整数")
+        effective_max_rows = min(effective_max_rows, max_rows_env)
 
     if not granted_tables:
         raise errors.PolicyDenial(errors.FUNCTION_GATE_DENIED, "当前角色没有可用的数据资源")
@@ -168,9 +180,16 @@ def resolve_query_policy(
         for table in narrowed_tables
         if TABLE_UPPER_BOUNDS[table].project_column
     }
-    staff_scope_columns = (
-        {} if allow_project_member_rows or "t_project_user" not in narrowed_tables else {"t_project_user": "STAFF_ID"}
-    )
+    # 状态列同样由代码上限声明，守卫据此注入有效数据条件——不硬编码 OPERATER_STATUS，
+    # 换表或换列时策略跟着变，避免守卫继续注入一个不存在的列。
+    status_scope_columns = {
+        table: TABLE_UPPER_BOUNDS[table].status_column
+        for table in narrowed_tables
+        if TABLE_UPPER_BOUNDS[table].status_column
+    }
+    # 成员表的行范围固定为「当前员工本人」。这是代码裁决的行权限边界，
+    # 不接受任何环境变量取消——要查看其他项目成员，必须由 RBAC/YAML 资源授权表达。
+    staff_scope_columns = {"t_project_user": "STAFF_ID"} if "t_project_user" in narrowed_tables else {}
 
     policy = QueryPolicy(
         tenant_id=subject.tenant_id,
@@ -181,9 +200,10 @@ def resolve_query_policy(
         selectable_columns=selectable_columns,
         project_scope_columns=project_scope_columns,
         staff_scope_columns=staff_scope_columns,
+        status_scope_columns=status_scope_columns,
         global_tables=frozenset(),
         denied_tables=PERMANENTLY_DENIED_TABLES,
         denied_columns=PERMANENTLY_DENIED_COLUMNS,
-        max_rows=max_rows,
+        max_rows=effective_max_rows,
     )
     return ResolvedPolicy(subject=subject, resource_codes=resource_codes, policy=policy)

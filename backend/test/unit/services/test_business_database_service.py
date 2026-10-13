@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import re
 from contextlib import nullcontext
 from decimal import Decimal
 
 import pytest
 
+from yuxi.nl2sql.table_policy import MAX_ROWS_CODE_UPPER_BOUND
 from yuxi.repositories.business_database_repository import BusinessDatabaseConnection
 from yuxi.services.business_database_security import PolicyViolation
 from yuxi.services.business_database_service import (
     BusinessDatabaseAuthorizationError,
+    BusinessDatabaseConfigurationError,
     BusinessDatabaseService,
     BusinessDatabaseSettings,
     BusinessQueryScope,
@@ -180,7 +183,7 @@ class FakeRepository:
         }
 
 
-def make_settings(binding: dict | None = None) -> BusinessDatabaseSettings:
+def make_settings(binding: dict | None = None, *, max_rows: int = 20) -> BusinessDatabaseSettings:
     """构造不含真实凭据的测试配置。"""
     return BusinessDatabaseSettings(
         connection=BusinessDatabaseConnection(
@@ -196,10 +199,9 @@ def make_settings(binding: dict | None = None) -> BusinessDatabaseSettings:
             or {
                 "business_user_id": 17,
                 "tenant_id": 1,
-                "allow_project_member_rows": False,
             }
         },
-        max_rows=20,
+        max_rows=max_rows,
     )
 
 
@@ -235,7 +237,8 @@ def test_service_executes_only_rewritten_query_and_serializes_decimal() -> None:
     lowered = repository.executed_sql.lower()
     assert "t_project.tenant_id = 1" in lowered
     assert "t_project.id in (2, 71)" in lowered
-    assert "limit 20" in lowered
+    # 必须精确落在 LIMIT 20，而不是被 `"limit 20" in "limit 200"` 这种子串巧合蒙混过关。
+    assert re.search(r"\blimit 20\b(?!\d)", lowered), "环境变量行数上限必须真正落到生成的 LIMIT 上"
     assert result["rows"][0]["GENERAL_BUDGET"] == "100.00"
 
 
@@ -277,7 +280,6 @@ def test_service_keeps_internal_scope_columns_out_of_visible_schema() -> None:
             "tenant_id": 1,
             "allowed_tables": ["t_project"],
             "allowed_columns": {"t_project": ["PROJECT_NAME"]},
-            "allow_project_member_rows": False,
         }
     )
     service, repository = build_service(settings)
@@ -366,3 +368,106 @@ def test_env_table_narrowing_cannot_widen_beyond_grant() -> None:
     service, _ = build_service(settings)
     with pytest.raises(BusinessDatabaseAuthorizationError, match="FUNCTION_GATE_DENIED"):
         service.list_authorized_tables("uid-1")
+
+
+# --- YUXI_BUSINESS_DB_MAX_ROWS 必须真正参与求交，且只能收紧 ---
+
+
+def test_settings_from_env_reads_max_rows(monkeypatch) -> None:
+    """环境变量必须被解析进 settings，而不是解析后无人使用。"""
+    monkeypatch.setenv("YUXI_BUSINESS_DB_HOST", "db.example.test")
+    monkeypatch.setenv("YUXI_BUSINESS_DB_USER", "readonly")
+    monkeypatch.setenv("YUXI_BUSINESS_DB_PASSWORD", "placeholder")
+    monkeypatch.setenv("YUXI_BUSINESS_DB_NAME", "business")
+    monkeypatch.setenv("YUXI_BUSINESS_DB_IDENTITIES_JSON", '{"uid-1":{"business_user_id":17}}')
+    monkeypatch.setenv("YUXI_BUSINESS_DB_MAX_ROWS", "37")
+
+    settings = BusinessDatabaseSettings.from_env()
+
+    assert settings.max_rows == 37
+
+
+def test_service_applies_env_max_rows_to_query_limit() -> None:
+    """环境变量上限必须端到端落到最终 SQL 的 LIMIT 与返回的 limit 上。"""
+    service, repository = build_service(make_settings(max_rows=20))
+
+    result = service.execute_authorized_query("uid-1", "SELECT ID, PROJECT_NAME FROM t_project")
+
+    assert result["limit"] == 20
+    assert repository.executed_sql is not None
+    assert re.search(r"\blimit 20\b(?!\d)", repository.executed_sql.lower())
+
+
+def test_service_env_max_rows_above_code_bound_cannot_widen() -> None:
+    """环境变量配置成大于代码上限时不得扩权，被压回代码上限。"""
+    service, repository = build_service(make_settings(max_rows=1000))
+
+    result = service.execute_authorized_query("uid-1", "SELECT ID, PROJECT_NAME FROM t_project")
+
+    assert result["limit"] == MAX_ROWS_CODE_UPPER_BOUND
+    assert repository.executed_sql is not None
+    assert re.search(rf"\blimit {MAX_ROWS_CODE_UPPER_BOUND}\b(?!\d)", repository.executed_sql.lower())
+
+
+# --- 环境变量层只能收紧：配置清洗与行范围 ---
+
+
+@pytest.mark.parametrize("blank_tables", [["   "], ["", "  "], ["\t"]])
+def test_allowed_tables_blank_after_cleaning_is_configuration_error(blank_tables) -> None:
+    """声明了 allowed_tables 却清洗为空，必须按配置错误拒绝。
+
+    回退成「不限制」等于把一次配置笔误静默放大成放行，与「只能收紧」的语义相反。
+    """
+    settings = make_settings({"business_user_id": 17, "tenant_id": 1, "allowed_tables": blank_tables})
+
+    with pytest.raises(BusinessDatabaseConfigurationError):
+        settings.resolve_binding("uid-1")
+
+
+def test_allowed_tables_cleaned_names_are_lowercased() -> None:
+    settings = make_settings({"business_user_id": 17, "tenant_id": 1, "allowed_tables": [" T_Project "]})
+
+    binding = settings.resolve_binding("uid-1")
+
+    assert binding.allowed_tables == frozenset({"t_project"})
+
+
+def test_allowed_tables_absent_means_no_narrowing() -> None:
+    """未声明 allowed_tables 才表示不额外收紧。"""
+    binding = make_settings({"business_user_id": 17, "tenant_id": 1}).resolve_binding("uid-1")
+
+    assert binding.allowed_tables is None
+
+
+@pytest.mark.parametrize("bad_columns", [{"t_project": ["  "]}, {"  ": ["ID"]}])
+def test_allowed_columns_blank_entries_are_configuration_error(bad_columns) -> None:
+    """allowed_columns 的空表名或空字段名同样按配置错误拒绝，不静默丢弃。"""
+    settings = make_settings({"business_user_id": 17, "tenant_id": 1, "allowed_columns": bad_columns})
+
+    with pytest.raises(BusinessDatabaseConfigurationError):
+        settings.resolve_binding("uid-1")
+
+
+def test_deprecated_allow_project_member_rows_is_rejected() -> None:
+    """已删除的环境变量开关必须显式报错，而不是被静默忽略。
+
+    静默忽略会让管理员以为「放开成员行范围」已生效，实际仍被 STAFF_ID 限定；
+    要查看其他项目成员，必须由 RBAC/YAML 资源授权表达，而不是环境变量扩权。
+    """
+    settings = make_settings({"business_user_id": 17, "tenant_id": 1, "allow_project_member_rows": True})
+
+    with pytest.raises(BusinessDatabaseConfigurationError, match="allow_project_member_rows"):
+        settings.resolve_binding("uid-1")
+
+
+def test_env_cannot_cancel_staff_row_scope() -> None:
+    """环境变量无权取消 STAFF_ID 行范围：成员行仍被限定为当前员工。"""
+    service, repository = build_service()
+
+    service.execute_authorized_query(
+        "uid-1",
+        "SELECT p.ID, pu.STAFF_ID FROM t_project p JOIN t_project_user pu ON pu.PROJECT_ID = p.ID",
+    )
+
+    assert repository.executed_sql is not None
+    assert "pu.staff_id = 13" in repository.executed_sql.lower()

@@ -62,9 +62,9 @@ def build_policy(payload: dict) -> tuple[dict[str, ResourceGrant], dict[str, tup
             if missing:
                 raise ResourcePolicyError(f"{resource_code}.{table} 缺少行权限必需列: {sorted(missing)}")
             tables[table] = requested
-        max_rows = int(spec.get("max_rows", 200))
-        if max_rows > 200:
-            raise ResourcePolicyError(f"{resource_code}.max_rows 超过 200")
+        max_rows = int(spec.get("max_rows", table_policy.MAX_ROWS_CODE_UPPER_BOUND))
+        if max_rows > table_policy.MAX_ROWS_CODE_UPPER_BOUND:
+            raise ResourcePolicyError(f"{resource_code}.max_rows 超过代码上限 {table_policy.MAX_ROWS_CODE_UPPER_BOUND}")
         resources[str(resource_code)] = ResourceGrant(
             resource_code=str(resource_code),
             tables=frozenset(tables),
