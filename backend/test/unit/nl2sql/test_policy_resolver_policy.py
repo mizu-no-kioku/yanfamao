@@ -3,7 +3,6 @@
 from types import MappingProxyType
 
 import pytest
-
 from yuxi.nl2sql import errors, policy_resolver
 from yuxi.nl2sql.policy_resolver import resolve_query_policy
 from yuxi.nl2sql.principal import BusinessPrincipal

@@ -5,7 +5,6 @@ from contextlib import nullcontext
 from decimal import Decimal
 
 import pytest
-
 from yuxi.nl2sql.table_policy import MAX_ROWS_CODE_UPPER_BOUND
 from yuxi.repositories.business_database_repository import BusinessDatabaseConnection
 from yuxi.services.business_database_security import PolicyViolation

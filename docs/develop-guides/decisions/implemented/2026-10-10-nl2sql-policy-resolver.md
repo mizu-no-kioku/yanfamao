@@ -58,6 +58,8 @@ Yuxi 问数只开放项目与项目成员两张表，而 `QueryPolicy` 的全部
 - **环境变量收紧层目前只在 `ty2` 上启用**，其余账号按 YAML 授权全量放行。
 - **部门、本人、全部授权项目与字段脱敏均未实现**。首期只拒绝字段，不做脱敏；`PROJECT_AUTH_STATUS` 的观测值全为 0，其业务含义待确认，不等于确认未启用。
 
+每项的当前状态、语义 Owner 与关闭条件由[业务问数权限解析：后续事项与已知限制](../../nl2sql-business-query-followups.md)拥有。
+
 ## 验证
 
 以下均为 2026-10-12 在运行态（`.cache/gitee-integration`）实测。
@@ -77,7 +79,13 @@ Yuxi 问数只开放项目与项目成员两张表，而 `QueryPolicy` 的全部
 
 守卫内部列同轮验证：`TENANT_ID`、`OPERATER_STATUS` 不在模型可见列内，模型显式引用即 `COLUMN_NOT_ALLOWED`。
 
-**全量测试**：2662 passed、58 skipped、0 failed（skip 来自未启用真实业务库与隔离测试库的集成用例）。
+**三类证据及各自边界**：
+
+- **全量单元测试**（`test/unit`，容器内运行）：2662 passed、58 skipped、0 failed。覆盖解析器、守卫、服务层与 worker 就绪分类的纯逻辑，不触达真实 MySQL、真实 HTTP 或浏览器。
+- **隔离集成测试**（`test/integration/nl2sql`）：20 passed、3 skipped。运行在隔离测试库 `yuxi-mysql-test-1`（`nl2sql_test`）上，用可写控制账号制造撤权与角色状态变化；真实业务库 `r_d_test` 只做只读对账。
+- **真实业务库验收**：`ty1`–`ty4` 四个真实 RBAC 主体在 `r_d_test` 上走工具层端到端，结果见上表。它证明真实数据与真实权限下的最终结果，不经过浏览器前端。
+
+3 skipped 全部来自 `test/integration/nl2sql/test_policy_resolver_business_db.py` 中依赖 `business_directory` fixture 的三条用例：`test_business_account_cannot_write`、`test_trial_identity_chain_resolves_on_business_db`、`test_trial_identity_project_scope_matches_independent_query`。该 fixture 在 `YUXI_NL2SQL_BUSINESS_TEST` 不为 `1` 时跳过，原因是该轮未开启只读业务库对账；同文件另两条用例不依赖该 fixture，正常执行。隔离测试库在该轮已配置 `YUXI_NL2SQL_TEST_DATABASE_CONFIG`，`require_test_database` 未产生额外跳过——该目录共 23 条用例，18 条依赖隔离测试库的用例全部计入 20 passed，与上述识别一致。
 
 **冷启动与 worker 恢复**：冷启动全栈后三个业务数据库工具均正常注册并回答；worker 启动等待 PostgreSQL 就绪（`backend/test/unit/services/test_worker_database_readiness.py`），不再需要人工重启。
 
@@ -96,4 +104,4 @@ Yuxi 问数只开放项目与项目成员两张表，而 `QueryPolicy` 的全部
 - **状态列**：守卫改为按策略声明的 `status_scope_columns`（来自 `TableBound.status_column`）注入，不再硬编码 `OPERATER_STATUS`。
 - **死代码**：删除无人调用的 `single_transaction_directory`，并修正指向它的过时注释与文档。
 
-同轮门禁：全量 `test/unit` 2701 passed、58 skipped、0 failed；`test/integration/nl2sql` 20 passed、3 skipped；`ruff check` 与 `ruff format --check`（锁定 0.16.4）对改动文件通过；`scripts/verify_engineering_contracts.py` 通过。四账号回归 `ty1=14`、`ty2=3`（`GENERAL_BUDGET` → `COLUMN_NOT_ALLOWED`、`t_project_user` → `TABLE_NOT_ALLOWED`）、`ty3=FUNCTION_GATE_DENIED`、`ty4=NO_PROJECT_ACCESS`，与上表一致。
+同轮门禁：全量 `test/unit` 2701 passed、58 skipped、0 failed；`test/integration/nl2sql` 20 passed、3 skipped（跳过原因见上一节的识别）；`ruff check package`、`ruff format package --check` 与 `ruff check --select I package`（锁定 0.16.4，与 `Makefile` 的 `lint` 目标和 `.github/workflows/ruff.yml` 同范围）通过；改动涉及的 15 个 Python 文件另按 `--select I` 单独核对通过；`scripts/verify_engineering_contracts.py` 通过。四账号回归 `ty1=14`、`ty2=3`（`GENERAL_BUDGET` → `COLUMN_NOT_ALLOWED`、`t_project_user` → `TABLE_NOT_ALLOWED`）、`ty3=FUNCTION_GATE_DENIED`、`ty4=NO_PROJECT_ACCESS`，与上表一致。

@@ -18,7 +18,6 @@ import asyncpg
 import pytest
 from sqlalchemy.dialects.postgresql.asyncpg import AsyncAdapt_asyncpg_dbapi
 from sqlalchemy.exc import DBAPIError
-
 from yuxi.services import run_worker
 
 _DBAPI = AsyncAdapt_asyncpg_dbapi(asyncpg)

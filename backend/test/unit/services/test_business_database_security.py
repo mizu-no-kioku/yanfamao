@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import pytest
-
 from yuxi.services.business_database_security import PolicyViolation, QueryPolicy, SQLSecurityGuard
 
 pytestmark = pytest.mark.unit

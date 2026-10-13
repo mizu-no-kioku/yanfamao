@@ -20,7 +20,6 @@ def business_directory():
 def test_business_account_cannot_write(business_directory):
     """生产账号只有 SELECT；这里证明它确实写不了。"""
     import pymysql
-
     from yuxi.nl2sql.mysql_directory import business_connection_factory
 
     connection = business_connection_factory()()
