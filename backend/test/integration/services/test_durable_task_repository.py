@@ -20,9 +20,9 @@ from yuxi.repositories.evaluation_repository import EvaluationRepository
 from yuxi.repositories.knowledge_file_repository import KnowledgeFileRepository
 from yuxi.repositories.task_repository import TaskRepository
 from yuxi.services import task_queue_service
-from yuxi.services.task_queue_service import finalize_task_failure
+from yuxi.services.task_queue_service import TaskPublicationUnavailableError, finalize_task_failure
 from yuxi.services.task_service import TaskContext, Tasker
-from yuxi.storage.postgres.manager import PostgresManager
+from yuxi.storage.postgres.manager import TENANT_SCHEMA_STATEMENTS, PostgresManager
 from yuxi.storage.postgres.models_business import TaskRecord
 from yuxi.storage.postgres.models_knowledge import EvaluationDataset, EvaluationRun, KnowledgeBase, KnowledgeFile
 from yuxi.utils.datetime_utils import utc_now_naive
@@ -66,6 +66,16 @@ async def durable_task_schema(monkeypatch):
         await connection.run_sync(KnowledgeFile.__table__.create)
         await connection.run_sync(EvaluationDataset.__table__.create)
         await connection.run_sync(EvaluationRun.__table__.create)
+        # 任务发现以 `tenants` 注册表为锚点（它没有 RLS，是"跨租户发现"的入口）。
+        # 隔离 schema 里也要有它 + 默认租户行，否则 `publish_pending_tasks` 找不到任何租户。
+        for statement in TENANT_SCHEMA_STATEMENTS:
+            await connection.execute(text(statement))
+        await connection.execute(
+            text(
+                "INSERT INTO tenants (id, external_tenant_id, issuer, name, code) "
+                "VALUES (1, 'default', 'local', '默认租户', 'default') ON CONFLICT (id) DO NOTHING"
+            )
+        )
 
     manager = object.__new__(PostgresManager)
     PostgresManager.__init__(manager)
@@ -74,10 +84,16 @@ async def durable_task_schema(monkeypatch):
     # 业务会话走 RuntimeSession；这里一并指到隔离 engine 并装上租户注入钩子。
     manager.runtime_engine = scoped_engine
     manager._install_tenant_context_hook()
+    # 跨租户发现走**专用连接**（生产里是 `yuxi_worker_discovery` 角色）。隔离用例把它指到
+    # 同一个隔离 schema，这样 `known_tenant_ids()` 在测试里也能读到 `tenants`。
+    manager.discovery_engine = scoped_engine
+    manager.DiscoverySession = async_sessionmaker(scoped_engine, class_=AsyncSession, expire_on_commit=False)
     manager._initialized = True
     monkeypatch.setattr(task_repository_module, "pg_manager", manager)
     monkeypatch.setattr(evaluation_repository_module, "pg_manager", manager)
     monkeypatch.setattr(knowledge_file_repository_module, "pg_manager", manager)
+    # 任务发现（`known_tenant_ids`）也走 `pg_manager`，同样要指到隔离 engine。
+    monkeypatch.setattr(task_queue_service, "pg_manager", manager)
 
     try:
         yield manager
@@ -388,7 +404,7 @@ async def test_full_worker_fails_legacy_task_through_current_domain_hook(
     )
     published = False
 
-    async def reject_publish(_task_id: str) -> None:
+    async def reject_publish(_task_id: str, _tenant_id: int) -> None:
         nonlocal published
         published = True
 
@@ -509,6 +525,101 @@ async def test_cancel_request_wins_race_with_successful_handler(durable_task_sch
         is True
     )
     assert (await repo.get_by_id(failed_task_id)).status == "cancelled"
+
+
+async def test_publish_pending_tasks_discovers_and_carries_non_default_tenants(
+    durable_task_schema, monkeypatch
+) -> None:
+    """发现以 `tenants` 注册表为锚点：**非默认租户**的 pending 任务也会被发布，且携带自己的租户。
+
+    这条证明"跨租户发现"不依赖某个固定的默认租户——注册表里有几个租户，就进入几个租户的上下文。
+    """
+    async with durable_task_schema.get_async_session_context() as session:
+        await session.execute(
+            text(
+                "INSERT INTO tenants (id, external_tenant_id, issuer, name, code) "
+                "VALUES (2, 't2', 'host', '租户二', 't2') ON CONFLICT (id) DO NOTHING"
+            )
+        )
+
+    task_id = uuid.uuid4().hex
+    await TaskRepository().create(task_id, {**_task_data(), "tenant_id": 2})
+    published: list[tuple[str, int]] = []
+
+    async def capture(task: str, tenant: int) -> None:
+        published.append((task, tenant))
+
+    monkeypatch.setattr(task_queue_service, "publish_task", capture)
+    await task_queue_service.publish_pending_tasks()
+
+    assert (task_id, 2) in published
+
+
+async def test_one_tenants_publication_failure_does_not_block_another_tenant(
+    durable_task_schema, monkeypatch
+) -> None:
+    """**失败隔离**：前一个租户（id 小的）发布失败，后一个租户的任务仍会被发布。
+
+    串行逐租户处理时，若单任务异常逃逸就会中断整轮，后面的租户永远等不到补发——这条钉住
+    "单任务失败不阻断其他租户"的契约，同时证明失败任务仍是 pending（下一轮可重试）。
+    """
+    async with durable_task_schema.get_async_session_context() as session:
+        await session.execute(
+            text(
+                "INSERT INTO tenants (id, external_tenant_id, issuer, name, code) "
+                "VALUES (2, 't2', 'host', '租户二', 't2') ON CONFLICT (id) DO NOTHING"
+            )
+        )
+
+    failing_id = uuid.uuid4().hex
+    healthy_id = uuid.uuid4().hex
+    repo = TaskRepository()
+    await repo.create(failing_id, {**_task_data(), "tenant_id": 1})
+    await repo.create(healthy_id, {**_task_data(), "tenant_id": 2})
+    published: list[tuple[str, int]] = []
+
+    async def publish(task: str, tenant: int) -> None:
+        if task == failing_id:
+            raise ConnectionError("simulated queue outage for the first tenant")
+        published.append((task, tenant))
+
+    monkeypatch.setattr(task_queue_service, "publish_task", publish)
+
+    # 不抛异常：单任务失败被隔离，整轮继续。
+    await task_queue_service.publish_pending_tasks()
+
+    assert (healthy_id, 2) in published
+    assert all(task != failing_id for task, _ in published)
+    # 失败的任务没被改动，仍是 pending —— 下一轮补发会重试。
+    assert (await repo.get_by_id(failing_id)).status == "pending"
+
+
+async def test_publication_failure_for_every_task_reports_the_round_failed(
+    durable_task_schema, monkeypatch
+) -> None:
+    """**整轮全失败**：有任务要发但一条都没发出去 → 显式报错，而不是静默返回空列表。
+
+    同时钉住归因口径：原始异常保留在 `__cause__`；全部失败是**连接类**时只报"**疑似**队列
+    不可用"，不写成根因结论。
+    """
+    task_id = uuid.uuid4().hex
+    await TaskRepository().create(task_id, {**_task_data(), "tenant_id": 1})
+
+    async def publish(_task: str, _tenant: int) -> None:
+        raise ConnectionError("simulated queue outage")
+
+    monkeypatch.setattr(task_queue_service, "publish_task", publish)
+
+    with pytest.raises(TaskPublicationUnavailableError) as caught:
+        await task_queue_service.publish_pending_tasks()
+
+    error = caught.value
+    assert error.attempted == 1
+    assert error.failures == 1
+    assert error.queue_unavailable_suspected is True
+    # 原始异常类型与消息保留在 cause 里。
+    assert isinstance(error.__cause__, ConnectionError)
+    assert "simulated queue outage" in str(error.__cause__)
 
 
 async def test_dataset_completion_and_task_success_share_owner_transaction(durable_task_schema) -> None:

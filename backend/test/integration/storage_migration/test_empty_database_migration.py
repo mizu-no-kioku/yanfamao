@@ -44,17 +44,21 @@ def test_the_full_migration_exits_zero_and_keeps_its_log_in_the_round_root(migra
     assert migration_round.log_path.is_file(), "迁移日志没有落在本轮临时根里"
 
 
-async def test_the_database_records_business_13_and_knowledge_2(migration_round: MigrationRound) -> None:
+async def test_the_database_records_business_14_and_knowledge_2(migration_round: MigrationRound) -> None:
     versions = await round_module.schema_versions()
     assert versions == EXPECTED_VERSIONS
 
 
-async def test_the_full_migration_does_not_enable_rls(migration_round: MigrationRound) -> None:
-    """版本 13 的迁移入口**不**启用 RLS：策略要等隔离验证通过后单独接线。"""
+async def test_the_full_migration_enables_rls(migration_round: MigrationRound) -> None:
+    """版本 14 的迁移入口**会**启用 RLS——策略随本版本一起接线（此前只建表不启用）。
+
+    这是版本 14 与 13 的行为分界：13 只建表，策略等隔离验证通过后单独接线；14 把
+    RLS + 引用一致性 + 归属根护栏 + 发现权限边界一起纳入迁移门禁。
+    """
 
     tables = await round_module.public_table_count()
     assert tables > 0, "迁移没有建出任何表，这条断言会退化成空转"
-    assert await round_module.rls_enabled_table_count() == 0
+    assert await round_module.rls_enabled_table_count() > 0
 
 
 def test_no_artifact_escapes_the_round_root(migration_round: MigrationRound) -> None:

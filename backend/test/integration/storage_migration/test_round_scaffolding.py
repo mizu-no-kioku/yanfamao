@@ -509,3 +509,40 @@ def test_the_migration_round_keeps_artifacts_on_timeout() -> None:
         assert "partial" in log, "超时那一轮没有留下子进程已经产出的日志"
     finally:
         shutil.rmtree(round_.root, ignore_errors=True)
+
+
+def test_a_second_run_does_not_overwrite_the_first_runs_log() -> None:
+    """同一个 `MigrationRound` 跑两轮时，**第一轮（失败那轮）的日志必须还在**。
+
+    中途失败／重放用例就是对同一个轮次跑两次：先注入失败、再重放。旧写法每次都往同一个文件
+    `write_text` 表头，等于把第一轮的失败日志截断——而"保留失败现场"要留的正是它，于是报错里
+    贴出来的会变成第二轮的日志，把人引向错误的现场。这条用例用两个自报家门的子进程取证：
+    两轮的标记必须各自留在自己的文件里，且 `log_tail()` 逐轮给出而不是只留最后一轮。
+    """
+
+    round_ = migration_round_module.start_round()
+    try:
+        migration_round_module.run_full_migration(
+            round_,
+            timeout_seconds=20.0,
+            command=[sys.executable, "-c", "print('first-round-failure', flush=True); raise SystemExit(3)"],
+        )
+        assert round_.returncode == 3, round_.log_tail()
+        migration_round_module.run_full_migration(
+            round_,
+            timeout_seconds=20.0,
+            command=[sys.executable, "-c", "print('second-round-ok', flush=True)"],
+        )
+        assert round_.returncode == 0, round_.log_tail()
+
+        assert len(round_.log_paths) == 2, f"两轮应各分到一个日志文件：{round_.log_paths}"
+        first, second = (path.read_text(encoding="utf-8") for path in round_.log_paths)
+        assert "first-round-failure" in first, "第一轮失败日志被第二轮截断了"
+        assert "second-round-ok" not in first, "第二轮输出串进了第一轮的日志文件"
+        assert "second-round-ok" in second
+        tail = round_.log_tail()
+        assert "first-round-failure" in tail and "second-round-ok" in tail, (
+            f"多轮日志没有逐轮给出，第二轮把第一轮盖掉了：\n{tail}"
+        )
+    finally:
+        shutil.rmtree(round_.root, ignore_errors=True)

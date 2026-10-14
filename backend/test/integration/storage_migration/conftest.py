@@ -104,6 +104,17 @@ def migrated_test_database() -> Iterator[MigrationRound]:
         )
 
 
+@pytest.fixture()
+def current_test_database() -> None:
+    """只读确认隔离测试库已到目标版本；不隐式迁移、不重建实例。"""
+
+    from _tenant_schema_test_db import assert_target_is_the_test_instance
+
+    anyio.run(assert_target_is_the_test_instance)
+    versions = anyio.run(round_module.schema_versions)
+    assert versions == round_module.EXPECTED_VERSIONS, f"测试库版本不兼容：{versions}"
+
+
 @pytest.fixture(scope="module")
 def worker_round(migrated_test_database: MigrationRound) -> Iterator[WorkerRound]:
     """拿互斥、起 worker、等它报出 worker_id；结束时整组回收。"""

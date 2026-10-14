@@ -55,3 +55,31 @@ def test_the_health_ttl_is_derived_from_the_reconciliation_period() -> None:
     period = task_queue_service.TASK_RECONCILIATION_SECONDS
     assert task_queue_service.TASK_RECONCILIATION_HEALTH_TTL_SECONDS == int(period * 2 + 5)
     assert task_queue_service.TASK_RECONCILIATION_HEALTH_TTL_SECONDS > period
+
+
+def test_the_cross_tenant_discovery_query_exposes_only_tenant_ids() -> None:
+    """跨租户发现是全库唯一的跨租户读，边界是"只暴露租户 id"——不能顺带带出租户元数据。
+
+    这条钉住 SQL 文本：一旦有人在这里加列（name / code / issuer …），普通运行时角色能看到的
+    租户信息就超出"发现任务"所需，测试会立刻变红。
+    """
+
+    sql = task_queue_service.KNOWN_TENANT_IDS_SQL
+    assert sql == "SELECT id FROM tenants ORDER BY id"
+    assert "*" not in sql
+
+
+async def test_known_tenant_ids_fails_closed_without_a_discovery_credential(monkeypatch) -> None:
+    """没有发现凭据时，跨租户发现必须**直接失败**，不得回落到运行时 / owner 连接。
+
+    这正是 API 的行为：API 不配置 `POSTGRES_DISCOVERY_URL`，所以它**枚举不了**租户——
+    方案 (b) 的"消费者区分"在代码路径上就成立，而不是只靠部署约定。
+    """
+
+    from yuxi.storage.postgres.manager import pg_manager
+
+    monkeypatch.setattr(pg_manager, "DiscoverySession", None)
+    monkeypatch.setattr(pg_manager, "_initialized", True)  # 别让 initialize() 去连库
+
+    with pytest.raises(RuntimeError, match="POSTGRES_DISCOVERY_URL"):
+        await task_queue_service.known_tenant_ids()

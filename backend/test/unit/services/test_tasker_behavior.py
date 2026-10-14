@@ -12,6 +12,8 @@ import pytest
 
 from yuxi.services import task_queue_service, task_service
 from yuxi.services.task_service import TaskContext, Tasker, process_task
+from yuxi.storage.postgres.models_business import TaskRecord
+from yuxi.storage.postgres.tenant_context import explicit_tenant_id
 from yuxi.utils.datetime_utils import format_utc_datetime, utc_now_naive
 
 
@@ -42,6 +44,7 @@ def make_record(**overrides) -> FakeRecord:
         "status": "pending",
         "progress": 0.0,
         "message": "等待执行",
+        "tenant_id": 1,
         "payload": {},
         "result": None,
         "error": None,
@@ -179,9 +182,9 @@ async def test_arq_publication_uses_fresh_messages_instead_of_stale_job_lock(mon
 
     monkeypatch.setattr(task_queue_service, "get_arq_pool", pool)
 
-    await task_queue_service.publish_task("task-1")
+    await task_queue_service.publish_task("task-1", 1)
 
-    assert calls == [(("process_task", "task-1"), {})]
+    assert calls == [(("process_task", "task-1", 1), {})]
 
 
 async def test_submit_persists_before_arq_publication(monkeypatch):
@@ -189,7 +192,7 @@ async def test_submit_persists_before_arq_publication(monkeypatch):
     tasker = Tasker()
     tasker._repo = repo
 
-    async def publish(task_id: str):
+    async def publish(task_id: str, tenant_id: int):
         assert repo.record is not None
         repo.events.append("publish")
         return True
@@ -228,7 +231,7 @@ async def test_unique_submit_uses_database_dedupe_and_does_not_republish(monkeyp
     tasker._repo = repo
     published: list[str] = []
 
-    async def publish(task_id: str):
+    async def publish(task_id: str, tenant_id: int):
         published.append(task_id)
         return True
 
@@ -304,7 +307,7 @@ async def test_process_task_rebuilds_handler_and_persists_success(monkeypatch):
     monkeypatch.setattr(task_service, "TaskRepository", lambda: repo)
     monkeypatch.setattr(task_service, "get_task_definition", lambda *_args: FakeDefinition(handler))
 
-    await process_task({"worker_id": "worker-1"}, record.id)
+    await process_task({"worker_id": "worker-1"}, record.id, 1)
 
     assert seen == [7]
     assert repo.record.status == "success"
@@ -330,7 +333,7 @@ async def test_process_task_uses_failure_hook_when_success_hook_cannot_load(monk
     monkeypatch.setattr(task_service, "TaskRepository", lambda: repo)
     monkeypatch.setattr(task_service, "get_task_definition", lambda *_args: BrokenSuccessDefinition(None))
 
-    await process_task({"worker_id": "worker-1"}, record.id)
+    await process_task({"worker_id": "worker-1"}, record.id, 1)
 
     assert repo.record.status == "failed"
     assert repo.finish_calls[-1]["message"] == "任务 Handler 无法加载"
@@ -356,7 +359,7 @@ async def test_process_task_republishes_pending_tasks_after_slot_release(monkeyp
     monkeypatch.setattr(task_service, "get_task_definition", lambda *_args: FakeDefinition(handler))
     monkeypatch.setattr(task_service, "publish_pending_tasks", publish_pending)
 
-    await process_task({"worker_id": "worker-1"}, record.id)
+    await process_task({"worker_id": "worker-1"}, record.id, 1)
 
     assert publication_limits == [task_service.DURABLE_TASK_MAX_RUNNING]
 
@@ -374,7 +377,7 @@ async def test_duplicate_delivery_cannot_execute_without_claim(monkeypatch):
     monkeypatch.setattr(task_service, "TaskRepository", lambda: repo)
     monkeypatch.setattr(task_service, "get_task_definition", lambda *_args: FakeDefinition(handler))
 
-    await process_task({"worker_id": "worker-1"}, record.id)
+    await process_task({"worker_id": "worker-1"}, record.id, 1)
 
     assert called is False
     assert repo.finish_calls == []
@@ -397,7 +400,7 @@ async def test_heartbeat_error_cancels_handler_as_lost_lease(monkeypatch):
     monkeypatch.setattr(task_service, "TaskRepository", lambda: repo)
     monkeypatch.setattr(task_service, "get_task_definition", lambda *_args: FakeDefinition(handler))
 
-    await process_task({"worker_id": "worker-1"}, record.id)
+    await process_task({"worker_id": "worker-1"}, record.id, 1)
 
     assert observed_reason == ["lease_lost"]
     assert repo.finish_calls == []
@@ -419,7 +422,7 @@ async def test_parent_job_cancellation_waits_for_handler_exit(monkeypatch):
     monkeypatch.setattr(task_service, "TaskRepository", lambda: repo)
     monkeypatch.setattr(task_service, "get_task_definition", lambda *_args: FakeDefinition(handler))
 
-    job = asyncio.create_task(process_task({"worker_id": "worker-1"}, record.id))
+    job = asyncio.create_task(process_task({"worker_id": "worker-1"}, record.id, 1))
     await started.wait()
     job.cancel()
     with pytest.raises(asyncio.CancelledError):
@@ -445,7 +448,7 @@ async def test_process_task_timeout_persists_failed_terminal(monkeypatch):
     monkeypatch.setattr(task_service, "TaskRepository", lambda: repo)
     monkeypatch.setattr(task_service, "get_task_definition", lambda *_args: FakeDefinition(handler))
 
-    await process_task({"worker_id": "worker-1"}, record.id)
+    await process_task({"worker_id": "worker-1"}, record.id, 1)
 
     assert repo.record.status == "failed"
     assert observed_reason == ["timeout"]
@@ -500,3 +503,143 @@ def test_task_timeout_override_cannot_exceed_worker_default():
     assert tasker._resolve_timeout_seconds(30.0) == 30.0
     with pytest.raises(ValueError, match="cannot exceed the worker default"):
         tasker._resolve_timeout_seconds(61.0)
+
+
+async def test_process_task_without_tenant_context_does_not_execute(monkeypatch):
+    """缺 tenant_id 的 ARQ 消息**不**执行、不猜租户——留给周期补发（用持久化记录里的租户重发）。"""
+    record = make_record()
+    repo = FakeRepo(record)
+    called = False
+
+    async def handler(_context: TaskContext):
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr(task_service, "TaskRepository", lambda: repo)
+    monkeypatch.setattr(task_service, "get_task_definition", lambda *_args: FakeDefinition(handler))
+
+    await process_task({"worker_id": "worker-1"}, record.id)
+
+    assert called is False
+    assert repo.finish_calls == []
+    assert repo.record.status == "pending"
+
+
+async def test_process_task_rejects_a_payload_tenant_that_disagrees_with_persistence(monkeypatch):
+    """payload 租户与持久化归属不一致时**不执行**（RLS 生效时本就读不到；这里覆盖比较分支）。"""
+    record = make_record(tenant_id=2)
+    repo = FakeRepo(record)
+    called = False
+
+    async def handler(_context: TaskContext):
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr(task_service, "TaskRepository", lambda: repo)
+    monkeypatch.setattr(task_service, "get_task_definition", lambda *_args: FakeDefinition(handler))
+
+    await process_task({"worker_id": "worker-1"}, record.id, 1)
+
+    assert called is False
+    assert repo.finish_calls == []
+    assert repo.record.status == "pending"
+
+
+async def test_process_task_runs_under_the_persisted_tenant(monkeypatch):
+    """执行期间租户上下文 = payload 声明的租户（与持久化一致）。"""
+    record = make_record(tenant_id=3)
+    repo = FakeRepo(record)
+    observed: list[int | None] = []
+
+    async def handler(_context: TaskContext):
+        observed.append(explicit_tenant_id())
+        return {"ok": True}
+
+    monkeypatch.setattr(task_service, "TaskRepository", lambda: repo)
+    monkeypatch.setattr(task_service, "get_task_definition", lambda *_args: FakeDefinition(handler))
+
+    await process_task({"worker_id": "worker-1"}, record.id, 3)
+
+    assert observed == [3]
+    assert repo.record.status == "success"
+    assert explicit_tenant_id() is None
+
+
+# --------------------------------------------------------------------------------------
+# 归属列不外泄：**列表与详情两条路径都要挡住**，且详情不能顺带砍掉原有字段。
+#
+# `to_summary_dict()` 会 pop 掉 `payload` / `result`，所以详情改用它是另一种破坏。
+# 这些用例打在**真实**的 `TaskRecord` 上（不是上面的 FakeRecord），否则钉不住真实模型的行为。
+# --------------------------------------------------------------------------------------
+
+
+def _task_record(**overrides: Any) -> TaskRecord:
+    """真实的 `TaskRecord` 实例（不落库，只读属性），带一个可分辨的归属租户。"""
+
+    fields: dict[str, Any] = {
+        "id": "task-detail-1",
+        "name": "demo",
+        "type": "demo",
+        "status": "pending",
+        "progress": 0.0,
+        "message": "",
+        "tenant_id": 7,
+        "payload": {"kb_id": "kb-1"},
+        "result": {"ok": True},
+    }
+    fields.update(overrides)
+    return TaskRecord(**fields)
+
+
+class _StubTaskRepository:
+    """只回放固定记录的仓储桩；不碰数据库。"""
+
+    def __init__(self, records: list[TaskRecord]):
+        self._records = list(records)
+
+    async def get_by_id(self, task_id: str) -> TaskRecord | None:
+        return next((record for record in self._records if record.id == task_id), None)
+
+    async def list(self, *, status=None, limit=100, operator_id=None) -> list[TaskRecord]:
+        return list(self._records)
+
+    async def summarize(self, *, status=None, operator_id=None) -> dict[str, Any]:
+        return {}
+
+
+async def test_task_detail_response_hides_tenant_id_but_keeps_every_original_field() -> None:
+    """详情响应不含顶层 `tenant_id`，且 `payload` / `result` 等原有字段一个不少。"""
+
+    tasker = Tasker()
+    tasker._repo = _StubTaskRepository([_task_record()])
+
+    detail = await tasker.get_task("task-detail-1")
+
+    assert detail is not None
+    assert "tenant_id" not in detail, "详情响应外泄了归属列"
+    assert detail["payload"] == {"kb_id": "kb-1"}, "详情必须保留 payload——改用摘要响应会把它砍掉"
+    assert detail["result"] == {"ok": True}
+    assert detail["id"] == "task-detail-1"
+    assert detail["status"] == "pending"
+
+
+async def test_task_list_response_hides_tenant_id() -> None:
+    """列表响应同样不含顶层 `tenant_id`（两条路径必须同口径）。"""
+
+    tasker = Tasker()
+    tasker._repo = _StubTaskRepository([_task_record()])
+
+    listing = await tasker.list_tasks()
+
+    assert "tenant_id" not in listing["tasks"][0]
+    assert listing["tasks"][0]["id"] == "task-detail-1"
+
+
+def test_task_record_to_dict_still_carries_tenant_id_for_internal_use() -> None:
+    """`to_dict()` 本身**保留** `tenant_id`——剔除只发生在对外响应这一层。
+
+    这是前两条的反面证据：若有人图省事直接从 `to_dict()` 删掉归属列，依赖它的内部调用方会
+    静默拿到 `None`，而"对外不含归属列"的断言**不会**变红。
+    """
+
+    assert _task_record().to_dict()["tenant_id"] == 7

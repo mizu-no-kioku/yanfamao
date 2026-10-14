@@ -7,10 +7,13 @@ from yuxi.agents.mcp.service import ensure_builtin_mcp_servers_in_db
 from yuxi.models.providers.service import ensure_builtin_model_providers_in_db
 from yuxi.services.run_queue_service import close_queue_clients, get_redis_client
 from yuxi.storage.postgres.manager import pg_manager
+from yuxi.storage.postgres.tenant_context import DEFAULT_TENANT_ID, use_tenant
 from yuxi.utils import logger
 from yuxi.agents.backends.sandbox import init_sandbox_provider, shutdown_sandbox_provider
 from yuxi import get_version
 from yuxi.utils.auth_utils import AuthUtils
+
+from server.utils.tenant_context_middleware import validate_multi_tenant_config
 
 
 class RequiredStartupComponentError(RuntimeError):
@@ -50,6 +53,22 @@ async def _initialize_startup_component(
 
 
 async def _startup(app: FastAPI) -> None:
+    """在**显式建立的默认租户上下文**下执行全局启动初始化。
+
+    启动期的全局初始化（内置 Skills / Agents / 模型供应商 / 选项）写入归属根表，需要租户
+    上下文；这里**显式**建立默认租户，而不是依赖 storage 层的隐式回落（回落已被去掉，缺
+    上下文会 fail-closed）。多租户部署的每租户初始化另行设计。
+
+    进入初始化前先**校验多租户开关**：拼错的值（如 `ture`）在这里就抛错，让进程起不来，
+    而不是等到第一个请求才失败——那时部署看起来是健康的。
+    """
+
+    validate_multi_tenant_config()
+    with use_tenant(DEFAULT_TENANT_ID):
+        await _startup_impl(app)
+
+
+async def _startup_impl(app: FastAPI) -> None:
     """取得 API 运行资源并发布结构化启动状态。"""
 
     app.state.startup_complete = False

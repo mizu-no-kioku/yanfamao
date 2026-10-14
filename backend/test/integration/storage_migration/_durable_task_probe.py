@@ -17,7 +17,7 @@ payload 里 `count=0`，`_generate_dataset_task` 因此在
 ## 归属：写库用的是 owner 连接
 
 探针走 `tenant_schema_url()`（owner），worker 走受限角色 `yuxi_app`。这是**有意**的：
-探针扮演"提交任务的应用"，权限比 worker 宽；RLS 尚未启用（版本 13），两侧都能看到同一批行。
+探针只负责夹具写入与最终 oracle；版本 14 已启用 RLS，真实 worker 用显式租户上下文执行。
 """
 
 from __future__ import annotations
@@ -26,7 +26,7 @@ import os
 import uuid
 from dataclasses import dataclass
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from yuxi.storage.postgres.models_business import TaskRecord
@@ -55,9 +55,10 @@ class ProbeTask:
     kb_id: str
     dataset_id: str
     task_id: str
+    tenant_id: int = 1
 
 
-def new_probe_task(kind: str) -> ProbeTask:
+def new_probe_task(kind: str, *, tenant_id: int = 1) -> ProbeTask:
     """每次**运行**唯一（`SESSION_SUFFIX` 是进程级的，同一次运行内多个场景靠 `kind` 区分）。
 
     上一版用固定的 `local` 作缺省标识，跨运行复用同一个 kb_id，于是"上一轮留下的行"会参与
@@ -69,6 +70,7 @@ def new_probe_task(kind: str) -> ProbeTask:
         kb_id=f"kb-rs-{suffix}",
         dataset_id=f"dataset-rs-{suffix}",
         task_id=f"task-rs-{suffix}",
+        tenant_id=tenant_id,
     )
 
 
@@ -95,6 +97,23 @@ async def _session_factory():
     return engine, async_sessionmaker(engine, expire_on_commit=False)
 
 
+async def register_probe_tenant(probe: ProbeTask) -> None:
+    """通过 owner 注册测试租户；仅在隔离实例中使用。"""
+
+    engine, factory = await _session_factory()
+    try:
+        async with factory() as session:
+            await session.execute(
+                text("INSERT INTO tenants (id, external_tenant_id, issuer, name, code) "
+                     "VALUES (:id, :external, 'part2-probe', :name, :code) ON CONFLICT (id) DO NOTHING"),
+                {"id": probe.tenant_id, "external": f"probe-{probe.tenant_id}",
+                 "name": f"探针租户{probe.tenant_id}", "code": f"probe-{probe.tenant_id}"},
+            )
+            await session.commit()
+    finally:
+        await engine.dispose()
+
+
 async def insert_pending_intent(probe: ProbeTask, *, task_type: str = "dataset_generation") -> None:
     """写知识库 + 数据集 + **pending** Task 行，**不发布**——这就是"worker 挂了留下的意图"。
 
@@ -108,7 +127,14 @@ async def insert_pending_intent(probe: ProbeTask, *, task_type: str = "dataset_g
             # 分三次 flush：这三个 mapper 之间**没有** `relationship()`，unit of work 因此
             # 没有依赖边可依，一次 flush 的 INSERT 顺序不保证满足外键（实测会撞
             # `evaluation_datasets_kb_id_fkey`）。依赖顺序在这里是显式的，不靠 SQLAlchemy 猜。
-            session.add(KnowledgeBase(kb_id=probe.kb_id, name=probe.dataset_id, kb_type="milvus"))
+            session.add(
+                KnowledgeBase(
+                    kb_id=probe.kb_id,
+                    name=probe.dataset_id,
+                    kb_type="milvus",
+                    tenant_id=probe.tenant_id,
+                )
+            )
             await session.flush()
             session.add(
                 EvaluationDataset(
@@ -133,6 +159,7 @@ async def insert_pending_intent(probe: ProbeTask, *, task_type: str = "dataset_g
             session.add(
                 TaskRecord(
                     id=probe.task_id,
+                    tenant_id=probe.tenant_id,
                     name="生成评估数据集",
                     type=task_type,
                     status="pending",
@@ -157,6 +184,7 @@ async def read_task_state(task_id: str) -> dict | None:
                 return None
             return {
                 "status": record.status,
+                "tenant_id": record.tenant_id,
                 "attempt_count": int(record.attempt_count or 0),
                 "worker_id": record.worker_id,
                 "message": record.message,

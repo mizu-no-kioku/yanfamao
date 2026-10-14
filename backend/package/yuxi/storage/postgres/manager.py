@@ -25,13 +25,14 @@ from yuxi.storage.postgres.tenant_context import (
     DEFAULT_TENANT_ID as DEFAULT_TENANT_ID,
     DEFAULT_TENANT_ISSUER as DEFAULT_TENANT_ISSUER,
     current_tenant_id as current_tenant_id,
+    explicit_tenant_id as explicit_tenant_id,
     use_tenant as use_tenant,
 )
 from yuxi.utils import logger
 from yuxi.utils.singleton import SingletonMeta
 
 AGENT_RUN_TERMINAL_STATUS_SQL = ", ".join(f"'{status}'" for status in AGENT_RUN_TERMINAL_STATUSES)
-BUSINESS_SCHEMA_VERSION = 13
+BUSINESS_SCHEMA_VERSION = 14
 KNOWLEDGE_SCHEMA_VERSION = 2
 SCHEMA_VERSION_TABLE = "yuxi_schema_migrations"
 # 默认租户常量从 tenant_context 再导出：models_* 与 manager 都要用，来源只此一处。
@@ -230,10 +231,14 @@ RLS_POLICY_SCHEMA_STATEMENTS: tuple[str, ...] = (
     )
     + _derived_policy_statements()
 )
-# 引用一致性：一行不能同时挂在**两个不同知识库**的父行上。
+# 引用一致性：一行不能同时挂在**两个不同知识库**的父行上，父行也不能改归属把既有子行甩下。
 #
 # 与 RLS 的分工是明确的：RLS 管租户可见性，这里管知识库归属自洽。**同租户、不同知识库**的组合
 # RLS 抓不到（两边的行都可见），只有这里能抓；跨租户的组合两层都会拒绝。
+#
+# 两个方向各有一组语句（`TENANT_REFERENCE_RULES` 子侧 / `TENANT_PARENT_OWNERSHIP_RULES` 父侧），
+# **互不替代**——见两处各自的说明。权威设计见
+# `docs/develop-guides/version-14-parent-ownership-guard-spec.md`。
 #
 # 子表 -> ((本表列, 父表, 父表键), ...)。列名对着真库的 FK 与 information_schema 核对过：
 # `knowledge_graph_triples` 的实体列是 `source_entity_id` / `target_entity_id`（不是 subject/object）。
@@ -264,6 +269,70 @@ TENANT_REFERENCE_ROW_KB: dict[str, str] = {
     "evaluation_run_items": "(SELECT kb_id FROM evaluation_runs WHERE run_id = NEW.run_id)",
 }
 TENANT_REFERENCE_DEFAULT_ROW_KB = "NEW.kb_id"
+# 父行侧：父行的 `kb_id` 变化时必须复核既有子行的父表。
+#
+# 与 `TENANT_REFERENCE_RULES` **互不替代**：那张表管"新写入的子行引用了哪个父行"，只在**子表**
+# 写入时触发；而"改父行的 `kb_id`"这条路（repository 的 `_writable_fields`、评估域连白名单都
+# 没有的 `setattr`）走不到子侧触发器，父行归属被改时没有任何人复核既有子行。
+#
+# 父表 -> (父表主键列, ((子表, 子表的引用列, 子表自身的 kb 列 或 None), ...))
+TENANT_PARENT_OWNERSHIP_RULES: dict[str, tuple[str, tuple[tuple[str, str, str | None], ...]]] = {
+    "knowledge_files": (
+        "file_id",
+        (
+            ("knowledge_files", "parent_id", "kb_id"),
+            ("knowledge_chunks", "file_id", "kb_id"),
+            ("knowledge_graph_entity_mentions", "file_id", "kb_id"),
+            ("knowledge_graph_triple_mentions", "file_id", "kb_id"),
+        ),
+    ),
+    "knowledge_chunks": (
+        "chunk_id",
+        (
+            ("knowledge_graph_entity_mentions", "chunk_id", "kb_id"),
+            ("knowledge_graph_triple_mentions", "chunk_id", "kb_id"),
+        ),
+    ),
+    "knowledge_graph_entities": (
+        "entity_id",
+        (
+            ("knowledge_graph_entity_mentions", "entity_id", "kb_id"),
+            ("knowledge_graph_triples", "source_entity_id", "kb_id"),
+            ("knowledge_graph_triples", "target_entity_id", "kb_id"),
+        ),
+    ),
+    "knowledge_graph_triples": (
+        "triple_id",
+        (("knowledge_graph_triple_mentions", "triple_id", "kb_id"),),
+    ),
+    "evaluation_datasets": (
+        "dataset_id",
+        (
+            ("evaluation_dataset_items", "dataset_id", "kb_id"),
+            ("evaluation_runs", "dataset_id", "kb_id"),
+        ),
+    ),
+    "evaluation_dataset_items": (
+        "item_id",
+        # `evaluation_run_items` 没有 `kb_id` 列，判据只能是"存在引用"（第三个元素为 None）。
+        (("evaluation_run_items", "dataset_item_id", None),),
+    ),
+    "evaluation_runs": (
+        "run_id",
+        # **不是** `dataset_item_id`：它可以为空，只比非空题目会放过"空题目的结果行"，让它们
+        # 随 Run 隐式迁移归属——那正是本机制要禁止的静默级联迁移。所以这里比的是 `run_id`，
+        # 只要**存在结果行**就拒，与题目引用是否为空无关。
+        (("evaluation_run_items", "run_id", None),),
+    ),
+}
+# 装引用一致性护栏时**必须停写**的表：子侧触发器装在 `TENANT_REFERENCE_RULES` 的子表上，
+# 父侧触发器装在 `TENANT_PARENT_OWNERSHIP_RULES` 的父表上。两张规则表覆盖的全部表名去重后
+# 排序（取锁顺序固定，避免与并发迁移互锁）。`install_tenant_reference_consistency()` 用它
+# 在"预检已通过、触发器还没装上"这段窗口里对每一张表取 ACCESS EXCLUSIVE 停写锁——DDL 本身
+# 就要这个强度，一次取到位可避免"弱锁升级"与等待写入的读事务互锁。
+TENANT_REFERENCE_GUARDED_TABLES: tuple[str, ...] = tuple(
+    sorted(set(TENANT_REFERENCE_RULES) | set(TENANT_PARENT_OWNERSHIP_RULES))
+)
 
 
 def _reference_consistency_statements() -> tuple[str, ...]:
@@ -278,11 +347,45 @@ def _reference_consistency_statements() -> tuple[str, ...]:
 
     函数按默认 `SECURITY INVOKER` 运行：父行被 RLS 挡住时子查询返回 NULL，`IS DISTINCT FROM`
     判定为不一致从而拒绝，与「RLS 一律 fail-closed」一致。
+
+    **取锁顺序**（本函数最容易写错的地方）：子行可以在**一行里**引用多个父行——
+    `knowledge_graph_entity_mentions` 三个、`knowledge_graph_triples` 两个——两个并发事务若以
+    不同顺序取这些锁就会死锁。所以父行查找改成 `... FOR SHARE`，并按「**实际父行**」的
+    `(父表名, 主键值)` 统一顺序逐个取：先把本行的父行键值取成数组 `ORDER BY`（父表名在生成期
+    就排好序），再 `FOREACH` 加锁。排序键**不是**列的书写顺序、也不是列名——`triples` 的两个
+    引用是同表同键列，按列名排出的次序是固定的，但两个事务里两个 ID 的角色可以互换（A→B 与
+    B→A），只按列名排序仍会反向取锁。
+
+    `FOR SHARE` 是必须的：`UPDATE ... SET kb_id` 改的是非键列，PostgreSQL 因此只取该行的
+    `FOR NO KEY UPDATE`，而外键检查取的是 `FOR KEY SHARE`，**与它不冲突**——单靠"外键锁 + 子侧
+    检查"挡不住"父行改归属 × 子行写入"的并发。
     """
 
     statements: list[str] = []
     for table, rules in TENANT_REFERENCE_RULES.items():
         row_kb = TENANT_REFERENCE_ROW_KB.get(table, TENANT_REFERENCE_DEFAULT_ROW_KB)
+        # 同一父表可能出现多次（`triples` 两个引用都指向 entities）——先去重、再统一排序加锁。
+        by_parent: dict[str, list[str]] = {}
+        parent_key_of: dict[str, str] = {}
+        for local_key, parent, parent_key in rules:
+            by_parent.setdefault(parent, []).append(f"NEW.{local_key}")
+            parent_key_of[parent] = parent_key
+        # `FOREACH ... IN ARRAY` 里的 `ARRAY` 是**语句关键字**，后面不能再跟 `(SELECT ...)`
+        # （会被当成标量子查询，运行时报 "must yield an array, not type character varying"）。
+        # 所以先 `array_agg` 收集到变量，再 `FOREACH` 遍历它。`ORDER BY` 在 `array_agg` 里给出
+        # ——`DISTINCT` 之后子查询的排序不保证保留。
+        locks = "\n".join(
+            f"""
+                SELECT COALESCE(
+                    array_agg(DISTINCT pending.value ORDER BY pending.value), ARRAY[]::text[]
+                ) INTO parent_keys
+                  FROM unnest(ARRAY[{', '.join(by_parent[parent])}]::text[]) AS pending(value)
+                 WHERE pending.value IS NOT NULL;
+                FOREACH parent_value IN ARRAY parent_keys LOOP
+                    PERFORM 1 FROM {parent} WHERE {parent_key_of[parent]} = parent_value FOR SHARE;
+                END LOOP;"""
+            for parent in sorted(by_parent)
+        )
         checks = "\n".join(
             f"""
                 IF NEW.{local_key} IS NOT NULL THEN
@@ -301,6 +404,8 @@ def _reference_consistency_statements() -> tuple[str, ...]:
             CREATE OR REPLACE FUNCTION {function}() RETURNS trigger AS $$
             DECLARE
                 row_kb VARCHAR(80);
+                parent_keys text[];
+                parent_value text;
             BEGIN
                 row_kb := {row_kb};
                 -- 取不到行自身的 kb 时交给外键报错：BEFORE 触发器先于外键检查运行，在这里抛
@@ -308,6 +413,7 @@ def _reference_consistency_statements() -> tuple[str, ...]:
                 IF row_kb IS NULL THEN
                     RETURN NEW;
                 END IF;
+                {locks}
                 {checks}
                 RETURN NEW;
             END;
@@ -320,8 +426,140 @@ def _reference_consistency_statements() -> tuple[str, ...]:
     return tuple(statements)
 
 
-TENANT_REFERENCE_CONSISTENCY_STATEMENTS: tuple[str, ...] = _reference_consistency_statements()
+def _parent_ownership_statements() -> tuple[str, ...]:
+    """为每个父表生成 `BEFORE UPDATE` 触发器：`kb_id` 变化时复核既有子行。
+
+    父侧**不锁子行**（只做不加锁读）：此时父行已由自身的 `UPDATE` 持有 `FOR NO KEY UPDATE`，
+    任何并发的子行写入都因 `FOR SHARE` 阻塞在外——检查看到的子行集合是冻结的。死锁面则靠
+    子侧那个统一的取锁顺序压住，而不是靠这里的"只读"。
+
+    有 `kb_id` 列的子行按 `IS DISTINCT FROM NEW.kb_id` 判失配；没有该列的
+    （只有 `evaluation_run_items`）按"存在引用"判——它的归属由不可空的 `run_id` 定义。
+    """
+
+    statements: list[str] = []
+    for parent, (parent_key, children) in TENANT_PARENT_OWNERSHIP_RULES.items():
+        conflicts = []
+        for child, child_key, child_kb in children:
+            mismatch = f" AND child_row.{child_kb} IS DISTINCT FROM NEW.kb_id" if child_kb else ""
+            violation = (
+                f"parent ownership guard violated - {parent}.{parent_key} is still "
+                f"referenced by {child} rows, kb_id cannot change"
+            )
+            conflicts.append(
+                f"""
+                IF EXISTS (
+                    SELECT 1 FROM {child} AS child_row
+                    WHERE child_row.{child_key} = OLD.{parent_key}{mismatch}
+                ) THEN
+                    RAISE EXCEPTION
+                        '{violation}'
+                        USING ERRCODE = '23514';
+                END IF;"""
+            )
+        function = f"enforce_{parent}_parent_ownership_stability"
+        statements += [
+            f"""
+            CREATE OR REPLACE FUNCTION {function}() RETURNS trigger AS $$
+            BEGIN
+                IF NEW.kb_id IS DISTINCT FROM OLD.kb_id THEN
+                    {"".join(conflicts)}
+                END IF;
+                RETURN NEW;
+            END;
+            $$ LANGUAGE plpgsql
+            """,
+            f"DROP TRIGGER IF EXISTS {function} ON {parent}",
+            f"CREATE TRIGGER {function} BEFORE UPDATE ON {parent} "
+            f"FOR EACH ROW EXECUTE FUNCTION {function}()",
+        ]
+    return tuple(statements)
+
+
+def _root_tenant_immutability_statements() -> tuple[str, ...]:
+    """归属根的 `tenant_id` 在**普通更新路径上不可变**。
+
+    改一个归属根的租户会把**整棵归属子树**（派生表靠外键链归属）一起搬走——那是数据契约与业务
+    语义的变更，不是一次普通字段更新。RLS 只挡得住受限角色（`WITH CHECK` 比 `tenant_id`），
+    **owner / 迁移连接绕过 RLS**，所以需要数据库层护栏兜住普通 SQL 写入。
+
+    护栏**不承诺**阻止超级用户主动 `DISABLE TRIGGER`——那属运维信任边界。真正的跨租户迁移要
+    另设**经授权、可审计**的流程（显式停用护栏并留痕），而不是靠一次普通 `UPDATE`。
+
+    只在 `BEFORE UPDATE` 上判、且只在值**真的变了**时拒绝：INSERT 新行不受影响。
+
+    **重放安全不靠"语句顺序"**：护栏一旦存在，回填 `UPDATE ... WHERE tenant_id IS NULL` 同样会被
+    它拦下。正常重放之所以安全，是因为**此前迁移已完整完成**——`tenant_id` 已是 NOT NULL、没有
+    NULL 行，回填是空操作。这个前提不成立时（部分安装 / 人为破坏约束），
+    `ensure_tenant_root_immutability()` 会**明确拒绝并提示修复**，而不是关掉护栏。
+    """
+
+    statements: list[str] = []
+    for table in TENANT_ROOT_TABLES:
+        function = f"enforce_{table}_tenant_immutable"
+        statements += [
+            f"""
+            CREATE OR REPLACE FUNCTION {function}() RETURNS trigger AS $$
+            BEGIN
+                IF NEW.tenant_id IS DISTINCT FROM OLD.tenant_id THEN
+                    RAISE EXCEPTION
+                        'tenant ownership is immutable on {table} - use an authorized migration path'
+                        USING ERRCODE = '23514';
+                END IF;
+                RETURN NEW;
+            END;
+            $$ LANGUAGE plpgsql
+            """,
+            f"DROP TRIGGER IF EXISTS {function} ON {table}",
+            f"CREATE TRIGGER {function} BEFORE UPDATE ON {table} "
+            f"FOR EACH ROW EXECUTE FUNCTION {function}()",
+        ]
+    return tuple(statements)
+
+
+TENANT_ROOT_IMMUTABILITY_STATEMENTS: tuple[str, ...] = _root_tenant_immutability_statements()
+
+
+async def _relation_exists(connection, name: str) -> bool:
+    """表 / 视图是否存在。迁移要在"尚未建表的库"上也能跑，所以预检必须先判存在。"""
+
+    return bool(await connection.scalar(text("SELECT to_regclass(:name) IS NOT NULL"), {"name": name}))
+
+
+async def _stale_null_tenant_tables(connection) -> list[str]:
+    """仍存在 `tenant_id IS NULL` 行的归属根表；表或列不存在时跳过（迁移要在未建表的库上也能跑）。"""
+
+    stale: list[str] = []
+    for table in TENANT_ROOT_TABLES:
+        has_column = await connection.scalar(
+            text(
+                "SELECT EXISTS (SELECT 1 FROM pg_attribute a "
+                "WHERE a.attrelid = to_regclass(:table_name) "
+                "AND a.attname = 'tenant_id' AND a.attnum > 0 AND NOT a.attisdropped)"
+            ),
+            {"table_name": table},
+        )
+        if not has_column:
+            continue
+        if await connection.scalar(text(f"SELECT EXISTS (SELECT 1 FROM {table} WHERE tenant_id IS NULL)")):
+            stale.append(table)
+    return stale
+
+
+# 引用一致性 = 子侧（新写入的子行引用必须与行自身 kb 一致，并按统一顺序锁父行）
+# + 父侧（父行改 kb_id 时既有子行不得失配）。两者互不替代，见上面的说明。
+TENANT_REFERENCE_CONSISTENCY_STATEMENTS: tuple[str, ...] = (
+    _reference_consistency_statements() + _parent_ownership_statements()
+)
 TENANT_RUNTIME_ROLE = "yuxi_app"
+# 跨租户**发现**专用角色（worker 侧）。与运行时角色分开，是因为两者要的能力不同：
+# 运行时角色按租户上下文读写业务表，**不该**枚举租户；发现角色只回答"有哪些租户 id"，
+# **不该**碰任何业务表。API 与 worker 共用运行时角色，所以只靠列级授权无法把"普通请求"
+# 与"跨租户 worker"分开——只有**独立凭据**才能。
+TENANT_DISCOVERY_ROLE = "yuxi_worker_discovery"
+# 发现连接串只在 worker 进程配置；API 不持有它（未配置 → 发现能力不可用，fail-closed）。
+TENANT_DISCOVERY_URL_ENV = "POSTGRES_DISCOVERY_URL"
+TENANT_DISCOVERY_PASSWORD_ENV = "POSTGRES_DISCOVERY_PASSWORD"
 
 
 def _sql_literal(value: str) -> str:
@@ -360,6 +598,29 @@ def _tenant_role_statements() -> tuple[str, ...]:
     )
 
 
+def _tenant_discovery_role_statements() -> tuple[str, ...]:
+    """跨租户发现角色的登录凭据与属性。
+
+    与运行时角色同样的收敛纪律：非 superuser、无 BYPASSRLS、不能建库建角色；属性每次收敛，
+    密码只在创建时设置。**不**授任何表权限——权限由
+    `TENANT_DISCOVERY_BOUNDARY_STATEMENTS` 在**最后**统一授予，且只有 `SELECT (id) ON tenants`。
+    """
+
+    password = _sql_literal(os.getenv(TENANT_DISCOVERY_PASSWORD_ENV) or "postgres")
+    return (
+        f"""
+        DO $$
+        BEGIN
+            IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{TENANT_DISCOVERY_ROLE}') THEN
+                CREATE ROLE {TENANT_DISCOVERY_ROLE} LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE
+                    PASSWORD {password};
+            END IF;
+        END $$
+        """,
+        f"ALTER ROLE {TENANT_DISCOVERY_ROLE} WITH LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE",
+    )
+
+
 TENANT_ROLE_GRANT_SCHEMA_STATEMENTS: tuple[str, ...] = (
     f"GRANT USAGE ON SCHEMA public TO {TENANT_RUNTIME_ROLE}",
     # 必须授全部表，不只是归属根：应用要查 messages / conversations / knowledge_files 等
@@ -370,6 +631,35 @@ TENANT_ROLE_GRANT_SCHEMA_STATEMENTS: tuple[str, ...] = (
     f"ALTER DEFAULT PRIVILEGES IN SCHEMA public "
     f"GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO {TENANT_RUNTIME_ROLE}",
     f"ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE, SELECT ON SEQUENCES TO {TENANT_RUNTIME_ROLE}",
+)
+
+# 跨租户发现的**数据库权限边界**（选项 b：worker 专用发现凭据，已批准）。
+#
+# 背景：`TENANT_ROLE_GRANT_SCHEMA_STATEMENTS` 里的 `GRANT ... ON ALL TABLES` 把 `tenants`
+# 整表授给了运行时角色——读（SELECT）与**写**（INSERT/UPDATE/DELETE）都授了出去。于是
+# "worker 需要知道有哪些租户"就变成了"普通请求角色可以读写整张租户表"。把调用约定当成授权
+# 保证是不成立的。
+#
+# 只收窄列（第六轮做法）也**不够**：API 与 worker 共用运行时角色 `yuxi_app`，所以普通请求
+# 照样能枚举全部租户 id。"列级授权 = 专用发现入口"是不成立的。真正区分"普通请求"与
+# "跨租户 worker"只能靠**独立凭据**。因此本边界做两件事：
+#
+#   1. **运行时角色 `yuxi_app` 对 `tenants` 完全无权限**（读与写都收回）。业务路径不需要
+#      读租户表——归属来自认证 Claim 与持久化记录，不来自枚举。
+#   2. **发现角色 `yuxi_worker_discovery` 只有 `SELECT (id) ON tenants`**（外加 schema USAGE）。
+#      不授任何业务表、不授 BYPASSRLS、不授写。API 不配置该角色的连接串，因此**拿不到**这条能力。
+#
+# `REVOKE ALL PRIVILEGES` 同时清 `relacl`（表级）与 `attacl`（列级）——PG16 实测；所以它能把
+# 历史版本遗留的列级 `SELECT (id)` 一并收回（重放安全）。语句本身幂等，但**顺序不幂等**：
+# 先跑本边界、再重放 blanket 授权会把运行时角色的权限放回来。所以版本 14 装配里本边界必须是
+# **最后**一批。
+TENANT_DISCOVERY_BOUNDARY_STATEMENTS: tuple[str, ...] = (
+    # 运行时角色：读与写全部收回（含历史列级授权）。
+    f"REVOKE ALL PRIVILEGES ON tenants FROM {TENANT_RUNTIME_ROLE}",
+    # 发现角色：先清空历史授权（重放安全），再只授最小能力。
+    f"REVOKE ALL PRIVILEGES ON tenants FROM {TENANT_DISCOVERY_ROLE}",
+    f"GRANT USAGE ON SCHEMA public TO {TENANT_DISCOVERY_ROLE}",
+    f"GRANT SELECT (id) ON tenants TO {TENANT_DISCOVERY_ROLE}",
 )
 AGENT_RUN_LEASE_SCHEMA_STATEMENTS = (
     "ALTER TABLE IF EXISTS agent_runs ADD COLUMN IF NOT EXISTS worker_id VARCHAR(128)",
@@ -683,6 +973,11 @@ class PostgresManager(metaclass=SingletonMeta):
         # 运行时业务连接：与迁移/DDL 用的 async_engine 分开，走 yuxi_app 角色。
         self.runtime_engine = None
         self.RuntimeSession = None
+        # 跨租户**发现**专用连接：走 yuxi_worker_discovery 角色（只有 SELECT (id) ON tenants）。
+        # 只在配置了 POSTGRES_DISCOVERY_URL 的进程里存在——API 不配置，因此 discovery_engine
+        # 为 None，发现能力 fail-closed。
+        self.discovery_engine = None
+        self.DiscoverySession = None
         # 测试可观测的钩子；生产是空操作。
         self.on_tenant_context_applied = lambda _tenant_id: None
         self.langgraph_pool = None
@@ -734,6 +1029,18 @@ class PostgresManager(metaclass=SingletonMeta):
             # 注入挂在**事务**边界：set_config(..., true) 是事务局部的，挂在会话开始的话，
             # 会话中途 commit（auth_middleware 会这么做）之后后续查询就失去租户上下文。
             self._install_tenant_context_hook()
+
+            # 跨租户发现专用连接（worker 侧）。**没有** `or db_url` 回落：回落成 owner 会把
+            # "专用发现角色"这条边界悄悄退化成超级用户读，所以未配置就是未配置——发现能力
+            # fail-closed（`known_tenant_ids()` 直接抛错），而不是悄悄用高权限连接顶上。
+            discovery_url = os.getenv(TENANT_DISCOVERY_URL_ENV)
+            if discovery_url:
+                self.discovery_engine = create_async_engine(discovery_url, **engine_kwargs)
+                self.DiscoverySession = async_sessionmaker(
+                    bind=self.discovery_engine,
+                    class_=AsyncSession,
+                    expire_on_commit=False,
+                )
 
             # ==========================================
             # 2. 为 LangGraph 专门初始化一个原生 psycopg_pool
@@ -938,6 +1245,9 @@ class PostgresManager(metaclass=SingletonMeta):
                 *TENANT_BACKFILL_SCHEMA_STATEMENTS,
                 *TENANT_CONSTRAINT_SCHEMA_STATEMENTS,
                 *_tenant_role_statements(),
+                # 发现角色只创建（属性收敛），权限由 `ensure_tenant_discovery_boundary()`
+                # 在**最后**统一授予——它必须晚于上面的 blanket 授权。
+                *_tenant_discovery_role_statements(),
                 *TENANT_ROLE_GRANT_SCHEMA_STATEMENTS,
             ):
                 await conn.execute(text(statement))
@@ -955,17 +1265,151 @@ class PostgresManager(metaclass=SingletonMeta):
             for statement in RLS_POLICY_SCHEMA_STATEMENTS:
                 await conn.execute(text(statement))
 
+    async def precheck_tenant_reference_consistency(self) -> None:
+        """装引用一致性约束**之前**的存量预检：既有子行的 kb 必须与父行一致。
+
+        **为什么必须先于装约束**：子侧触发器只约束**新写入**，管不到既有行。若库里已存在跨库
+        子行，直接装约束会得到"约束装好了、脏数据还在"——边界看起来关上了，其实一直开着。
+        所以这里先把存量失配查出来并**显式失败**、提示修复，而不是静默继续。
+
+        **独立的只读入口**：它自己开一个只读连接。迁移入口**不用**它——那里走
+        `install_tenant_reference_consistency()`，把预检与装约束放进**同一事务**并在整个窗口
+        持有停写锁，否则"预检提交"与"触发器装上"之间的窗口仍可能被写入挤进来（见该方法的说明）。
+
+        只读、幂等；缺表时跳过（全新库 / 该域尚未建表）。
+        """
+
+        self._check_initialized()
+        async with self.async_engine.connect() as conn:
+            await self._precheck_reference_consistency(conn)
+
+    async def install_tenant_reference_consistency(self) -> None:
+        """同事务取停写锁、预检存量、安装引用触发器；失败则整笔回滚。
+
+        先按固定表名顺序取 ACCESS EXCLUSIVE，覆盖子侧与父侧触发器涉及的表，
+        再查存量并执行DDL。锁同时挡读写，避免先取弱锁再升级与等待写入的读事务互锁。
+        取锁最多等10秒，超时失败，不跳过。提交后写入恢复，由新触发器约束。
+
+        迁移入口在RLS之后调用本方法，后续根护栏、发现边界与版本记录仍各自提交，
+        并非全迁移原子事务。预检能看全行靠的是本连接自身的权限（owner 连接），
+        row_security=off 只是绊线：角色退化到需要 RLS 过滤时直接报错，而不是静默漏查。
+        """
+
+        self._check_initialized()
+        async with self.async_engine.begin() as conn:
+            # 直接取DDL所需强度，避免停写锁升级时与等待写入的读事务形成死锁。
+            await conn.execute(text("SET LOCAL lock_timeout = '10s'"))
+            for table in TENANT_REFERENCE_GUARDED_TABLES:
+                if not await _relation_exists(conn, table):
+                    continue
+                # 停写：先取锁，再预检，最后装触发器——三者同一事务，窗口内不可能有写入。
+                await conn.execute(text(f'LOCK TABLE "{table}" IN ACCESS EXCLUSIVE MODE'))
+            await self._precheck_reference_consistency(conn)
+            for statement in TENANT_REFERENCE_CONSISTENCY_STATEMENTS:
+                await conn.execute(text(statement))
+
     async def ensure_tenant_reference_consistency(self) -> None:
         """建立引用一致性触发器：一行不能同时挂在两个不同知识库的父行上。
+
+        两个方向一起装：**子侧**（`BEFORE INSERT OR UPDATE`，新写入的子行引用必须与行自身 kb
+        一致，父行查找用 `FOR SHARE` 并按统一的「实际父行」顺序加锁）+ **父侧**
+        （`BEFORE UPDATE`，父行改 `kb_id` 时既有子行不得失配）。只有一侧成立时，另一侧那条
+        路径就是静默的失配入口——它们互不替代，理由见两个规则表上方的说明。
 
         与 `ensure_tenant_rls()` 分开：RLS 管租户可见性，这里管知识库归属自洽。幂等
         （`CREATE OR REPLACE FUNCTION` + `DROP TRIGGER IF EXISTS`）。与策略语句一样**不加**
         `to_regclass` 守卫——缺表时显式失败能暴露建表顺序错误。
+
+        **迁移入口不用本方法**：它只装触发器、不做预检、也不停写。迁移走
+        `install_tenant_reference_consistency()`（预检 + 装约束同事务 + 停写锁）。本方法留给
+        隔离用例里"先建表、单独装触发器"的夹具场景。
         """
 
         self._check_initialized()
         async with self.async_engine.begin() as conn:
             for statement in TENANT_REFERENCE_CONSISTENCY_STATEMENTS:
+                await conn.execute(text(statement))
+
+    async def _precheck_reference_consistency(self, conn) -> None:
+        """在**给定连接**上跑存量预检；失配时抛错。只读、幂等，缺表跳过。
+
+        抽出来是为了让 `precheck_tenant_reference_consistency()`（独立只读入口）与
+        `install_tenant_reference_consistency()`（同一事务内的预检 + 装约束）共用同一套判据，
+        而不是两份会漂移的实现。
+        """
+
+        # 预检可见性来自本连接自身的权限，不是这个设置。它是**绊线**：一旦角色退化到
+        # "查询需要受 RLS 过滤"，PostgreSQL 直接报错，而不是静默返回被过滤的子集、
+        # 让存量失配看起来不存在。异常不捕获，会中断整个迁移。
+        await conn.execute(text("SET LOCAL row_security = off"))
+        violations: list[str] = []
+        for table, rules in TENANT_REFERENCE_RULES.items():
+            if not await _relation_exists(conn, table):
+                continue
+            # 行自身 kb 的来源：多数表是 `kb_id` 列，`evaluation_run_items` 只能经 `run_id` 取。
+            row_kb = TENANT_REFERENCE_ROW_KB.get(table, TENANT_REFERENCE_DEFAULT_ROW_KB).replace(
+                "NEW.", "child_row."
+            )
+            for child_column, parent_table, parent_key in rules:
+                if not await _relation_exists(conn, parent_table):
+                    continue
+                mismatches = await conn.scalar(
+                    text(
+                        f"SELECT count(*) FROM {table} AS child_row "
+                        f"JOIN {parent_table} AS parent_row "
+                        f"ON child_row.{child_column} = parent_row.{parent_key} "
+                        f"WHERE {row_kb} IS NOT NULL AND parent_row.kb_id IS NOT NULL "
+                        f"AND {row_kb} IS DISTINCT FROM parent_row.kb_id"
+                    )
+                )
+                if mismatches:
+                    violations.append(f"{table}.{child_column} → {parent_table}.{parent_key}：{mismatches} 行")
+        if violations:
+            raise RuntimeError(
+                "装引用一致性约束前发现既有跨库子行，说明存量数据已失配："
+                + "；".join(violations)
+                + "。请先修复这些行（或走经授权的迁移路径）再重跑，不要跳过预检。"
+            )
+
+    async def ensure_tenant_root_immutability(self) -> None:
+        """安装归属根 `tenant_id` 不可变护栏（**属于引入它的那个版本**，不是 `ensure_tenant_schema`）。
+
+        **为什么不并进 `ensure_tenant_schema()`**：那个方法对"已在当前版本的库"**不会执行**，
+        对全新库却会执行——同一个版本会因此带不同约束。护栏必须随版本一起收敛，不能无记录地
+        改写既有版本语义。
+
+        安装前先查"异常 / 部分安装"状态：正常路径下 `tenant_id` 已是 NOT NULL、没有 NULL 行；
+        若仍有 NULL 行，说明上一轮迁移没有完整完成。此时**明确失败并提示修复**——不关护栏、
+        也不自动回填，避免报出"tenant ownership is immutable"这种误导性原因。
+        """
+
+        self._check_initialized()
+        async with self.async_engine.begin() as conn:
+            stale = await _stale_null_tenant_tables(conn)
+            if stale:
+                raise RuntimeError(
+                    "安装租户护栏前发现 tenant_id 仍为空的归属根行，说明上一轮迁移未完整完成："
+                    f"{', '.join(stale)}。请先补跑回填并恢复 NOT NULL，不要停用护栏。"
+                )
+            for statement in TENANT_ROOT_IMMUTABILITY_STATEMENTS:
+                await conn.execute(text(statement))
+
+    async def ensure_tenant_discovery_boundary(self) -> None:
+        """把跨租户发现收进**专用角色**：运行时角色对 `tenants` 无权限，发现角色只有 `SELECT (id)`。
+
+        这是"跨租户发现"的**数据库权限边界**，取代"只应由 worker 调用"这种调用约定——
+        约定不是授权保证。`TENANT_ROLE_GRANT_SCHEMA_STATEMENTS` 的 `ON ALL TABLES` 会整表
+        授权（含写）给运行时角色，所以本方法必须在它**之后**执行；语句幂等，但**顺序不幂等**。
+
+        **边界范围**：`yuxi_app`（API 与 worker 共用）**完全**不能读/写 `tenants`；
+        只有 worker 侧用独立连接串（`POSTGRES_DISCOVERY_URL` → 角色
+        `yuxi_worker_discovery`）能读 `tenants.id`。API 不配置该连接串，因此拿不到这条能力。
+        决定记录见 `docs/develop-guides/version-14-worker-tenant-chain-spec.md` §5。
+        """
+
+        self._check_initialized()
+        async with self.async_engine.begin() as conn:
+            for statement in TENANT_DISCOVERY_BOUNDARY_STATEMENTS:
                 await conn.execute(text(statement))
 
     async def upgrade_knowledge_schema_v1_to_v2(self) -> None:
@@ -1955,9 +2399,17 @@ class PostgresManager(metaclass=SingletonMeta):
         `set_config('app.tenant_id', ..., true)` 的 `true` 表示只在当前事务内有效，
         所以它必须挂在事务边界（`after_begin`）而不是会话开始——会话中途 commit 之后
         事务结束，设置随之失效，下一次事务会重新注入。
+
+        **缺上下文时不注入默认租户**：`explicit_tenant_id()` 未设置就**跳过**这次注入，
+        会话的 `app.tenant_id` 保持未设置 → RLS 把它当"无租户"处理（读 0 行、写被
+        `WITH CHECK` 拒）。这样"忘了建立上下文"与"以租户 1 运行"可区分，不会静默串到租户 1。
+        显式建立租户的入口见 API 中间件、API / worker 启动的全局初始化，以及 worker 消费
+        任务时**由消息携带的路由提示**（该提示只用于建立上下文，归属以持久化记录核对为准）。
         """
 
-        tenant_id = current_tenant_id()
+        tenant_id = explicit_tenant_id()
+        if tenant_id is None:
+            return
         connection.execute(
             text("SELECT set_config('app.tenant_id', :tenant_id, true)"),
             {"tenant_id": str(tenant_id)},
@@ -2046,6 +2498,155 @@ class PostgresManager(metaclass=SingletonMeta):
         finally:
             await session.close()
 
+    @asynccontextmanager
+    async def get_discovery_session_context(self):
+        """跨租户**发现**专用会话：走 `yuxi_worker_discovery`（只有 `SELECT (id) ON tenants`）。
+
+        **未配置发现连接串时直接抛错**（fail-closed），不回落运行时/owner 连接：回落会把
+        "发现能力只属于 worker 的专用角色"退化成"任何进程都能枚举租户"，正是本边界要消除的。
+        """
+
+        self.initialize()  # 确保已初始化
+        if self.DiscoverySession is None:
+            raise RuntimeError(
+                f"跨租户发现需要专用连接串 {TENANT_DISCOVERY_URL_ENV}（角色 {TENANT_DISCOVERY_ROLE}）；"
+                "未配置时发现能力不可用，且**不**回落到运行时/owner 连接。"
+            )
+        session = self.DiscoverySession()
+        try:
+            yield session
+            await session.commit()
+        except Exception as e:
+            await session.rollback()
+            logger.error(f"PostgreSQL discovery operation failed: {e}")
+            raise
+        finally:
+            await session.close()
+
+    async def require_discovery_credential(self) -> None:
+        """启动期校验：发现凭据必须已配置，且其角色确实是**最小权限**的发现角色。
+
+        只校验"角色名对不对"不够——名字对、属性却被放宽的发现角色（superuser / BYPASSRLS /
+        经角色成员关系**继承**的基表所有权 / 是某个 superuser 或 BYPASSRLS 角色的成员 / 实际拿到
+        `tenants.id` 之外的权限）等于一个能读全库的账号。所以这里把
+        `require_restricted_runtime_role()` 的同一套属性检查搬过来，并额外核对：
+
+        - **有效权限**：当前 schema 下，该角色对基表只应有 `tenants(id)` 的列级 `SELECT`——
+          不得有表级读、不得有任何写、不得触及业务表。用 `has_table_privilege` /
+          `has_column_privilege` 判定，能同时抓 `PUBLIC` 授予与经成员关系继承来的权限；
+        - **连接目标**：发现连接必须与运行时连接指向同一个 `host:port/database`，否则"发现"看的
+          不是业务所在的那个库。
+
+        实际能读什么最终由 `ensure_tenant_discovery_boundary()` 的授权与隔离测试保证；这里是
+        启动期的**快速失败**，防配置漂移悄悄发生。
+        """
+
+        self.initialize()
+        if self.discovery_engine is None:
+            raise RuntimeError(
+                f"未配置 {TENANT_DISCOVERY_URL_ENV}：worker 无法跨租户发现待收敛的任务。"
+            )
+
+        problems: list[str] = []
+        async with self.discovery_engine.connect() as connection:
+            role = (
+                await connection.execute(
+                    text(
+                        "SELECT current_user AS role_name, rolsuper, rolbypassrls "
+                        "FROM pg_roles WHERE rolname = current_user"
+                    )
+                )
+            ).one()
+            if role.role_name != TENANT_DISCOVERY_ROLE:
+                problems.append(f"角色是 {role.role_name}，期望 {TENANT_DISCOVERY_ROLE}")
+            if role.rolsuper:
+                problems.append("superuser")
+            if role.rolbypassrls:
+                problems.append("BYPASSRLS")
+
+            # 经角色成员关系继承来的所有权同样绕过边界——用 pg_has_role，不比较名字。
+            owned_tables = (
+                await connection.execute(
+                    text(
+                        "SELECT c.relname FROM pg_class c "
+                        "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                        "WHERE n.nspname = current_schema() AND c.relkind = 'r' "
+                        "AND pg_has_role(current_user, c.relowner, 'USAGE') ORDER BY c.relname"
+                    )
+                )
+            ).scalars().all()
+            if owned_tables:
+                problems.append("拥有基表（" + "、".join(owned_tables[:5]) + "）")
+
+            # 成员关系里若有 superuser / BYPASSRLS 角色，等于可以 SET ROLE 过去拿高权限。
+            privileged_memberships = (
+                await connection.execute(
+                    text(
+                        "SELECT r.rolname FROM pg_auth_members m "
+                        "JOIN pg_roles r ON r.oid = m.roleid "
+                        "JOIN pg_roles me ON me.oid = m.member "
+                        "WHERE me.rolname = current_user AND (r.rolsuper OR r.rolbypassrls) "
+                        "ORDER BY r.rolname"
+                    )
+                )
+            ).scalars().all()
+            if privileged_memberships:
+                problems.append("是高权限角色的成员（" + "、".join(privileged_memberships[:5]) + "）")
+
+            # 有效权限：只允许 `tenants(id)` 的列级 SELECT。
+            table_level = {
+                f"{row[0]}.{row[1]}"
+                for row in await connection.execute(
+                    text(
+                        "SELECT c.relname, p.priv FROM pg_class c "
+                        "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                        "CROSS JOIN (VALUES ('SELECT'),('INSERT'),('UPDATE'),('DELETE'),"
+                        "('TRUNCATE'),('REFERENCES'),('TRIGGER')) AS p(priv) "
+                        "WHERE n.nspname = current_schema() AND c.relkind = 'r' "
+                        "AND has_table_privilege(current_user, c.oid, p.priv)"
+                    )
+                )
+            }
+            column_level = {
+                f"{row[0]}.{row[1]}:{row[2]}"
+                for row in await connection.execute(
+                    text(
+                        "SELECT c.relname, a.attname, p.priv FROM pg_class c "
+                        "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                        "JOIN pg_attribute a ON a.attrelid = c.oid "
+                        "AND a.attnum > 0 AND NOT a.attisdropped "
+                        "CROSS JOIN (VALUES ('SELECT'),('INSERT'),('UPDATE'),('REFERENCES')) AS p(priv) "
+                        "WHERE n.nspname = current_schema() AND c.relkind = 'r' "
+                        "AND has_column_privilege(current_user, c.oid, a.attnum, p.priv)"
+                    )
+                )
+            }
+            if table_level:
+                problems.append("持有表级权限：" + "、".join(sorted(table_level)))
+            extra_columns = column_level - {"tenants.id:SELECT"}
+            if extra_columns:
+                problems.append("持有列级权限：" + "、".join(sorted(extra_columns)))
+            if "tenants.id:SELECT" not in column_level:
+                problems.append("缺少 tenants(id) 的列级 SELECT")
+
+            discovery_database = await connection.scalar(text("SELECT current_database()"))
+
+        # 发现连接必须与运行时连接指向**同一个库**——否则发现的是别的库的租户。
+        if self.runtime_engine is not None:
+            runtime_url = self.runtime_engine.url
+            discovery_url = self.discovery_engine.url
+            discovery_target = (discovery_url.host, discovery_url.port, discovery_database)
+            runtime_target = (runtime_url.host, runtime_url.port, runtime_url.database)
+            if discovery_target != runtime_target:
+                problems.append(
+                    "发现连接目标与运行时不一致："
+                    f"{discovery_url.host}:{discovery_url.port}/{discovery_database} 对 "
+                    f"{runtime_url.host}:{runtime_url.port}/{runtime_url.database}"
+                )
+
+        if problems:
+            raise RuntimeError("发现数据库角色不足以承载跨租户发现：" + "；".join(problems))
+
     async def close(self):
         """关闭引擎"""
         if self.async_engine:
@@ -2054,6 +2655,9 @@ class PostgresManager(metaclass=SingletonMeta):
         if self.runtime_engine:
             await self.runtime_engine.dispose()
 
+        if self.discovery_engine:
+            await self.discovery_engine.dispose()
+
         if self.langgraph_pool:
             await self.langgraph_pool.close()
 
@@ -2061,6 +2665,8 @@ class PostgresManager(metaclass=SingletonMeta):
         self.AsyncSession = None
         self.runtime_engine = None
         self.RuntimeSession = None
+        self.discovery_engine = None
+        self.DiscoverySession = None
         self.langgraph_pool = None
         self.langgraph_checkpointer = None
         self._langgraph_checkpointer_setup = False

@@ -16,22 +16,22 @@ docker compose --profile test-db up -d --force-recreate postgres-test redis-test
 docker compose exec -T api uv run --no-sync pytest test/integration/storage_migration -q -p no:cacheprovider
 ```
 
-跑完这一轮，测试实例上就是 `business=13 / knowledge=2` 的库——Part 2 的测试 worker 需要这个状态
+跑完这一轮，测试实例上就是 `business=14 / knowledge=2` 的库——Part 2 的测试 worker 需要这个状态
 （`_worker_startup` 第一步是 `require_current_schema()`）。这条前置由 `conftest.py` 的
 `migrated_test_database` 提供，session 级只跑一次。
 
 **前提：`REDIS_TEST_URL` 必须在 api 容器里**（测试 worker 用它连独立 Redis）。compose 里已经声明；
 改过 compose 的**环境变量**后必须 `up -d` 重建容器，`restart` 不生效——否则这一步会硬失败并告诉你去重建。
 
-## 四组分别断言什么
+## 各组分别断言什么
 
 **第一轮：空库完整迁移**（`test_empty_database_migration.py`）
 
 | 断言 | 依据 |
 |---|---|
 | 迁移子进程退出 0 | `test_the_full_migration_exits_zero_...` |
-| 库里记着 `business=13 / knowledge=2` | `test_the_database_records_business_13_and_knowledge_2` |
-| **RLS 仍未启用**（且确实建出了表，非空转） | `test_the_full_migration_does_not_enable_rls` |
+| 库里记着 `business=14 / knowledge=2` | `test_the_database_records_business_14_and_knowledge_2` |
+| **RLS 已启用**（且确实建出了表，非空转） | `test_the_full_migration_enables_rls` |
 | 每个文件根都被显式改道到本轮临时根 | `test_the_child_environment_overrides_every_file_root` |
 | 产物全落在临时根（诱饵 cwd 保持为空） | `test_no_artifact_escapes_the_round_root` |
 | 开发目录未被写入 | `test_development_directories_are_not_written` |
@@ -76,7 +76,58 @@ docker compose exec -T api uv run --no-sync pytest test/integration/storage_migr
 **周期设成 3600 不是顺手调大超时**：它让两条路径不可能互相冒充。已用**差分变异探针**实测：
 注释掉启动收敛 → 只有启动场景红；注释掉周期收敛 → 只有周期场景红。
 
-**第四组：脚手架自身**（`test_round_scaffolding.py`）
+**坏消息消费链**（同文件，`test_bad_message_is_consumed_without_execution_then_periodic_republish_completes`）
+
+上面两条验的是"补发时机"，这条验的是**错误消息的恢复**：队列里是一条**租户信息错/缺失**的消息
+（参数化 `message_tenant=[None, 1]`，而任务的持久化租户是 2）。它必须被 **ARQ 消费掉、但不执行**，
+随后**周期补发**用**持久化租户**重新发布并以正确租户完成。
+
+做法：先 `LOCK TABLE tenants IN ACCESS EXCLUSIVE MODE` 把发现路径挡住（`known_tenant_ids()` 取不到
+租户 id → 补发**发不出去**），再用连接池**直接投递**坏参数的消息（`process_task(task_id)` 或
+`process_task(task_id, 1)`）。此时断言：
+
+| 断言 | 含义 |
+|---|---|
+| job 被消费且 `success` | 坏消息**不会**卡在队列里反复重试 |
+| 任务仍是 `pending`、`attempt_count == 0`、`worker_id is None` | **没有执行**——`process_task` 缺租户/租户不符时 fail-closed |
+| 解锁后轮次最终 `success`、`attempt_count == 1`、数据集 `completed` | 周期补发用**持久化租户**重发并完成 |
+| `pool.all_job_results()` 里有 `process_task` 参数 `(task_id, 2)` 的 success | 补发用的**确实是**持久化租户，不是默认 1 |
+
+**为什么用锁而不是"投递坏消息后干等"**：解锁前补发**不可能**成功，所以"任务还是 pending"这条断言
+不可能是"恰好在观察窗口内还没被补发"的巧合；解锁才是唯一让它前进的事件。
+
+**第四组：迁移中途失败与重放**（`test_migration_failure_and_replay.py`）
+
+前四组都建立在"迁移**跑成功了**"之上。这组问的是反面：**中途失败会不会把半成品库记成已完成**。
+
+| 断言 | 依据 |
+|---|---|
+| 注入失败的那一步**不记录** `business=14` | `test_a_failed_step_does_not_record_version_and_a_rerun_completes` |
+| 失败点之后重跑**同一条真实入口**能续上并完成 | 同上（参数化 `ensure_tenant_rls` / `ensure_tenant_discovery_boundary`） |
+| 已是 14 的库上重放**幂等**：版本不变、RLS 不被关掉、授权不回退 | `test_rerunning_the_migration_on_a_current_database_is_idempotent` |
+
+注入方式是**真实入口** `python -m yuxi.storage_migration` + 把 `ensure_tenant_rls` /
+`ensure_tenant_discovery_boundary` 换成抛错的函数（`python -c`），不是把 `record_schema_version`
+换成桩——桩只能证明"桩被调过"。
+
+两个失败点覆盖**两种形态**：`ensure_tenant_rls` 失败 → 库上 RLS 表数 **0**（什么都没装）；
+`ensure_tenant_discovery_boundary` 失败 → RLS 表数 **33**（**前段已提交**）。后者才是真正的
+**部分迁移重放**——它证明"已提交的前段不会被回退"，而不只是"失败就整笔没发生"。
+
+**口径注意**：全新库在租户步骤**之前**会先落一条**遗留基线** `business=9`
+（由 `upgrade_agent_resource_selection()` 记录，既有行为）。所以断言写的是
+`business != 14`（14 才是"重跑时跳过全部租户步骤"的那道闸），不是"一条都没记"。
+
+重放后还核对**角色授权**没有回退：`yuxi_app` 对 `tenants` 无任何列权限、
+`yuxi_worker_discovery` 只有 `tenants(id)` 的列级 `SELECT`（`name` 不可读）。
+
+**中途失败用独立数据库**（`CREATE DATABASE` 临时库，跑完 `DROP ... WITH (FORCE)`），不动会话级的
+`yuxi_test`。方式见 `_migration_round.py`：`run_full_migration()` 允许对**同一个轮次**调用多次，
+每次分到一个**全新**的日志文件（`migration.log` / `migration.run2.log`）——共用一个文件会把
+**第一轮（失败那轮）**的日志冲掉，而"保留失败现场"要留的正是它。
+`test_a_second_run_does_not_overwrite_the_first_runs_log` 把这条钉住。
+
+**第五组：脚手架自身**（`test_round_scaffolding.py`）
 
 守卫是否**接线**且**每次核对**（不缓存——缓存过的版本只记部分输入，"测试 URL 不变、`REDIS_URL`
 被换成同一目标"就能绕过）、报错不泄漏凭证、租约必需且原子释放并自动续期、
@@ -102,23 +153,35 @@ docker compose exec -T api uv run --no-sync pytest test/integration/storage_migr
   `http://127.0.0.1:1` 的沙箱 provisioner（真走到沙箱会立刻失败，不会打到开发 provisioner）。
   Neo4j / Milvus / MinIO **没有**隔离。
   Step D 起本轮**会投递 job**（`dataset_generation`），所以"不投递 job"这句已经作废；
-  之所以仍然安全，是因为探针意图的 payload 是 `count=0`，`_generate_dataset_task` 在
-  `existing_count (0) >= total_count (0)` 处**短路返回**，既不查 Milvus 也不调 LLM。
-  这是**路径选择**而不是隔离：换一个 `count > 0` 的意图，本轮就会打到开发的 Milvus 上。
+  坏消息消费那条也投递同一个探针任务。之所以仍然安全，是因为探针意图的 payload 是 `count=0`，
+  `_generate_dataset_task` 在 `existing_count (0) >= total_count (0)` 处**短路返回**，既不查 Milvus
+  也不调 LLM。这是**路径选择**而不是隔离：换一个 `count > 0` 的意图，本轮就会打到开发的 Milvus 上。
 - 这一步应称为**「带已满足身份前置条件的完整入口验收」**，不是身份迁移本身的证据：运行身份迁移
   （`.v072-runtime-identity`）在 api 容器里是**预置**的（该容器以 `1000:1000` 运行，而迁移步骤要求
   root）。预置是如实陈述的条件：标记内容 `UID:GID` 的**两个值都被核对**，且临时根的归属被断言过。
   身份迁移本身需要在可控的 root 环境里另行验收。
 - **迁移轮次断言"库是空的"，所以每跑一轮都要先重建 `postgres-test`**；第二轮（worker）本身不要求
   空库，但复用同一套 session 前置，因此整目录一起跑时前置仍然是"全新库"。
-- **第三组的两个场景是"补发时机"的证据，不是多租户验收证据**。它们是在 `rls_enabled=0` 的
-  测试实例上取得的；探针用 owner 连接写前置数据，那只是**安排测试前置条件**的手段。
-  版本 14 落地后要证明的是**受限 worker 的租户隔离**：worker 走 `yuxi_app`、任务**携带并恢复**
-  正确的租户上下文、正常租户的任务能完成、**缺上下文 / 跨租户**的任务被拒绝。
-- **`services/` 里那条同名旧用例仍依赖共享 worker 容器的周期**。
-  `test_durable_task_worker_path.py::test_shipping_worker_periodic_reconciliation_recovers_pending_publication`
-  的窗口已改为**由周期推导**（`TASK_RECONCILIATION_SECONDS × 2 + 余量`，原为写死的 15s = 周期的一半，
-  实测 4 次里红 2 次），但它的**确定性仍受容器 loop 相位影响**，只是窗口现在覆盖得住。
-  更根本的是：它依赖**前一个用例**留下的状态与**共享 worker 容器**，因此**不是独立、
-  完全隔离的测试**——窗口扩大只是把等待预算改成与周期匹配。本轮的主要证据是上面第三组的
-  两个场景，那条旧用例不是。
+  **第四组（中途失败／重放）是例外**：中途失败在**另建的一次性库**上跑，不消耗"空库"这个前置；
+  只有"对已是 14 的库重放"那条复用会话级的 `yuxi_test`。
+  **那个一次性库不自动删除**：脚手架只在收尾时把库名与 `DROP DATABASE` 语句打出来，交人工处理。
+  自动 `DROP ... WITH (FORCE)` 会在用例失败时把现场连同库一起销毁，且 `FORCE` 会强断其他会话——
+  破坏性存储操作不由测试代劳。
+  **收尾只在整套断言都通过时清理产物**：异常 / 断言失败 / 超时一律保留两轮日志与测试库。
+- **第三组的两个场景是"补发时机"的证据**。它们在**版本 14**（`business=14`、RLS 已启用）的测试
+  实例上取得：测试 worker 走受限角色 `yuxi_app` + 独立发现凭据 `yuxi_worker_discovery`，任务
+  **携带并恢复**正确的租户上下文。探针用 owner 连接写前置数据，那只是**安排测试前置条件**的手段
+  （owner 绕过 RLS），**不构成**"普通请求也受隔离"的证据。
+- **`services/` 里那条同名旧用例仍依赖共享 worker 容器的周期，且尚未版本 14 就绪**。
+  `test_durable_task_worker_path.py` 的两条 shipping-worker 用例有两个未关闭的前置：
+  1. **依赖常驻 worker 容器**做周期收敛——`test_shipping_worker_periodic_reconciliation_recovers_pending_publication`
+     的窗口已改为**由周期推导**（`TASK_RECONCILIATION_SECONDS × 2 + 余量`），但确定性仍受容器
+     loop 相位影响；更根本的是它依赖**前一个用例**留下的状态与**共享 worker 容器**，因此
+     **不是独立、完全隔离的测试**。
+  2. **在版本 14 实例上，它们自身 setup 就被 RLS 拒绝**：
+     `InsufficientPrivilegeError: new row violates row-level security policy for table "knowledge_bases"`
+     ——它们经 `yuxi_app` 写夹具却没有建立租户上下文。**对照实验**：主树未改动的 HEAD 在同一实例上
+     通过，因为主树的 `_apply_tenant_context` 会**静默回落到 `DEFAULT_TENANT_ID`**；本分支刻意
+     去掉该兜底（`explicit_tenant_id()` 不回落）。因此这两条用例需先建立**显式租户上下文**
+     （或夹具改用 owner 会话），并补常驻 worker，才能作为版本 14 验收。
+  本轮的主要证据是上面第三组的两个场景，那两条旧用例不是。

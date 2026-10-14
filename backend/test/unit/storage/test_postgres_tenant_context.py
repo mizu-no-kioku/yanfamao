@@ -10,18 +10,89 @@ import pytest
 
 from yuxi.storage.postgres.manager import (
     TENANT_ROLE_GRANT_SCHEMA_STATEMENTS,
+    PostgresManager,
     _tenant_role_statements,
 )
-from yuxi.storage.postgres.tenant_context import DEFAULT_TENANT_ID, current_tenant_id, use_tenant
+from yuxi.storage.postgres.tenant_context import (
+    DEFAULT_TENANT_ID,
+    current_tenant_id,
+    explicit_tenant_id,
+    use_tenant,
+)
 
 pytestmark = [pytest.mark.unit]
 
 
-def test_current_tenant_falls_back_to_the_default_tenant():
-    """没有显式上下文时回落默认租户——单租户部署与未接入认证前的所有会话靠它。
+class _RecordingConnection:
+    """记录 `set_config` 注入调用的假连接。"""
 
-    不能改成返回 None：tenant_id 已是 NOT NULL，回落成 None 会让所有插入失败。
+    def __init__(self) -> None:
+        self.statements: list[str] = []
+        self.params: list[dict] = []
+
+    def execute(self, statement, params=None):
+        self.statements.append(str(statement))
+        self.params.append(params or {})
+
+
+def _bare_manager() -> PostgresManager:
+    manager = object.__new__(PostgresManager)
+    PostgresManager.__init__(manager)
+    return manager
+
+
+def test_apply_tenant_context_skips_injection_without_an_explicit_tenant():
+    """缺显式上下文时**不注入**默认租户：会话的 `app.tenant_id` 保持未设置 → RLS fail-closed。
+
+    这是"缺上下文 ≠ 租户 1"的落点：不再靠回落把"忘了建立上下文"变成"以租户 1 运行"。
     """
+    manager = _bare_manager()
+    applied: list[int] = []
+    manager.on_tenant_context_applied = applied.append
+    connection = _RecordingConnection()
+
+    manager._apply_tenant_context(None, None, connection)
+
+    assert connection.statements == []
+    assert applied == []
+
+
+def test_apply_tenant_context_injects_the_explicit_tenant():
+    manager = _bare_manager()
+    applied: list[int] = []
+    manager.on_tenant_context_applied = applied.append
+    connection = _RecordingConnection()
+
+    with use_tenant(9):
+        manager._apply_tenant_context(None, None, connection)
+
+    assert len(connection.statements) == 1
+    assert "set_config('app.tenant_id'" in connection.statements[0]
+    assert connection.params[0] == {"tenant_id": "9"}
+    assert applied == [9]
+
+
+def test_explicit_tenant_is_unset_by_default_and_never_falls_back():
+    """缺上下文返回 `None`，**不**回落默认租户——这是运行时数据库会话的唯一租户来源。
+
+    回落会让"忘了建立上下文"静默变成"以租户 1 运行"；`_apply_tenant_context` 据此在缺上下文时
+    **跳过注入**，RLS 因此按"无租户"处理（读 0 行、写被拒）。
+    """
+    assert explicit_tenant_id() is None
+    with use_tenant(7):
+        assert explicit_tenant_id() == 7
+    assert explicit_tenant_id() is None
+
+
+def test_current_tenant_falls_back_to_the_default_tenant():
+    """`current_tenant_id()` 只服务 ORM **列默认值**（建表 / SQLite 单测 / 迁移）。
+
+    它不是运行时数据库会话的租户来源（那个用 `explicit_tenant_id()`）。不能改成返回 None：
+    `tenant_id` 已是 NOT NULL，回落成 None 会让这些没有会话上下文的插入直接失败。
+    """
+    assert current_tenant_id() == DEFAULT_TENANT_ID
+    with use_tenant(7):
+        assert current_tenant_id() == 7
     assert current_tenant_id() == DEFAULT_TENANT_ID
 
 

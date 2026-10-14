@@ -363,11 +363,14 @@ async def test_tenant_schema_creates_table_and_identity_constraint():
     assert "pg_constraint" in statements
 
 
-def test_business_schema_version_is_thirteen():
-    """版本号是迁移门禁的唯一真相；语句改动后必须推版本，否则已升级的库拿不到新语句。"""
+def test_business_schema_version_is_fourteen():
+    """版本号是迁移门禁的唯一真相；语句改动后必须推版本，否则已升级的库拿不到新语句。
+
+    版本 14 = 租户护栏（RLS / 引用一致性 / 归属根不可变）+ 跨租户发现权限边界一起上线。
+    """
     from yuxi.storage.postgres import manager as manager_module
 
-    assert manager_module.BUSINESS_SCHEMA_VERSION == 13
+    assert manager_module.BUSINESS_SCHEMA_VERSION == 14
 
 
 @pytest.mark.asyncio

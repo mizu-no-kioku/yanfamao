@@ -116,6 +116,10 @@ services:
       - "host.docker.internal:host-gateway"
     env_file:
       - ${YUXI_ENV_FILE:-.env.prod}
+      # 跨租户发现的**专用凭据**只由 worker / storage-migrator 加载；API **不**加载
+      # （见 docker-compose.yml 的同名注释与 docs/develop-guides/version-14-worker-tenant-chain-spec.md §5）。
+      - path: .env.discovery
+        required: false
     environment:
       <<: *api-worker-env
       YUXI_RUNTIME_DIR: /app/runtime/worker
@@ -163,6 +167,9 @@ services:
       - ${YUXI_STATE_DIR:-./docker/volumes}/yuxi/skill-projections:/app/skill-projections
     env_file:
       - ${YUXI_ENV_FILE:-.env.prod}
+      # 迁移器只读其中的 `POSTGRES_DISCOVERY_PASSWORD`（用 **owner 连接**创建发现角色）。
+      - path: .env.discovery
+        required: false
     environment:
       <<: *api-worker-env
       YUXI_RUNTIME_DIR: /app/runtime/storage-migrator

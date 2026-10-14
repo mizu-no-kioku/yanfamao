@@ -24,6 +24,7 @@ from server.routers import router
 from server.utils.lifespan import lifespan
 from server.utils.common_utils import setup_logging
 from server.utils.access_log_middleware import AccessLogMiddleware
+from server.utils.tenant_context_middleware import TenantContextMiddleware
 
 # 设置日志配置
 setup_logging()
@@ -133,6 +134,10 @@ app.add_middleware(AccessLogMiddleware)
 
 # 添加登录限流中间件
 app.add_middleware(LoginRateLimitMiddleware)
+
+# 租户上下文中间件**最后添加 = 最外层**：它要在认证依赖与端点之前建立租户上下文
+# （`get_current_user` 读 `users` 需要租户上下文）。见 tenant_context_middleware 的说明。
+app.add_middleware(TenantContextMiddleware)
 
 if __name__ == "__main__":
     # uvicorn.run(app, host="0.0.0.0", port=5050, threads=10, workers=10, reload=True)

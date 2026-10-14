@@ -243,18 +243,38 @@ async def test_runtime_session_injects_the_tenant_into_every_transaction(isolate
 
     挂在会话开始（而不是事务开始）会让第二次查询失去上下文——表现为功能报错
     （RLS 查不到数据）而不是越权，但同样是故障。
+
+    **必须显式建立上下文**：运行时注入已按设计改为 fail-closed（`explicit_tenant_id()`，
+    未设置不回落默认租户，见 spec §2），所以这里用 `use_tenant(...)`。本用例钉的是
+    "注入挂在**事务**边界"——不是"没上下文也有租户"；后者由下面的 fail-closed 用例钉住。
+    """
+    manager = isolated_tenant_schema
+    manager.runtime_engine = manager.async_engine
+    manager._install_tenant_context_hook()
+
+    with use_tenant(DEFAULT_TENANT_ID):
+        async with manager.get_async_session_context() as session:
+            first = (await session.execute(text("SELECT current_setting('app.tenant_id', true)"))).scalar()
+            await session.commit()
+            second = (await session.execute(text("SELECT current_setting('app.tenant_id', true)"))).scalar()
+
+    assert first == str(DEFAULT_TENANT_ID)
+    assert second == str(DEFAULT_TENANT_ID)
+
+
+async def test_runtime_session_without_an_explicit_tenant_injects_nothing(isolated_tenant_schema):
+    """**没有**显式上下文时，运行时会话**不**注入——这是"缺上下文 ≠ 租户 1"的直接证据。
+
+    回落默认租户已去掉；注入被跳过，`app.tenant_id` 保持未设置，RLS 因此按"无租户"处理。
     """
     manager = isolated_tenant_schema
     manager.runtime_engine = manager.async_engine
     manager._install_tenant_context_hook()
 
     async with manager.get_async_session_context() as session:
-        first = (await session.execute(text("SELECT current_setting('app.tenant_id', true)"))).scalar()
-        await session.commit()
-        second = (await session.execute(text("SELECT current_setting('app.tenant_id', true)"))).scalar()
+        seen = (await session.execute(text("SELECT current_setting('app.tenant_id', true)"))).scalar()
 
-    assert first == str(DEFAULT_TENANT_ID)
-    assert second == str(DEFAULT_TENANT_ID)
+    assert seen in (None, "")
 
 
 async def test_runtime_session_follows_use_tenant(isolated_tenant_schema):

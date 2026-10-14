@@ -14,6 +14,12 @@ import yuxi.services.run_worker as run_worker
 from arq.worker import RetryJob
 from yuxi.config import options as config_options
 from yuxi.services import task_service
+from yuxi.storage.postgres.tenant_context import (
+    DEFAULT_TENANT_ID,
+    clear_tenant_context,
+    explicit_tenant_id,
+    use_tenant,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -1453,6 +1459,12 @@ async def test_worker_startup_ensures_builtin_mcp_servers(monkeypatch: pytest.Mo
     async def fake_require_current_schema():
         calls.append("require_current_schema")
 
+    async def fake_require_restricted_runtime_role():
+        calls.append("require_restricted_runtime_role")
+
+    async def fake_require_discovery_credential():
+        calls.append("require_discovery_credential")
+
     async def fake_ensure_builtin_mcp_servers_in_db():
         calls.append("ensure_builtin_mcp_servers_in_db")
 
@@ -1507,6 +1519,16 @@ async def test_worker_startup_ensures_builtin_mcp_servers(monkeypatch: pytest.Mo
 
     monkeypatch.setattr(run_worker.pg_manager, "initialize", fake_initialize)
     monkeypatch.setattr(run_worker.pg_manager, "require_current_schema", fake_require_current_schema)
+    # `_worker_startup` 紧接着校验运行时角色是否受限（同 API）。这是**真实数据库**调用，
+    # 单元测试里必须打桩——否则会去连一个未初始化的 runtime_engine。角色受限与否由
+    # `test/integration/services/test_tenant_runtime_role.py` 在真库上验收。
+    monkeypatch.setattr(
+        run_worker.pg_manager, "require_restricted_runtime_role", fake_require_restricted_runtime_role
+    )
+    # 跨租户发现凭据校验：只有 worker 做，且同样是真库调用，单元测试里打桩。
+    monkeypatch.setattr(
+        run_worker.pg_manager, "require_discovery_credential", fake_require_discovery_credential
+    )
     monkeypatch.setattr(run_worker.pg_manager, "get_async_session_context", fake_session_ctx)
     monkeypatch.setattr(run_worker, "ensure_builtin_mcp_servers_in_db", fake_ensure_builtin_mcp_servers_in_db)
     monkeypatch.setattr(run_worker, "init_builtin_skills", fake_init_builtin_skills)
@@ -1537,6 +1559,8 @@ async def test_worker_startup_ensures_builtin_mcp_servers(monkeypatch: pytest.Mo
     assert calls == [
         "initialize",
         "require_current_schema",
+        "require_restricted_runtime_role",
+        "require_discovery_credential",
         "ensure_options_in_db",
         "invalidate_option_cache",
         "ensure_builtin_mcp_servers_in_db",
@@ -1650,6 +1674,10 @@ async def test_worker_startup_fails_when_system_options_cannot_initialize(monkey
 
     monkeypatch.setattr(run_worker.pg_manager, "initialize", lambda: None)
     monkeypatch.setattr(run_worker.pg_manager, "require_current_schema", AsyncMock())
+    # 同 `require_current_schema`：这是真库调用，单元测试里打桩，让用例能走到被考察的
+    # `ensure_options_in_db` 失败分支。
+    monkeypatch.setattr(run_worker.pg_manager, "require_restricted_runtime_role", AsyncMock())
+    monkeypatch.setattr(run_worker.pg_manager, "require_discovery_credential", AsyncMock())
 
     @asynccontextmanager
     async def fake_session_ctx():
@@ -1754,3 +1782,79 @@ async def test_cancel_during_manifest_preparation_settles_without_waiting_for_le
     await run_worker.process_agent_run({"job_try": 1}, run.id)
     finish.assert_awaited_once()
     assert finish.call_args.kwargs["run_id"] == run.id
+
+
+# --------------------------------------------------------------------------------------
+# `process_agent_run` 的租户上下文
+#
+# agent-run 链尚未多租户化，ARQ 却**直接**调用本 handler（`WorkerSettings.functions`），payload
+# 只有 `run_id`、没有任何租户路由提示。缺上下文时运行时会话不注入 `app.tenant_id`，RLS 谓词
+# `tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::int` 退化成 `tenant_id = NULL`
+# → `_get_run` 恒为 None → 整条链**静默停摆**（既不执行也不报错）。
+# 所以入口必须**显式**建立默认租户，且不得污染外层已有的上下文。
+#
+# 注意：这些是**上下文接线**的证据。真实受限角色下"默认租户的 AgentRun 能跑通"需要集成环境，
+# 不在本文件的射程内；非默认租户**仍不受支持**。
+# --------------------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def observed_tenants(monkeypatch: pytest.MonkeyPatch) -> list[int | None]:
+    """把 `_process_agent_run` 换成记录"执行时看到哪个租户"的桩。"""
+
+    observed: list[int | None] = []
+
+    async def fake(_ctx, _run_id):
+        observed.append(explicit_tenant_id())
+
+    monkeypatch.setattr(run_worker, "_process_agent_run", fake)
+    return observed
+
+
+@pytest.mark.asyncio
+async def test_process_agent_run_runs_under_the_default_tenant_when_none_is_set(
+    observed_tenants: list[int | None],
+):
+    """没有外层上下文时，handler 内部必须是**显式**默认租户，而不是 None。"""
+
+    clear_tenant_context()
+    await run_worker.process_agent_run({}, "run-1")
+
+    assert observed_tenants == [DEFAULT_TENANT_ID]
+
+
+@pytest.mark.asyncio
+async def test_process_agent_run_restores_an_outer_tenant_context(
+    observed_tenants: list[int | None],
+):
+    """外层已有上下文时：内部用默认租户，**退出后外层值必须恢复**。"""
+
+    with use_tenant(42):
+        await run_worker.process_agent_run({}, "run-1")
+        assert explicit_tenant_id() == 42, "包装器污染了外层租户上下文"
+
+    assert observed_tenants == [DEFAULT_TENANT_ID]
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [RuntimeError("boom"), asyncio.CancelledError()],
+    ids=["exception", "cancelled"],
+)
+@pytest.mark.asyncio
+async def test_process_agent_run_restores_context_after_internal_failure(
+    monkeypatch: pytest.MonkeyPatch, failure: BaseException
+):
+    """内部抛异常或被取消时，外层上下文同样必须恢复（上下文管理器语义）。"""
+
+    async def boom(_ctx, _run_id):
+        raise failure
+
+    monkeypatch.setattr(run_worker, "_process_agent_run", boom)
+
+    # 断言必须在**外层 `use_tenant(42)` 仍然生效时**做：出了这个块，上下文管理器自己就把
+    # ContextVar 重置了，那时读到 None 是块退出的结果，不是"包装器没恢复"。
+    with use_tenant(42):
+        with pytest.raises(type(failure)):
+            await run_worker.process_agent_run({}, "run-1")
+        assert explicit_tenant_id() == 42, "失败路径没有恢复外层租户上下文"

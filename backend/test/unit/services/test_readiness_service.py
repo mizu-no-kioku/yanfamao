@@ -51,6 +51,7 @@ async def test_readiness_requires_startup_postgres_and_redis(monkeypatch: pytest
             "postgres": {"status": "ok"},
             "redis": {"status": "ok"},
             "worker": {"status": "ok"},
+            "tenant_context": {"status": "ok"},
         },
         "components": {},
     }
@@ -74,6 +75,7 @@ async def test_readiness_preserves_each_failed_fact(monkeypatch: pytest.MonkeyPa
         "postgres": {"status": "error", "code": "ConnectionError"},
         "redis": {"status": "ok"},
         "worker": {"status": "ok"},
+        "tenant_context": {"status": "ok"},
     }
     assert result["degraded"] is False
     assert "secret" not in str(result)
@@ -228,3 +230,41 @@ async def test_readiness_cache_is_single_flight_and_returns_independent_payloads
 
     assert calls == {"postgres": 1, "redis": 1}
     assert cached["checks"]["postgres"]["status"] == "ok"
+
+
+async def test_multi_tenant_without_claim_resolution_is_not_ready(monkeypatch: pytest.MonkeyPatch) -> None:
+    """多租户模式下业务请求全 503，readiness **不能**报就绪——否则是探活通过、业务全挂。
+
+    这条防的正是"只检查'查询成功'就报就绪"的错误信号：探针本身都成功，但服务实际不能接流量。
+    """
+    async def ok() -> None:
+        return None
+
+    monkeypatch.setattr(readiness_service, "_probe_postgres", ok)
+    monkeypatch.setattr(readiness_service, "_probe_redis", ok)
+    monkeypatch.setenv("YUXI_MULTI_TENANT", "true")
+
+    result = await readiness_service.get_readiness(startup_complete=True)
+
+    assert result["status"] == "not_ready"
+    assert result["checks"]["tenant_context"] == {
+        "status": "error",
+        "code": "tenant_claim_resolution_unavailable",
+    }
+    # 探针本身都成功：not_ready 只来自租户上下文这一条，不是探针连带失败。
+    assert result["checks"]["postgres"] == {"status": "ok"}
+    assert result["checks"]["redis"] == {"status": "ok"}
+    assert result["checks"]["worker"] == {"status": "ok"}
+
+
+async def test_postgres_readiness_probe_does_not_read_business_tables() -> None:
+    """Postgres 探针必须是纯连通性查询。
+
+    若改成查按租户隔离的业务表，免租户上下文下 RLS 会返回 **0 行**而不是报错——"查询成功"
+    于是变成错误就绪信号。`SELECT 1` 不引用任何表，从根上排除这种可能。
+    """
+
+    sql = readiness_service.POSTGRES_PROBE_SQL
+    assert sql == "SELECT 1"
+    for token in ("from", "join", "tenants", "tasks", "users"):
+        assert token not in sql.lower()

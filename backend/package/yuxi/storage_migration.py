@@ -125,7 +125,7 @@ async def main() -> None:
                 "business",
                 business_version,
                 BUSINESS_SCHEMA_VERSION,
-                upgrade_from=(2, 7, 8, 9, 10, 11, 12),
+                upgrade_from=(2, 7, 8, 9, 10, 11, 12, 13),
             )
             knowledge_version = versions.get("knowledge")
             _require_supported_version(
@@ -167,7 +167,19 @@ async def main() -> None:
             # 因此这里用快照比较，不重读。
             if business_version != BUSINESS_SCHEMA_VERSION:
                 await pg_manager.ensure_tenant_schema()
-                await pg_manager.record_schema_version("business", BUSINESS_SCHEMA_VERSION)
+                await pg_manager.ensure_tenant_rls()
+                # **存量预检与装约束同一事务 + 全程停写**：预检只证明"提交那一刻没有跨库子行"，
+                # 触发器只约束新写入；分两个事务会在"预检已过、触发器未装"之间留一段写入窗口。
+                # `install_tenant_reference_consistency()` 对受保护表持 `ACCESS EXCLUSIVE`
+                # 停写锁（与触发器 DDL 所需强度一致，避免锁升级），把这段窗口关掉
+                # （详见该方法 docstring）。
+                await pg_manager.install_tenant_reference_consistency()
+                # 归属根护栏**不属于** `ensure_tenant_schema()`（那会无记录地改写既有版本语义），
+                # 随本版本单独装。
+                await pg_manager.ensure_tenant_root_immutability()
+                # **发现边界必须最后**：它依赖上面的 blanket 授权先建立，再用 REVOKE 收窄。
+                # 语句幂等，但顺序不幂等——先跑边界、再重放 blanket 会把权限放回来。
+                await pg_manager.ensure_tenant_discovery_boundary()
 
             await _converge_database_state(fail_nonterminal_runs=requires_quiescence)
             legacy_config_file = get_legacy_storage_dir() / "config/base.toml"
@@ -175,8 +187,18 @@ async def main() -> None:
                 legacy_config_file.unlink()
             if migrates_workdirs:
                 await asyncio.to_thread(cleanup_v071_thread_sources, workdir_plan.conversations)
+            # Skill 迁移**会写库并提交**（改 `Skill.dir_path`），属于"会改数据库的步骤"，必须排在
+            # 版本记录之前——否则它失败时库里已经写着 14，重跑会跳过全部租户步骤，半成品被当已完成。
             async with pg_manager.get_owner_session_context() as session:
                 await migrate_shared_skills(session)
+            # **业务版本记录后于全部会写库的步骤**：上面任何一步失败都不写 14，重跑可续。
+            # 记录放在收敛之后，是为了不让"护栏已装但数据未收敛"的中间态被标成已完成。
+            #
+            # 版本号只认证**数据库**变换。文件侧迁移（v071 workdir 收敛、Skill 迁移标记、
+            # v072 运行时身份）各有自己的完成标记与幂等路径，**不并入版本契约**：它们失败时
+            # 不回滚版本，也不需要版本号证明。两层契约分开读，别混。
+            if business_version != BUSINESS_SCHEMA_VERSION:
+                await pg_manager.record_schema_version("business", BUSINESS_SCHEMA_VERSION)
             mark_v071_skills_migrated()
             await asyncio.to_thread(migrate_runtime_storage_identity)
     finally:

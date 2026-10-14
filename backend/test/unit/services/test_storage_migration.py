@@ -47,6 +47,13 @@ async def test_storage_migration_reads_legacy_schema_before_cutover(monkeypatch)
         create_knowledge_tables=lambda: _record(calls, "create_knowledge_tables"),
         ensure_business_schema=lambda: _record(calls, "ensure_business_schema"),
         ensure_tenant_schema=lambda: _record(calls, "tenant_schema"),
+        ensure_tenant_rls=lambda: _record(calls, "tenant_rls"),
+        # 预检 + 装约束 + 停写锁现在是**同一个方法、同一个事务**；"预检先于装约束"是它内部
+        # 的契约（由集成用例 `test_the_install_holds_a_stop_write_lock...` 直接取证），
+        # 不再由本文件的两步顺序断言覆盖。
+        install_tenant_reference_consistency=lambda: _record(calls, "tenant_reference_install"),
+        ensure_tenant_root_immutability=lambda: _record(calls, "tenant_root_guard"),
+        ensure_tenant_discovery_boundary=lambda: _record(calls, "tenant_discovery_boundary"),
         ensure_knowledge_schema=lambda: _record(calls, "ensure_knowledge_schema"),
         setup_langgraph_checkpointer=lambda: _record(calls, "setup_langgraph_checkpointer"),
         get_async_session_context=session_context,
@@ -122,6 +129,13 @@ async def test_storage_migration_rejects_v071_schema_without_quiescence_proof(mo
         create_knowledge_tables=lambda: _record(calls, "create_knowledge"),
         ensure_business_schema=lambda: _record(calls, "schema"),
         ensure_tenant_schema=lambda: _record(calls, "tenant_schema"),
+        ensure_tenant_rls=lambda: _record(calls, "tenant_rls"),
+        # 预检 + 装约束 + 停写锁现在是**同一个方法、同一个事务**；"预检先于装约束"是它内部
+        # 的契约（由集成用例 `test_the_install_holds_a_stop_write_lock...` 直接取证），
+        # 不再由本文件的两步顺序断言覆盖。
+        install_tenant_reference_consistency=lambda: _record(calls, "tenant_reference_install"),
+        ensure_tenant_root_immutability=lambda: _record(calls, "tenant_root_guard"),
+        ensure_tenant_discovery_boundary=lambda: _record(calls, "tenant_discovery_boundary"),
         ensure_knowledge_schema=lambda: _record(calls, "knowledge_schema"),
         setup_langgraph_checkpointer=lambda: _record(calls, "checkpoint"),
         get_async_session_context=session_context,
@@ -173,6 +187,13 @@ async def test_current_schema_skips_schema_ddl(monkeypatch):
         create_knowledge_tables=lambda: _record(calls, "create_knowledge"),
         ensure_business_schema=lambda: _record(calls, "business_schema"),
         ensure_tenant_schema=lambda: _record(calls, "tenant_schema"),
+        ensure_tenant_rls=lambda: _record(calls, "tenant_rls"),
+        # 预检 + 装约束 + 停写锁现在是**同一个方法、同一个事务**；"预检先于装约束"是它内部
+        # 的契约（由集成用例 `test_the_install_holds_a_stop_write_lock...` 直接取证），
+        # 不再由本文件的两步顺序断言覆盖。
+        install_tenant_reference_consistency=lambda: _record(calls, "tenant_reference_install"),
+        ensure_tenant_root_immutability=lambda: _record(calls, "tenant_root_guard"),
+        ensure_tenant_discovery_boundary=lambda: _record(calls, "tenant_discovery_boundary"),
         ensure_knowledge_schema=lambda: _record(calls, "knowledge_schema"),
         setup_langgraph_checkpointer=lambda: _record(calls, "checkpoint"),
         get_async_session_context=session_context,
@@ -264,14 +285,21 @@ async def test_supported_legacy_business_schema_is_converged_and_versioned_as_cu
         get_schema_versions=lambda: _async_value(
             {"business": business_version, "knowledge": storage_migration.KNOWLEDGE_SCHEMA_VERSION}
         ),
-        upgrade_agent_resource_selection=lambda: _record(
-            calls, f"version:business:{storage_migration.BUSINESS_SCHEMA_VERSION}"
-        ),
+        # 用**独立**标记：这条桩若也叫 `version:business:...`，`calls.index(...)` 会先命中它，
+        # 于是"版本记录在全部数据库步骤之后"就变成一句测不出来的话。
+        upgrade_agent_resource_selection=lambda: _record(calls, "agent_resource_selection"),
         record_schema_version=lambda domain, version: _record(calls, f"version:{domain}:{version}"),
         create_business_tables=lambda: _record(calls, "create_business"),
         create_knowledge_tables=lambda: _record(calls, "create_knowledge"),
         ensure_business_schema=lambda: _record(calls, "business_schema"),
         ensure_tenant_schema=lambda: _record(calls, "tenant_schema"),
+        ensure_tenant_rls=lambda: _record(calls, "tenant_rls"),
+        # 预检 + 装约束 + 停写锁现在是**同一个方法、同一个事务**；"预检先于装约束"是它内部
+        # 的契约（由集成用例 `test_the_install_holds_a_stop_write_lock...` 直接取证），
+        # 不再由本文件的两步顺序断言覆盖。
+        install_tenant_reference_consistency=lambda: _record(calls, "tenant_reference_install"),
+        ensure_tenant_root_immutability=lambda: _record(calls, "tenant_root_guard"),
+        ensure_tenant_discovery_boundary=lambda: _record(calls, "tenant_discovery_boundary"),
         ensure_knowledge_schema=lambda: _record(calls, "knowledge_schema"),
         setup_langgraph_checkpointer=lambda: _record(calls, "checkpoint"),
         get_async_session_context=session_context,
@@ -302,6 +330,17 @@ async def test_supported_legacy_business_schema_is_converged_and_versioned_as_cu
     assert f"version:business:{storage_migration.BUSINESS_SCHEMA_VERSION}" in calls
     assert "tenant_schema" in calls
     assert {"create_business", "checkpoint", "knowledge_schema"}.isdisjoint(calls)
+    # 顺序契约（版本 14）：RLS **先于** 预检 + 装约束（同一事务）；归属根护栏在它之后；
+    # 发现边界 **最后**；版本记录 **后于** 全部数据库步骤。
+    # "预检先于装约束"现在**内部**于 `install_tenant_reference_consistency()`（同事务 + 停写锁），
+    # 由集成用例直接取证，不在本文件的调用序列里。
+    assert calls.index("tenant_rls") < calls.index("tenant_reference_install")
+    assert calls.index("tenant_reference_install") < calls.index("tenant_root_guard")
+    assert calls.index("tenant_root_guard") < calls.index("tenant_discovery_boundary")
+    assert calls.index("tenant_discovery_boundary") < calls.index("converge:False")
+    assert calls.index("converge:False") < calls.index(
+        f"version:business:{storage_migration.BUSINESS_SCHEMA_VERSION}"
+    )
 
 
 @pytest.mark.asyncio
@@ -329,6 +368,13 @@ async def test_failed_business_migration_does_not_record_version(monkeypatch):
         create_knowledge_tables=lambda: _record(calls, "create_knowledge"),
         ensure_business_schema=lambda: _record(calls, "business_schema"),
         ensure_tenant_schema=lambda: _record(calls, "tenant_schema"),
+        ensure_tenant_rls=lambda: _record(calls, "tenant_rls"),
+        # 预检 + 装约束 + 停写锁现在是**同一个方法、同一个事务**；"预检先于装约束"是它内部
+        # 的契约（由集成用例 `test_the_install_holds_a_stop_write_lock...` 直接取证），
+        # 不再由本文件的两步顺序断言覆盖。
+        install_tenant_reference_consistency=lambda: _record(calls, "tenant_reference_install"),
+        ensure_tenant_root_immutability=lambda: _record(calls, "tenant_root_guard"),
+        ensure_tenant_discovery_boundary=lambda: _record(calls, "tenant_discovery_boundary"),
         ensure_knowledge_schema=lambda: _record(calls, "knowledge_schema"),
         setup_langgraph_checkpointer=fail_checkpoint_setup,
         get_async_session_context=session_context,
@@ -376,6 +422,13 @@ async def test_current_schema_does_not_rewrite_workdir_data(monkeypatch):
         create_knowledge_tables=lambda: _record(calls, "create_knowledge"),
         ensure_business_schema=lambda: _record(calls, "schema"),
         ensure_tenant_schema=lambda: _record(calls, "tenant_schema"),
+        ensure_tenant_rls=lambda: _record(calls, "tenant_rls"),
+        # 预检 + 装约束 + 停写锁现在是**同一个方法、同一个事务**；"预检先于装约束"是它内部
+        # 的契约（由集成用例 `test_the_install_holds_a_stop_write_lock...` 直接取证），
+        # 不再由本文件的两步顺序断言覆盖。
+        install_tenant_reference_consistency=lambda: _record(calls, "tenant_reference_install"),
+        ensure_tenant_root_immutability=lambda: _record(calls, "tenant_root_guard"),
+        ensure_tenant_discovery_boundary=lambda: _record(calls, "tenant_discovery_boundary"),
         ensure_knowledge_schema=lambda: _record(calls, "knowledge_schema"),
         setup_langgraph_checkpointer=lambda: _record(calls, "checkpoint"),
         get_async_session_context=session_context,

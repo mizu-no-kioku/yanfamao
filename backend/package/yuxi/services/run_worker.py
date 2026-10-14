@@ -18,6 +18,7 @@ from yuxi.agents.backends.sandbox.provider import get_sandbox_provider
 from yuxi.agents.callbacks.model_request_timing import FirstModelRequestRecorder
 from yuxi.agents.mcp.service import ensure_builtin_mcp_servers_in_db
 from yuxi.config import get_int_env
+from yuxi.config.multi_tenant import validate_multi_tenant_config
 from yuxi.repositories.agent_run_repository import TERMINAL_RUN_STATUSES, AgentRunRepository
 from yuxi.services.agent_request_queue_service import (
     dispatch_next_request,
@@ -60,6 +61,7 @@ from yuxi.services.workdir_service import (
 from yuxi.services.worker_health import WORKER_HEALTH_INTERVAL_SECONDS, WORKER_HEALTH_KEY
 from yuxi.storage.postgres.manager import pg_manager
 from yuxi.storage.postgres.models_business import AgentRun, Conversation, Message, User
+from yuxi.storage.postgres.tenant_context import DEFAULT_TENANT_ID, use_tenant
 from yuxi.storage.redis import get_arq_redis_settings
 from yuxi.utils.auth_utils import AuthUtils
 from yuxi.utils.datetime_utils import utc_now_naive
@@ -840,6 +842,22 @@ async def _consume_stream_with_cancel(agen, run_ctx: RunContext):
 
 
 async def process_agent_run(ctx, run_id: str):
+    """ARQ 入口：在**显式默认租户**上下文里执行 AgentRun。
+
+    agent-run 链尚未多租户化（见 `version-14-worker-tenant-chain-spec.md` §5 边界），所以这里与
+    `_reconcile_agent_run_leases_forever`、`_worker_startup` 同口径，**显式**建立默认租户。
+
+    **为什么不能省**：ARQ 直接调用本函数（`WorkerSettings.functions`），payload 只有 `run_id`，
+    没有可用的租户路由提示。不建立上下文时运行时会话不注入 `app.tenant_id`，RLS 谓词
+    `tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::int` 退化成 `tenant_id = NULL`
+    → 读 0 行 → `_get_run` 恒为 None → 整条链**静默停摆**（既不执行、也不报错）。
+    """
+
+    with use_tenant(DEFAULT_TENANT_ID):
+        await _process_agent_run(ctx, run_id)
+
+
+async def _process_agent_run(ctx, run_id: str):
     """执行队列中的 AgentRun，并只从 run 列和输入消息恢复运行参数。"""
     run = await _get_run(run_id)
     if not run:
@@ -1496,20 +1514,26 @@ async def _load_input_message(message_id: int | None) -> Message | None:
 
 
 async def _reconcile_agent_run_leases_forever() -> None:
-    """周期收敛失去 heartbeat 的 Run；多个 worker 并发执行仍由行锁保证单赢家。"""
+    """周期收敛失去 heartbeat 的 Run；多个 worker 并发执行仍由行锁保证单赢家。
+
+    agent-run / 定时任务链的**租户接线是后续增量**。在接线完成前，这一组周期任务显式以
+    **默认租户**运行——不是靠 storage 层的隐式回落（回落已去掉，缺上下文会 fail-closed）。
+    多租户上线前必须先完成这条链的逐租户化，否则非默认租户的 Run 不会被收敛。
+    """
     while True:
         await asyncio.sleep(RUN_RECONCILIATION_SECONDS)
         try:
-            reconciled_ids = await reconcile_expired_run_leases()
-            if reconciled_ids:
-                logger.warning(f"Reconciled expired AgentRun leases: count={len(reconciled_ids)}")
-            cleaned_ids = await reconcile_pending_runtime_cleanups()
-            if cleaned_ids:
-                logger.warning(f"Reconciled pending runtime cleanups: count={len(cleaned_ids)}")
-            await recover_pending_dispatches()
-            await recover_scheduled_dispatches()
-            await claim_and_dispatch_due_jobs()
-            await _publish_reconciliation_health()
+            with use_tenant(DEFAULT_TENANT_ID):
+                reconciled_ids = await reconcile_expired_run_leases()
+                if reconciled_ids:
+                    logger.warning(f"Reconciled expired AgentRun leases: count={len(reconciled_ids)}")
+                cleaned_ids = await reconcile_pending_runtime_cleanups()
+                if cleaned_ids:
+                    logger.warning(f"Reconciled pending runtime cleanups: count={len(cleaned_ids)}")
+                await recover_pending_dispatches()
+                await recover_scheduled_dispatches()
+                await claim_and_dispatch_due_jobs()
+                await _publish_reconciliation_health()
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -1517,18 +1541,30 @@ async def _reconcile_agent_run_leases_forever() -> None:
 
 
 async def _reconcile_durable_tasks_forever() -> None:
-    """周期收敛失联通用 Task，并补发持久 pending 意图。"""
+    """周期收敛失联通用 Task，并补发持久 pending 意图。
+
+    健康键的续租放在**收敛与补发成功之后**：一旦 `reconcile_and_publish_tasks()` 抛错
+    （含"本轮全部发布尝试失败"），这一轮的 `_publish_task_reconciliation_health()` 就被跳过，
+    键**不再续租**。
+
+    **健康宽限契约（不要读成"失败即立即撤销就绪"）**：不续租不等于立即失效——上一次成功写入的
+    健康键仍带原有的 TTL，readiness 会**继续保持就绪直到旧 TTL 到期**，最长
+    `TASK_RECONCILIATION_HEALTH_TTL_SECONDS`（默认 30 秒周期 → 65 秒）。到期后 worker 探针失败
+    → 就绪撤销。也就是说"补发坏了"会在**一个宽限窗口之后**从就绪状态上暴露，而不是立刻。
+    """
+
     while True:
         await asyncio.sleep(TASK_RECONCILIATION_SECONDS)
         try:
             reconciled = await reconcile_and_publish_tasks()
             if reconciled:
-                logger.warning("Reconciled expired durable tasks: count=%s", len(reconciled))
+                logger.warning("Reconciled expired durable tasks: count={}", len(reconciled))
             await _publish_task_reconciliation_health()
         except asyncio.CancelledError:
             raise
-        except Exception:
-            logger.error("Failed to reconcile durable tasks", exc_info=True)
+        except Exception as exc:
+            # Loguru：`exc_info=True` 是 no-op，堆栈不会输出；必须用 `opt(exception=...)`。
+            logger.opt(exception=exc).error("Failed to reconcile durable tasks")
 
 
 async def _publish_task_reconciliation_health() -> None:
@@ -1553,7 +1589,24 @@ async def _publish_reconciliation_health() -> None:
 
 
 async def _worker_startup(ctx):
-    """初始化 worker 依赖。"""
+    """初始化 worker 依赖。
+
+    启动期的全局初始化（内置 Skills / 选项 / MCP）以及尚未逐租户化的 agent-run / 定时任务
+    收敛，都在**显式建立的默认租户上下文**下运行——不是靠 storage 层的隐式回落（回落已去掉，
+    缺上下文会 fail-closed）。通用 Durable Task 的收敛与补发由 `reconcile_and_publish_tasks`
+    自己**逐租户**进入上下文，不依赖这里建立的默认租户。
+
+    进入初始化前先**校验多租户开关**：拼错的值（如 `ture`）在这里就抛错，让 worker 起不来，
+    而不是静默地以默认租户跑。
+    """
+
+    validate_multi_tenant_config()
+    with use_tenant(DEFAULT_TENANT_ID):
+        await _worker_startup_impl(ctx)
+
+
+async def _worker_startup_impl(ctx):
+    """取得 worker 运行资源并发布结构化启动状态。"""
 
     if not isinstance(ctx, dict):
         raise TypeError("ARQ worker context 必须是字典")
@@ -1563,6 +1616,9 @@ async def _worker_startup(ctx):
     await pg_manager.require_current_schema()
     # 同 API：运行时角色不受限就等于没有租户边界。
     await pg_manager.require_restricted_runtime_role()
+    # 只有 worker 需要跨租户发现，所以只有 worker 校验发现凭据。未配置时直接起不来——
+    # 否则它会以"一个租户都发现不到"的状态静默运行，任务永不收敛。
+    await pg_manager.require_discovery_credential()
     async with pg_manager.get_async_session_context() as session:
         from yuxi.config.options import (
             ensure_options_in_db,
@@ -1587,6 +1643,9 @@ async def _worker_startup(ctx):
         logger.warning(f"Reconciled expired AgentRun leases at startup: count={len(reconciled_ids)}")
     await reconcile_pending_runtime_cleanups()
     await recover_pending_dispatches()
+    # 启动期的首轮补发**不吞异常**：若"全部发布尝试失败"抛错，worker 起不来，且
+    # `_publish_task_reconciliation_health()` 不会执行 → 健康键不存在 → readiness 的 worker
+    # 探针失败。即"启动时队列不可用"表现为**拒绝就绪**，而不是带着坏状态装作就绪。
     await reconcile_and_publish_tasks()
     await _publish_task_reconciliation_health()
     await recover_scheduled_dispatches()

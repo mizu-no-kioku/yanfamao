@@ -84,7 +84,7 @@ async def test_prepare_task_with_failed_initial_arq_publication(monkeypatch) -> 
     async with pg_manager.get_async_session_context() as session:
         session.add(KnowledgeBase(kb_id=kb_id, name=dataset_name, kb_type="milvus"))
 
-    async def fail_initial_publication(_task_id: str) -> None:
+    async def fail_initial_publication(_task_id: str, _tenant_id: int) -> None:
         raise ConnectionError("simulated Redis publication failure")
 
     monkeypatch.setattr(task_service, "publish_task", fail_initial_publication)

@@ -19,6 +19,7 @@ from yuxi.services.task_queue_service import (
     publish_task,
 )
 from yuxi.services.task_registry import get_failure_task_definition, get_task_definition
+from yuxi.storage.postgres.tenant_context import use_tenant
 from yuxi.utils.datetime_utils import utc_isoformat, utc_now_naive
 from yuxi.utils.logging_config import logger
 
@@ -36,6 +37,8 @@ class Task:
     status: str = "pending"
     progress: float = 0.0
     message: str = ""
+    # 归属租户：随任务发布进 ARQ payload，消费侧据此建立事务上下文并回查持久化记录核对。
+    tenant_id: int | None = None
     created_at: str = field(default_factory=utc_isoformat)
     updated_at: str = field(default_factory=utc_isoformat)
     started_at: str | None = None
@@ -262,7 +265,13 @@ class Tasker:
 
     async def get_task(self, task_id: str) -> dict[str, Any] | None:
         record = await self._repo.get_by_id(task_id)
-        return record.to_dict() if record else None
+        if record is None:
+            return None
+        # 详情响应保持既有字段集合（含 payload / result），只剔除归属列——与
+        # `to_summary_dict()` 同口径。两条路径若只防一条，"不外泄归属列"就会被另一条绕过。
+        detail = record.to_dict()
+        detail.pop("tenant_id", None)
+        return detail
 
     async def cancel_task(self, task_id: str) -> Task | None:
         current = await self._repo.get_by_id(task_id)
@@ -288,10 +297,18 @@ class Tasker:
 
     @staticmethod
     async def _publish_created_task(task: Task) -> None:
+        if task.tenant_id is None:
+            # 没有归属租户就无法安全唤醒：不猜、不默认。留给周期补发（它会用持久化记录里
+            # 的租户重新发布），不静默当成某个租户。
+            logger.error("Task has no tenant; leaving for periodic republish: task_id={}", task.id)
+            return
         try:
-            await publish_task(task.id)
-        except Exception:
-            logger.error("Task publication failed; pending intent will be retried: task_id=%s", task.id, exc_info=True)
+            await publish_task(task.id, int(task.tenant_id))
+        except Exception as exc:
+            # Loguru：用 `{}` 占位 + `opt(exception=...)`；`%s`/`exc_info=True` 都不会生效。
+            logger.opt(exception=exc).error(
+                "Task publication failed; pending intent will be retried: task_id={}", task.id
+            )
 
     async def _enqueue_task(
         self,
@@ -381,8 +398,8 @@ async def _heartbeat_task(context: TaskContext, execution: asyncio.Task[Any]) ->
             )
         except asyncio.CancelledError:
             raise
-        except Exception:
-            logger.error("Task heartbeat failed; cancelling owner: task_id=%s", context.task_id, exc_info=True)
+        except Exception as exc:
+            logger.opt(exception=exc).error("Task heartbeat failed; cancelling owner: task_id={}", context.task_id)
             context._request_cancel("lease_lost")
             execution.cancel()
             return
@@ -421,15 +438,59 @@ async def _publish_pending_after_slot_release() -> None:
     """释放 Durable Task 槽后接力唤醒 pending intent。"""
     try:
         await publish_pending_tasks(limit=DURABLE_TASK_MAX_RUNNING)
-    except Exception:
-        logger.error("Failed to publish pending tasks after slot release", exc_info=True)
+    except Exception as exc:
+        logger.opt(exception=exc).error("Failed to publish pending tasks after slot release")
 
 
-async def process_task(ctx: dict[str, Any], task_id: str) -> None:
-    """从 PG Task 意图重建并执行一个注册 Handler。"""
+async def process_task(ctx: dict[str, Any], task_id: str, tenant_id: int | None = None) -> None:
+    """ARQ 入口：在**持久化归属租户**的事务上下文里重建并执行一个注册 Handler。
+
+    `tenant_id` 来自 ARQ payload。消费侧**不信任 payload**：用它建立事务上下文（RLS 据此
+    决定可见性），再回查持久化 `TaskRecord` 核对归属；缺失或与持久化记录不一致即 fail-closed。
+
+    - **缺 tenant_id**：不猜、不默认成某个租户，直接不处理；该任务仍是 pending，周期补发
+      会用持久化记录里的租户重新发布（见 `publish_pending_tasks`）。
+    - **payload 租户与持久化归属不一致**：在 payload 租户下回查不到该行 → 不处理（同上）。
+      RLS 生效时，payload 租户与行归属不符的行本就读不到；RLS 未生效（误配）时由
+      `_process_claimed_task` 里的显式比较兜住。
+    """
+
+    if tenant_id is None:
+        logger.error(
+            "Durable task message without tenant context; leaving for periodic republish: task_id={}",
+            task_id,
+        )
+        return
+    with use_tenant(int(tenant_id)):
+        await _process_claimed_task(ctx, task_id, int(tenant_id))
+
+
+async def _process_claimed_task(ctx: dict[str, Any], task_id: str, tenant_id: int) -> None:
+    """在已建立租户上下文的事务里重建并执行任务。调用方必须已 `use_tenant(tenant_id)`。"""
+
     repo = TaskRepository()
     record = await repo.get_by_id(task_id)
-    if record is None or record.status in TERMINAL_STATUSES:
+    if record is None:
+        # 在 payload 声明的租户下不可见：payload 与持久化归属不一致，或行已被删除。
+        # 不静默当成"无事发生"——留给周期补发（它会用持久化记录里的租户重新发布）。
+        logger.error(
+            "Durable task not visible under its declared tenant; leaving for periodic republish: task_id={}, tenant={}",
+            task_id,
+            tenant_id,
+        )
+        return
+    if int(record.tenant_id) != tenant_id:
+        # RLS 生效时不可达（不符的行本就读不到）。RLS 未生效（误配）时这里兜住
+        # "payload 声明的租户 ≠ 持久化归属"：**不在错误租户下执行**，也不改动任务状态——
+        # 它仍是 pending，周期补发会用**持久化记录里的租户**重新发布，从而正确恢复。
+        logger.error(
+            "Durable task tenant mismatch; leaving for periodic republish: task_id={}, payload={}, persisted={}",
+            task_id,
+            tenant_id,
+            record.tenant_id,
+        )
+        return
+    if record.status in TERMINAL_STATUSES:
         return
 
     handler_version = 1 if record.handler_version is None else int(record.handler_version)

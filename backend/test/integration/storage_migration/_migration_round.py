@@ -3,7 +3,7 @@
 ## 一轮 = 一个空库
 
 "空库迁移"验的是 `business_version is None` 那条路径。在**非空**库上重跑，迁移会因为版本已经是
-13 而跳过建表与租户步骤——子进程照样退出 0，用例照样"通过"，但什么都没验。因此：
+14 而跳过建表与租户步骤——子进程照样退出 0，用例照样"通过"，但什么都没验。因此：
 
 - 库必须是全新的。`postgres-test` 的数据目录挂 tmpfs，**重建容器**即得空库：
   `docker compose --profile test-db up -d --force-recreate postgres-test`。
@@ -63,7 +63,7 @@ QUIESCENCE_ENV_VARS = (
 )
 
 SCHEMA_VERSION_TABLE = "yuxi_schema_migrations"
-EXPECTED_VERSIONS = {"business": 13, "knowledge": 2}
+EXPECTED_VERSIONS = {"business": 14, "knowledge": 2}
 
 CHILD_CWD_DIRNAME = "child-cwd"
 
@@ -73,6 +73,10 @@ RUNTIME_IDENTITY_MARKER = _runtime_identity._MIGRATION_MARKER
 RUNTIME_IDENTITY_CONTENT = f"{RUNTIME_UID}:{RUNTIME_GID}\n"
 
 _LOG_TAIL_LINES = 40
+# 每轮一个日志文件、**绝不复用**。中途失败／重放用例会对同一个 `MigrationRound` 跑两次
+# （先注入失败、再重放），共用一个文件会把第一轮——也就是**失败那轮**——的日志冲掉，而
+# "失败保留现场"要留的恰恰是它。
+_LOG_NAME = "migration.log"
 
 
 @dataclass
@@ -86,10 +90,20 @@ class MigrationRound:
     development_markers_before: dict[str, tuple[bool, int, int]] = field(default_factory=dict)
     captured: CapturedProcess | None = None
     timed_out: bool = False
+    # 已经跑过的每一轮子进程的日志文件，按发生顺序。空表示还没跑过。
+    log_paths: list[Path] = field(default_factory=list)
 
     @property
     def log_path(self) -> Path:
-        return self.root / "migration.log"
+        """**最近这一轮**的日志；尚未跑过时是首轮的文件名（调用方可能先往里写字）。"""
+
+        return self.log_paths[-1] if self.log_paths else self.root / _LOG_NAME
+
+    def next_log_path(self) -> Path:
+        """为新一轮子进程分配一个**全新**文件，并登记它——不复用、不截断上一轮。"""
+
+        index = len(self.log_paths) + 1
+        return self.root / (_LOG_NAME if index == 1 else f"migration.run{index}.log")
 
     @property
     def returncode(self) -> int | None:
@@ -99,15 +113,34 @@ class MigrationRound:
         return self.returncode == 0
 
     def log_tail(self) -> str:
-        if self.captured is not None:
-            tail = self.captured.log_tail(_LOG_TAIL_LINES)
-            if tail:
-                return tail
-        try:
-            content = self.log_path.read_text(encoding="utf-8")
-        except OSError as exc:
-            return f"(读不到迁移日志 {self.log_path}: {exc})"
-        return "\n".join(content.splitlines()[-_LOG_TAIL_LINES:])
+        """失败现场的日志尾巴。
+
+        只跑过一轮时就是那一轮的尾巴（优先用子进程内存里的行，进程刚被杀时它比磁盘更全）。
+        跑过**多轮**时**逐轮**给出、各自带标题，而不是把它们接成一条时间线——接起来读的人分不清
+        哪一段是第一轮的失败、哪一段是第二轮的续跑，而"这两轮分别怎么了"正是这里要回答的问题。
+        """
+
+        paths = self.log_paths
+        if not paths:
+            return _read_log_tail(self.root / _LOG_NAME)
+        if len(paths) == 1:
+            if self.captured is not None:
+                tail = self.captured.log_tail(_LOG_TAIL_LINES)
+                if tail:
+                    return tail
+            return _read_log_tail(paths[0])
+        return "\n".join(
+            f"===== run {index} ({path.name}) =====\n{_read_log_tail(path)}"
+            for index, path in enumerate(paths, start=1)
+        )
+
+
+def _read_log_tail(path: Path) -> str:
+    try:
+        content = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        return f"(读不到迁移日志 {path}: {exc})"
+    return "\n".join(content.splitlines()[-_LOG_TAIL_LINES:])
 
 
 def new_round_root() -> Path:
@@ -215,15 +248,20 @@ def run_full_migration(
     才写日志，超时那一轮等于没有日志）。
 
     `command` 只给脚手架自检用例注入（验证超时也会留下日志），生产路径永远用迁移入口。
+
+    对同一个 `MigrationRound` 可以调用**多次**（失败／重放用例就是这么做的）：每次分到一个
+    **全新**的日志文件，上一轮的日志原样保留（见 `_LOG_NAME` 的说明）。
     """
 
     command = command or [sys.executable, "-m", "yuxi.storage_migration"]
-    round_.log_path.write_text(f"$ {' '.join(command)}\n[cwd] {round_.child_cwd}\n", encoding="utf-8")
+    log_path = round_.next_log_path()
+    round_.log_paths.append(log_path)
+    log_path.write_text(f"$ {' '.join(command)}\n[cwd] {round_.child_cwd}\n", encoding="utf-8")
     captured = spawn_captured(
         command,
         cwd=round_.child_cwd,
         env=round_.env,
-        log_path=round_.log_path,
+        log_path=log_path,
     )
     round_.captured = captured
     deadline = time.monotonic() + timeout_seconds
@@ -271,10 +309,15 @@ async def assert_target_is_the_test_instance_and_database_is_empty() -> None:
         )
 
 
-async def schema_versions() -> dict[str, int]:
-    engine = create_async_engine(tenant_schema_url(), pool_pre_ping=True)
+async def schema_versions(url: str | None = None) -> dict[str, int]:
+    """读版本记录。`url` 缺省是测试库；中途失败/重放用例要读**另一个**库（见 `_migration_failure`）。"""
+
+    engine = create_async_engine(url or tenant_schema_url(), pool_pre_ping=True)
     try:
         async with engine.connect() as connection:
+            exists = await connection.scalar(text(f"SELECT to_regclass('{SCHEMA_VERSION_TABLE}') IS NOT NULL"))
+            if not exists:
+                return {}
             rows = (await connection.execute(text(f"SELECT domain, version FROM {SCHEMA_VERSION_TABLE}"))).all()
     finally:
         await engine.dispose()
@@ -293,7 +336,7 @@ async def public_table_count() -> int:
     return int(value)
 
 
-async def rls_enabled_table_count() -> int:
+async def rls_enabled_table_count(url: str | None = None) -> int:
     """public 下启用了 RLS（enabled 或 forced）的基表数。"""
 
     statement = """
@@ -304,7 +347,7 @@ async def rls_enabled_table_count() -> int:
           AND c.relkind = 'r'
           AND (c.relrowsecurity OR c.relforcerowsecurity)
     """
-    engine = create_async_engine(tenant_schema_url(), pool_pre_ping=True)
+    engine = create_async_engine(url or tenant_schema_url(), pool_pre_ping=True)
     try:
         async with engine.connect() as connection:
             value = await connection.scalar(text(statement))

@@ -33,6 +33,12 @@ import shutil
 from pathlib import Path
 
 import pytest
+from arq import create_pool
+from arq.connections import RedisSettings
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import create_async_engine
+
+from _tenant_schema_test_db import tenant_schema_url
 
 import _durable_task_probe as probe_module
 import _worker_round as worker_round_module
@@ -132,6 +138,60 @@ async def test_periodic_reconciliation_republishes_an_intent_committed_after_sta
                 f"领域 success hook 没有把数据集收敛到 completed：{metadata!r}"
             )
     finally:
+        await probe_module.delete_probe_rows(probe)
+
+
+@pytest.mark.parametrize("message_tenant", [None, 1], ids=["missing-tenant", "wrong-tenant"])
+async def test_bad_message_is_consumed_without_execution_then_periodic_republish_completes(
+    current_test_database, session_failed_tests, message_tenant
+) -> None:
+    """阻断发现以固定坏消息阶段；用 ARQ 结果和 PG 终态分别证明消费与恢复。"""
+
+    probe = probe_module.new_probe_task("badmsg", tenant_id=2)
+    engine = create_async_engine(tenant_schema_url())
+    pool = await create_pool(RedisSettings.from_dsn(worker_round_module.redis_test_url()))
+    try:
+        await probe_module.register_probe_tenant(probe)
+        async with managed_worker_round(
+            env_overrides=_period_override(PERIODIC_SCENARIO_PERIOD),
+            failed_tests=session_failed_tests,
+        ) as round_:
+            assert round_.worker_id is not None, round_.log_tail()
+            async with engine.connect() as connection:
+                async with connection.begin():
+                    # 发现 SELECT 被阻断，但 tasks 上的坏消息消费仍可运行。
+                    await connection.execute(text("LOCK TABLE tenants IN ACCESS EXCLUSIVE MODE"))
+                    await probe_module.insert_pending_intent(probe)
+                    args = (probe.task_id,) if message_tenant is None else (probe.task_id, message_tenant)
+                    job = await pool.enqueue_job("process_task", *args)
+                    assert job is not None
+                    await job.result(timeout=15, poll_delay=0.05)
+                    result = await job.result_info()
+                    assert result is not None and result.success, "坏消息没有真实消费完成"
+                    assert result.args == args
+                    state = await probe_module.read_task_state(probe.task_id)
+                    metadata = await probe_module.read_dataset_metadata(probe.dataset_id)
+                    assert state["status"] == "pending" and state["attempt_count"] == 0, state
+                    assert state["tenant_id"] == 2 and state["worker_id"] is None, state
+                    assert (metadata or {}).get("status") == "pending", metadata
+                # 释放发现锁并提交意图后，真实周期补发负责恢复；不手工投递正确消息。
+            state = await worker_round_module.wait_for_round_result(
+                round_, lambda: probe_module.read_task_state(probe.task_id),
+                terminal=_terminal, timeout_seconds=RUN_TIMEOUT_SECONDS,
+                description="消费坏消息后未通过真实周期补发恢复",
+            )
+            assert state["status"] == "success" and state["attempt_count"] == 1, state
+            assert state["tenant_id"] == 2 and state["worker_id"] is None, state
+            completed_jobs = await pool.all_job_results()
+            assert any(
+                item.function == "process_task" and item.args == (probe.task_id, 2) and item.success
+                for item in completed_jobs
+            ), "周期补发没有携带持久化租户创建并完成正确消息"
+            metadata = await probe_module.read_dataset_metadata(probe.dataset_id)
+            assert (metadata or {}).get("status") == "completed", metadata
+    finally:
+        await pool.aclose()
+        await engine.dispose()
         await probe_module.delete_probe_rows(probe)
 
 

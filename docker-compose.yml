@@ -150,6 +150,12 @@ services:
       - "host.docker.internal:host-gateway"
     env_file:
       - ${YUXI_ENV_FILE:-.env}
+      # 跨租户发现的**专用凭据**只在这里加载：只有 worker 需要枚举租户，角色
+      # `yuxi_worker_discovery` 只有 `SELECT (id) ON tenants`。API **不**加载这个文件 →
+      # 拿不到这条能力（见 docs/develop-guides/version-14-worker-tenant-chain-spec.md §5）。
+      # 这两个变量**不要**放进 `.env`：`.env` 被 api 的 env_file 注入，会把发现能力泄漏给 API。
+      - path: .env.discovery
+        required: false
     environment:
       <<: *api-worker-env
       YUXI_RUNTIME_DIR: /app/runtime/worker
@@ -206,6 +212,10 @@ services:
       - app-network
     env_file:
       - ${YUXI_ENV_FILE:-.env}
+      # 迁移器负责**创建**发现角色，所以它需要该角色的初始口令（只在角色不存在时用）。
+      # 它**不需要**发现连接串——迁移不查 tenants，角色权限也由 owner 连接授予。
+      - path: .env.discovery
+        required: false
     environment:
       <<: *api-worker-env
       YUXI_RUNTIME_DIR: /app/runtime/storage-migrator

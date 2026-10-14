@@ -10,6 +10,7 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from sqlalchemy import text
+from yuxi.config.multi_tenant import multi_tenant_enabled
 from yuxi.services.run_queue_service import (
     WORKER_RECONCILIATION_HEALTH_KEY,
     WORKER_RECONCILIATION_HEALTH_TTL_SECONDS,
@@ -24,16 +25,22 @@ from yuxi.storage.postgres.manager import pg_manager
 
 READINESS_PROBE_TIMEOUT_SECONDS = float(os.getenv("READINESS_PROBE_TIMEOUT_SECONDS", "2"))
 READINESS_CACHE_TTL_SECONDS = float(os.getenv("READINESS_CACHE_TTL_SECONDS", "1"))
+# Postgres 探针是**纯连通性**探针，不是业务查询。
+#
+# 为什么钉成常量：readiness 在**无租户上下文**下运行（免租户端点），若这里改成查按租户隔离的
+# 业务表，RLS 会返回 **0 行**而不是报错——"查询成功"于是变成**错误的就绪信号**。`SELECT 1`
+# 不引用任何表，空结果问题从根上不存在。测试断言这条 SQL 不含表名。
+POSTGRES_PROBE_SQL = "SELECT 1"
 Probe = Callable[[], Awaitable[None]]
 _readiness_cache: tuple[tuple, float, dict[str, Any]] | None = None
 _readiness_inflight: dict[tuple, asyncio.Task] = {}
 
 
 async def _probe_postgres() -> None:
-    """验证业务 PostgreSQL 连接能够执行查询。"""
+    """验证业务 PostgreSQL 连接能够执行查询（纯连通性，不读任何业务表）。"""
 
     async with pg_manager.get_async_session_context() as session:
-        await session.execute(text("SELECT 1"))
+        await session.execute(text(POSTGRES_PROBE_SQL))
 
 
 async def _probe_redis() -> None:
@@ -90,6 +97,19 @@ def _component_snapshot(components: dict[str, dict[str, Any]] | None) -> tuple:
     )
 
 
+def _tenant_context_check() -> dict[str, str]:
+    """多租户模式下租户声明解析未接入 → **不能**报就绪。
+
+    readiness 的语义是"可以接业务流量"。多租户部署当前会把**所有业务请求 503**（Claim 解析
+    尚未接入），此时若仍报"就绪"，就是在探活通过、业务全挂的状态下发出错误信号。所以这里
+    显式失败，让编排器不要往这个实例发流量。
+    """
+
+    if multi_tenant_enabled():
+        return {"status": "error", "code": "tenant_claim_resolution_unavailable"}
+    return {"status": "ok"}
+
+
 async def _compute_readiness(*, startup_complete: bool, component_snapshot: tuple) -> dict[str, Any]:
     """执行一次真实探针并合并启动组件事实。"""
 
@@ -111,6 +131,7 @@ async def _compute_readiness(*, startup_complete: bool, component_snapshot: tupl
         "postgres": postgres,
         "redis": redis,
         "worker": worker,
+        "tenant_context": _tenant_context_check(),
     }
     required_components_ready = all(
         component["status"] == "ok" for component in components.values() if component["required"]
@@ -135,7 +156,16 @@ async def get_readiness(
     global _readiness_cache
 
     component_snapshot = _component_snapshot(startup_components)
-    cache_key = (startup_complete, component_snapshot, id(_probe_postgres), id(_probe_redis), id(_probe_worker))
+    cache_key = (
+        startup_complete,
+        component_snapshot,
+        id(_probe_postgres),
+        id(_probe_redis),
+        id(_probe_worker),
+        # 多租户开关参与缓存键：它决定 `tenant_context` 检查的结果，不带上就会在开关变化后
+        # 继续返回旧结论（1 秒 TTL 内，或单飞期间）。
+        multi_tenant_enabled(),
+    )
     now = time.monotonic()
     if _readiness_cache is not None:
         cached_key, expires_at, cached_result = _readiness_cache

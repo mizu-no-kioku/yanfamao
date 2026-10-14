@@ -65,6 +65,7 @@ from sqlalchemy.engine import make_url
 
 from yuxi.services.run_queue_service import WORKER_RECONCILIATION_HEALTH_KEY
 from yuxi.services.task_queue_service import TASK_RECONCILIATION_HEALTH_KEY
+from yuxi.storage.postgres.manager import TENANT_DISCOVERY_ROLE
 
 from _migration_round import QUIESCENCE_ENV_VARS, build_round_roots, new_round_root
 from _round_process import CapturedProcess, spawn_captured
@@ -309,6 +310,18 @@ def restricted_runtime_url() -> str:
     return url.set(username="yuxi_app", password=password).render_as_string(hide_password=False)
 
 
+def discovery_url() -> str:
+    """测试实例上的**发现角色**连接串（跨租户发现专用）。
+
+    与运行时连接串分开：发现角色只有 `SELECT (id) ON tenants`，只有 worker 配置它
+    （API 不持有，见 `docs/develop-guides/version-14-worker-tenant-chain-spec.md` §5）。
+    """
+
+    url = make_url(tenant_schema_url())
+    password = os.environ.get("POSTGRES_DISCOVERY_PASSWORD", "postgres")
+    return url.set(username=TENANT_DISCOVERY_ROLE, password=password).render_as_string(hide_password=False)
+
+
 def application_root() -> Path:
     """装着 `server/` 与 `package/` 的应用根。
 
@@ -343,6 +356,9 @@ def build_worker_env(
     env["POSTGRES_URL"] = tenant_schema_url()
     # 父进程的 POSTGRES_APP_URL / REDIS_URL / 沙箱地址指向开发实例，必须**换掉**而不是留着继承。
     env["POSTGRES_APP_URL"] = restricted_runtime_url()
+    # 跨租户发现走**专用角色**：worker 必须拿到它，否则 `require_discovery_credential()` 让
+    # worker 起不来（fail-closed）。API 不配置这条——这正是"区分普通请求与跨租户 worker"的边界。
+    env["POSTGRES_DISCOVERY_URL"] = discovery_url()
     env["REDIS_URL"] = redis_url
     env["PYTHONPATH"] = os.pathsep.join(
         part for part in (str(application_root()), env.get("PYTHONPATH", "")) if part

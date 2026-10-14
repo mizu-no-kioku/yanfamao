@@ -992,6 +992,7 @@ class TaskRecord(Base):
             "status": self.status,
             "progress": self.progress,
             "message": self.message,
+            "tenant_id": self.tenant_id,
             "created_at": format_utc_datetime(self.created_at),
             "updated_at": format_utc_datetime(self.updated_at),
             "started_at": format_utc_datetime(self.started_at),
@@ -1013,6 +1014,8 @@ class TaskRecord(Base):
         data = self.to_dict()
         data.pop("payload", None)
         data.pop("result", None)
+        # 摘要供 API 列表使用，保持既有响应形状：不外泄归属列。
+        data.pop("tenant_id", None)
         return data
 
 

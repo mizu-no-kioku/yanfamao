@@ -14,6 +14,11 @@ REQUIRED_STORAGE_TARGETS = {
     "worker": frozenset({"/app/user-data", "/app/skill-sources", "/app/skill-projections"}),
 }
 FORBIDDEN_API_WORKER_ENV_KEYS = frozenset({"YUXI_DOCKER_API_BASE"})
+# 跨租户发现的专用凭据。方案 (b)：只有 worker 需要枚举租户，**API 不得持有**。
+DISCOVERY_ENV_KEYS = frozenset({"POSTGRES_DISCOVERY_URL", "POSTGRES_DISCOVERY_PASSWORD"})
+DISCOVERY_ENV_FILE = ".env.discovery"
+DISCOVERY_ENV_FILE_CONSUMERS = frozenset({"worker", "storage-migrator"})
+ALL_SERVICES_WITH_DISCOVERY_CHECK = ("api", "worker", "storage-migrator")
 EXPECTED_RUNTIME_DIRS = {"api": "/app/runtime/api", "worker": "/app/runtime/worker"}
 EXPECTED_REDIS_CONNECTION_CAPACITY = {
     "api": "${API_REDIS_MAX_CONNECTIONS:-256}",
@@ -70,6 +75,19 @@ def _load_compose(filename: str) -> dict:
     return yaml.safe_load((_project_root() / filename).read_text())
 
 
+def _env_file_entries(service: dict) -> list[str]:
+    """归一化服务的 `env_file`：短格式字符串与长格式 dict 都还原成路径字符串。
+
+    Compose 的 `env_file` 会把文件内容**注入容器环境**——这与 `${...}` 插值是**两个**
+    机制。所以判断"某服务是否拿得到某个变量"时，必须同时看 `environment` 与 `env_file`。
+    """
+
+    entries = service.get("env_file") or []
+    if isinstance(entries, (str, dict)):
+        entries = [entries]
+    return [str(entry.get("path") or "") if isinstance(entry, dict) else str(entry) for entry in entries]
+
+
 def _volume_target(volume: object) -> str:
     """读取 Compose 短格式或长格式 volume 的容器目标路径。"""
     if isinstance(volume, dict):
@@ -107,6 +125,28 @@ def _forbidden_api_worker_env_keys(compose: dict) -> set[tuple[str, str]]:
         environment = compose["services"][service_name].get("environment") or {}
         for key in FORBIDDEN_API_WORKER_ENV_KEYS & environment.keys():
             violations.add((service_name, key))
+    return violations
+
+
+def _discovery_credential_violations(compose: dict) -> set[str]:
+    """返回"发现凭据可达性"违规：`<service>:<key>` / `<service>:.env.discovery`。
+
+    方案 (b) 的边界是**消费者区分**：只有 worker 能枚举租户。凭据一旦经 `environment` 或
+    共享 `env_file` 到得了 API（或任何非消费者），这条边界在**部署层**就失效了。
+    """
+
+    services = compose["services"]
+    violations: set[str] = set()
+
+    api = services.get("api") or {}
+    for key in DISCOVERY_ENV_KEYS & (api.get("environment") or {}).keys():
+        violations.add(f"api:{key}")
+    if DISCOVERY_ENV_FILE in _env_file_entries(api):
+        violations.add(f"api:{DISCOVERY_ENV_FILE}")
+
+    for service_name, service in services.items():
+        if DISCOVERY_ENV_FILE in _env_file_entries(service) and service_name not in DISCOVERY_ENV_FILE_CONSUMERS:
+            violations.add(f"{service_name}:{DISCOVERY_ENV_FILE}")
     return violations
 
 
@@ -375,6 +415,62 @@ def test_storage_migration_script_recovers_stopped_production_deployment(
 def test_api_and_worker_do_not_expose_removed_docker_api_configuration(filename: str):
     """API/worker 不得保留已删除 Docker daemon 通道的配置表面。"""
     assert _forbidden_api_worker_env_keys(_load_compose(filename)) == set()
+
+
+@pytest.mark.parametrize("filename", ["docker-compose.yml", "docker-compose.prod.yml"])
+def test_only_worker_and_migrator_can_reach_the_discovery_credential(filename: str) -> None:
+    """跨租户发现凭据只能由 worker / storage-migrator 加载——**API 不得持有**。
+
+    文档写"API 不持有"不等于部署真的做到：`env_file` 会把文件**内容**注入容器环境，所以
+    只要共享的 `.env` 里有发现凭据，api 就会拿到它。这条钉住"按消费者区分"在 Compose 层成立。
+    """
+    assert _discovery_credential_violations(_load_compose(filename)) == set()
+
+    # 共享的 env 模板里不得再出现发现凭据的**赋值**（注释可以）——它是 api 的 env_file。
+    text = (_project_root() / ".env.template").read_text()
+    for key in DISCOVERY_ENV_KEYS:
+        assert not re.search(rf"^{key}=", text, flags=re.MULTILINE), key
+
+
+def test_discovery_guard_detects_the_credential_file_reaching_api() -> None:
+    """把发现凭据文件加进 api 的 env_file 时，guard 必须报告。"""
+    compose = deepcopy(_load_compose("docker-compose.yml"))
+    compose["services"]["api"]["env_file"].append(DISCOVERY_ENV_FILE)
+
+    assert _discovery_credential_violations(compose) == {f"api:{DISCOVERY_ENV_FILE}"}
+
+
+def test_discovery_guard_detects_the_credential_key_in_api_environment() -> None:
+    """把发现凭据变量写进 api 的 environment 时，guard 必须报告。"""
+    compose = deepcopy(_load_compose("docker-compose.yml"))
+    compose["services"]["api"]["environment"]["POSTGRES_DISCOVERY_PASSWORD"] = "leaked"
+
+    assert _discovery_credential_violations(compose) == {"api:POSTGRES_DISCOVERY_PASSWORD"}
+
+
+def test_discovery_guard_detects_a_non_consumer_loading_the_credential_file() -> None:
+    """任何**非消费者**服务加载发现凭据文件时，guard 必须报告。"""
+    compose = deepcopy(_load_compose("docker-compose.yml"))
+    compose["services"]["web"].setdefault("env_file", []).append(DISCOVERY_ENV_FILE)
+
+    assert _discovery_credential_violations(compose) == {f"web:{DISCOVERY_ENV_FILE}"}
+
+
+def test_api_startup_does_not_require_a_discovery_credential() -> None:
+    """API 启动路径**不得**依赖跨租户发现凭据——那是 worker 的能力（方案 (b)）。
+
+    API 与 worker 共用 `pg_manager`，但只有 worker 的启动闸门包含发现凭据校验；API 的启动
+    只校验 schema 版本与受限运行时角色。这条把"API 不持有发现凭据"从部署配置追到**代码路径**。
+    """
+    root = _project_root()
+    api_source = (root / "backend/server/utils/lifespan.py").read_text()
+    worker_source = (root / "backend/package/yuxi/services/run_worker.py").read_text()
+
+    assert "require_discovery_credential" not in api_source
+    assert "require_discovery_credential" in worker_source
+    # 也不得直接引用发现连接——API 连"发现"这个概念都不该出现在启动路径上。
+    assert "discovery_engine" not in api_source
+    assert "DiscoverySession" not in api_source
 
 
 @pytest.mark.parametrize("filename", ["docker-compose.yml", "docker-compose.prod.yml"])
