@@ -7,6 +7,7 @@ from abc import ABC, abstractmethod
 from typing import Any
 
 import regex as safe_regex
+
 from yuxi.knowledge.chunking.ragflow_like.presets import ensure_chunk_defaults_in_additional_params
 from yuxi.knowledge.read_models import KnowledgeBaseConfig
 from yuxi.knowledge.schemas import (

@@ -29,6 +29,7 @@ class QueryPolicy:
     selectable_columns: Mapping[str, frozenset[str]] = field(default_factory=dict)
     project_scope_columns: Mapping[str, str] = field(default_factory=dict)
     staff_scope_columns: Mapping[str, str] = field(default_factory=dict)
+    status_scope_columns: Mapping[str, str] = field(default_factory=dict)
     global_tables: frozenset[str] = frozenset()
     denied_tables: frozenset[str] = frozenset()
     denied_columns: frozenset[str] = frozenset()
@@ -151,9 +152,13 @@ class SQLSecurityGuard:
         self._staff_scope_columns = {
             table.lower(): column.lower() for table, column in policy.staff_scope_columns.items()
         }
+        self._status_scope_columns = {
+            table.lower(): column.lower() for table, column in policy.status_scope_columns.items()
+        }
         for scope_name, scope_columns in (
             ("project_scope_columns", self._project_scope_columns),
             ("staff_scope_columns", self._staff_scope_columns),
+            ("status_scope_columns", self._status_scope_columns),
         ):
             for table_name, column_name in scope_columns.items():
                 if table_name not in self._table_columns or column_name not in self._table_columns[table_name]:
@@ -351,15 +356,14 @@ class SQLSecurityGuard:
         for scope in traverse_scope(root):
             predicates: list[exp.Expression] = []
             for alias, table_name, _ in self._physical_sources(scope):
-                columns = self._table_columns[table_name]
                 if table_name not in self._global_tables:
                     predicates.append(
                         exp.column("TENANT_ID", table=alias).eq(exp.Literal.number(self.policy.tenant_id))
                     )
-                if "operater_status" in columns:
+                if table_name in self._status_scope_columns:
                     predicates.append(
                         exp.GT(
-                            this=exp.column("OPERATER_STATUS", table=alias),
+                            this=exp.column(self._status_scope_columns[table_name], table=alias),
                             expression=exp.Literal.number(0),
                         )
                     )
@@ -414,8 +418,9 @@ class SQLSecurityGuard:
                     expected = f"{alias}.tenant_id = {self.policy.tenant_id}"
                     if expected not in where_sql:
                         raise PolicyViolation("TENANT_REWRITE_FAILED", "租户过滤条件注入失败")
-                if "operater_status" in self._table_columns[table_name]:
-                    expected = f"{alias}.operater_status > 0"
+                if table_name in self._status_scope_columns:
+                    column = self._status_scope_columns[table_name]
+                    expected = f"{alias}.{column} > 0"
                     if expected not in where_sql:
                         raise PolicyViolation("STATUS_REWRITE_FAILED", "有效数据过滤条件注入失败")
                 if table_name in self._staff_scope_columns:

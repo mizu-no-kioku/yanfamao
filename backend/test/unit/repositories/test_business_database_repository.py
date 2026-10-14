@@ -34,8 +34,11 @@ class FakeConnection:
     def __init__(self):
         self.cursor_instance = FakeCursor()
         self.closed = False
+        self.cursor_classes: list[object] = []
 
-    def cursor(self):
+    def cursor(self, cursor_class=None):
+        # repository 显式请求 DictCursor，以便在共享连接（目录按位置取值）上取到字典行。
+        self.cursor_classes.append(cursor_class)
         return self.cursor_instance
 
     def close(self):

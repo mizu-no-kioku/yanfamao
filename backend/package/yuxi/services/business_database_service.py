@@ -5,24 +5,27 @@ from __future__ import annotations
 import json
 import os
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
-from datetime import date, datetime, time as datetime_time
+from datetime import date, datetime
+from datetime import time as datetime_time
 from decimal import Decimal
 from typing import Any
 
+import pymysql
+from yuxi.nl2sql import errors as nl2sql_errors
+from yuxi.nl2sql.directory import BusinessDirectory
+from yuxi.nl2sql.mysql_directory import directory_on_connection
+from yuxi.nl2sql.policy_resolver import ResolvedPolicy, resolve_query_policy
+from yuxi.nl2sql.principal import BusinessPrincipal
 from yuxi.repositories.business_database_repository import (
     BusinessDatabaseConnection,
     BusinessDatabaseRepository,
 )
-from yuxi.services.business_database_security import QueryPolicy, SQLSecurityGuard
+from yuxi.services.business_database_security import SQLSecurityGuard
 from yuxi.utils import logger
 
-DEFAULT_ALLOWED_TABLES = frozenset({"t_project", "t_project_user"})
-PROJECT_SCOPE_COLUMNS = {
-    "t_project": "ID",
-    "t_project_user": "PROJECT_ID",
-}
 PERMANENTLY_DENIED_COLUMNS = frozenset(
     {
         "ACCOUNT",
@@ -47,15 +50,22 @@ class BusinessDatabaseAuthorizationError(PermissionError):
 
 
 @dataclass(frozen=True)
-class BusinessDatabaseIdentity:
-    """由服务端维护的原业务系统身份和授权范围。"""
+class BusinessDatabaseBinding:
+    """Yuxi 用户到业务库身份的绑定。
 
-    tenant_id: int
-    staff_id: int
-    allowed_tables: frozenset[str]
+    只声明「这个 Yuxi 用户是谁」以及可选的环境变量收紧项。
+    租户可以省略（由业务库推导），**员工编号不在此声明**——由解析器按当前租户动态推导，
+    这样员工与租户的对应关系变化时不需要改配置。
+
+    这里只允许出现「收紧」项。行范围（租户、有效状态、授权项目、员工本人）由代码与
+    RBAC/YAML 资源授权共同裁决，环境变量无权取消；历史上用于放开成员行范围的
+    `allow_project_member_rows` 已删除，出现即按配置错误拒绝。
+    """
+
+    business_user_id: int
+    tenant_id: int | None
+    allowed_tables: frozenset[str] | None
     allowed_columns: dict[str, frozenset[str]]
-    allow_all_projects: bool
-    allow_project_member_rows: bool
 
 
 @dataclass(frozen=True)
@@ -113,21 +123,37 @@ class BusinessDatabaseSettings:
             max_rows=max_rows,
         )
 
-    def resolve_identity(self, uid: str) -> BusinessDatabaseIdentity:
-        """把可信 Yuxi uid 解析为旧系统租户、员工和查询授权。"""
+    def resolve_binding(self, uid: str) -> BusinessDatabaseBinding:
+        """把可信 Yuxi uid 解析为业务库身份绑定与可选收紧项。
+
+        绑定只给 `business_user_id`（租户可选），**员工编号不再静态声明**——
+        它由解析器按当前租户从业务库推导，员工归属变化时无需改配置。
+        `allowed_tables` / `allowed_columns` 是环境变量层，语义上只能收紧：
+        清洗后为空的配置按错误拒绝，绝不回退成「不限制」。
+        """
         raw = self.identities.get(uid)
         if not isinstance(raw, dict):
             raise BusinessDatabaseAuthorizationError("当前用户尚未绑定业务数据库身份")
 
-        tenant_id = _positive_integer(raw.get("tenant_id"), "tenant_id")
-        staff_id = _positive_integer(raw.get("staff_id"), "staff_id")
-        configured_tables = raw.get("allowed_tables", sorted(DEFAULT_ALLOWED_TABLES))
-        if not isinstance(configured_tables, list) or not configured_tables:
-            raise BusinessDatabaseConfigurationError("allowed_tables 必须是非空表名列表")
-        allowed_tables = frozenset(str(name).strip().lower() for name in configured_tables if str(name).strip())
-        unsupported = allowed_tables - DEFAULT_ALLOWED_TABLES
-        if unsupported:
-            raise BusinessDatabaseConfigurationError("以下业务表尚未完成权限审计：" + ", ".join(sorted(unsupported)))
+        if "allow_project_member_rows" in raw:
+            raise BusinessDatabaseConfigurationError(
+                "allow_project_member_rows 已废弃：环境变量层只能收紧，不能取消 STAFF_ID 行范围；"
+                "如需查看其他项目成员，请通过 RBAC/YAML 资源授权表达"
+            )
+
+        business_user_id = _positive_integer(raw.get("business_user_id"), "business_user_id")
+        raw_tenant = raw.get("tenant_id")
+        tenant_id = None if raw_tenant in (None, "") else _positive_integer(raw_tenant, "tenant_id")
+
+        allowed_tables: frozenset[str] | None = None
+        if "allowed_tables" in raw:
+            configured = raw["allowed_tables"]
+            if not isinstance(configured, list) or not configured:
+                raise BusinessDatabaseConfigurationError("allowed_tables 必须是非空表名列表")
+            names = frozenset(str(name).strip().lower() for name in configured if str(name).strip())
+            if not names:
+                raise BusinessDatabaseConfigurationError("allowed_tables 清洗后为空表名列表")
+            allowed_tables = names
 
         raw_columns = raw.get("allowed_columns", {})
         if not isinstance(raw_columns, dict):
@@ -135,35 +161,44 @@ class BusinessDatabaseSettings:
         allowed_columns: dict[str, frozenset[str]] = {}
         for table_name, columns in raw_columns.items():
             normalized_table = str(table_name).strip().lower()
-            if normalized_table not in allowed_tables:
-                raise BusinessDatabaseConfigurationError(f"allowed_columns 包含未授权表 {normalized_table}")
+            if not normalized_table:
+                raise BusinessDatabaseConfigurationError("allowed_columns 含空表名")
             if not isinstance(columns, list) or not columns:
                 raise BusinessDatabaseConfigurationError(f"表 {normalized_table} 的 allowed_columns 必须是非空列表")
-            allowed_columns[normalized_table] = frozenset(str(column).strip().upper() for column in columns)
+            cleaned = frozenset(str(column).strip().upper() for column in columns if str(column).strip())
+            if not cleaned:
+                raise BusinessDatabaseConfigurationError(f"表 {normalized_table} 的 allowed_columns 清洗后为空字段列表")
+            allowed_columns[normalized_table] = cleaned
 
-        allow_all_projects = raw.get("allow_all_projects", False)
-        if not isinstance(allow_all_projects, bool):
-            raise BusinessDatabaseConfigurationError("allow_all_projects 必须是布尔值")
-        allow_project_member_rows = raw.get("allow_project_member_rows", False)
-        if not isinstance(allow_project_member_rows, bool):
-            raise BusinessDatabaseConfigurationError("allow_project_member_rows 必须是布尔值")
-        return BusinessDatabaseIdentity(
+        return BusinessDatabaseBinding(
+            business_user_id=business_user_id,
             tenant_id=tenant_id,
-            staff_id=staff_id,
             allowed_tables=allowed_tables,
             allowed_columns=allowed_columns,
-            allow_all_projects=allow_all_projects,
-            allow_project_member_rows=allow_project_member_rows,
         )
+
+
+@dataclass(frozen=True)
+class BusinessQueryScope:
+    """一次业务库工具调用共用的只读连接与解析目录。
+
+    解析与最终 SQL 必须落在这同一条连接、同一个事务上，才能保证策略所依据的
+    权限快照与查询所依据的数据快照是同一份。
+    """
+
+    connection: pymysql.connections.Connection
+    directory: BusinessDirectory
 
 
 @dataclass(frozen=True)
 class PreparedBusinessDatabaseAccess:
     """完成身份、Schema 和项目授权解析后的执行上下文。"""
 
-    identity: BusinessDatabaseIdentity
+    resolved: ResolvedPolicy
     metadata: dict[str, list[dict[str, Any]]]
     guard: SQLSecurityGuard
+    repository: BusinessDatabaseRepository
+    connection: pymysql.connections.Connection
 
 
 class BusinessDatabaseService:
@@ -175,149 +210,191 @@ class BusinessDatabaseService:
         repository_factory: Callable[
             [BusinessDatabaseConnection], BusinessDatabaseRepository
         ] = BusinessDatabaseRepository,
+        query_scope: Callable[[BusinessDatabaseConnection], AbstractContextManager[BusinessQueryScope]] | None = None,
     ):
         self._settings_loader = settings_loader
         self._repository_factory = repository_factory
+        # 延迟解析：模块级上下文管理器定义在类之后，直接做默认参数会在类定义时求值失败。
+        self._query_scope = query_scope or mysql_query_scope
 
     def list_authorized_tables(self, uid: str) -> list[dict[str, str]]:
         """列出当前用户可供模型选择的业务表。"""
-        settings, repository, access = self._prepare(uid)
-        del settings, repository
-        return [
-            {
-                "table_name": table_name,
-                "comment": str(columns[0].get("TABLE_COMMENT") or ""),
-            }
-            for table_name, columns in sorted(access.metadata.items())
-        ]
+        with self._prepared(uid) as access:
+            return [
+                {
+                    "table_name": table_name,
+                    "comment": str(columns[0].get("TABLE_COMMENT") or ""),
+                }
+                for table_name, columns in sorted(access.metadata.items())
+            ]
 
     def describe_authorized_table(self, uid: str, table_name: str) -> dict[str, Any]:
         """返回当前用户可见的单表字段清单。"""
         normalized = str(table_name or "").strip().lower()
-        settings, repository, access = self._prepare(uid)
-        del settings, repository
-        if normalized not in access.metadata:
-            raise BusinessDatabaseAuthorizationError(f"当前身份无权查看表 {normalized or '<empty>'}")
-        columns = access.metadata[normalized]
-        return {
-            "table_name": normalized,
-            "comment": str(columns[0].get("TABLE_COMMENT") or ""),
-            "columns": [
-                {
-                    "name": str(column["COLUMN_NAME"]),
-                    "type": str(column["COLUMN_TYPE"]),
-                    "comment": str(column.get("COLUMN_COMMENT") or ""),
-                }
-                for column in columns
-            ],
-            "enforced_scope": "tenant + active records + authorized projects + configured staff scope",
-        }
+        with self._prepared(uid) as access:
+            if normalized not in access.metadata:
+                raise BusinessDatabaseAuthorizationError(f"当前身份无权查看表 {normalized or '<empty>'}")
+            columns = access.metadata[normalized]
+            return {
+                "table_name": normalized,
+                "comment": str(columns[0].get("TABLE_COMMENT") or ""),
+                "columns": [
+                    {
+                        "name": str(column["COLUMN_NAME"]),
+                        "type": str(column["COLUMN_TYPE"]),
+                        "comment": str(column.get("COLUMN_COMMENT") or ""),
+                    }
+                    for column in columns
+                ],
+                "enforced_scope": "tenant + active records + authorized projects + configured staff scope",
+            }
 
     def execute_authorized_query(self, uid: str, sql: str) -> dict[str, Any]:
-        """校验、重写并执行一条当前身份可访问的只读查询。"""
-        started_at = time.monotonic()
-        settings, repository, access = self._prepare(uid)
-        secured = access.guard.secure(sql)
-        result = repository.execute_query(secured.final_sql)
-        normalized_result = _json_safe(result)
-        logger.info(
-            "business database query completed uid={} tenant_id={} staff_id={} tables={} rows={} latency_ms={}",
-            uid,
-            access.identity.tenant_id,
-            access.identity.staff_id,
-            list(secured.tables),
-            normalized_result["row_count"],
-            round((time.monotonic() - started_at) * 1000, 2),
-        )
-        return {
-            **normalized_result,
-            "limit": secured.limit,
-            "tables": list(secured.tables),
-            "scope": "tenant + active records + authorized projects + configured staff scope",
-        }
+        """校验、重写并执行一条当前身份可访问的只读查询。
 
-    def _prepare(
-        self,
-        uid: str,
-    ) -> tuple[BusinessDatabaseSettings, BusinessDatabaseRepository, PreparedBusinessDatabaseAccess]:
+        解析、Schema 读取、SQL 校验与最终执行共用**同一条只读连接和同一个事务**：
+        策略与它约束的数据来自同一快照。每次调用都新建连接与事务，不缓存策略，
+        因此下一次调用必然看到已提交的撤权。
+        """
+        started_at = time.monotonic()
+        with self._prepared(uid) as access:
+            secured = access.guard.secure(sql)
+            result = access.repository.execute_query(secured.final_sql, connection=access.connection)
+            normalized_result = _json_safe(result)
+            logger.info(
+                "business database query completed uid={} tenant_id={} staff_id={} tables={} rows={} latency_ms={}",
+                uid,
+                access.resolved.subject.tenant_id,
+                access.resolved.subject.staff_id,
+                list(secured.tables),
+                normalized_result["row_count"],
+                round((time.monotonic() - started_at) * 1000, 2),
+            )
+            return {
+                **normalized_result,
+                "limit": secured.limit,
+                "tables": list(secured.tables),
+                "scope": "tenant + active records + authorized projects + configured staff scope",
+            }
+
+    @contextmanager
+    def _prepared(self, uid: str) -> Iterator[PreparedBusinessDatabaseAccess]:
+        """在一次只读连接与事务内完成解析、Schema 读取与策略构造。
+
+        `list` / `describe` / `query` 都走这里，因此三者都会重新读取当前权限。
+        """
         normalized_uid = str(uid or "").strip()
         if not normalized_uid:
             raise BusinessDatabaseAuthorizationError("无法获取当前 Yuxi 用户身份")
         settings = self._settings_loader()
-        identity = settings.resolve_identity(normalized_uid)
+        binding = settings.resolve_binding(normalized_uid)
         repository = self._repository_factory(settings.connection)
-        if not repository.validate_staff_identity(identity.tenant_id, identity.staff_id):
-            raise BusinessDatabaseAuthorizationError("绑定的员工不属于当前租户或员工记录已失效")
 
-        raw_metadata = repository.load_schema(identity.allowed_tables)
-        missing_tables = identity.allowed_tables - set(raw_metadata)
-        if missing_tables:
-            raise BusinessDatabaseConfigurationError("授权表不存在：" + ", ".join(sorted(missing_tables)))
-        safe_metadata = _filter_metadata(raw_metadata, {})
-        metadata = _filter_metadata(safe_metadata, identity.allowed_columns)
-        table_columns = {
-            table_name: frozenset(str(column["COLUMN_NAME"]) for column in columns)
-            for table_name, columns in safe_metadata.items()
-        }
-        selectable_columns = {
-            table_name: frozenset(str(column["COLUMN_NAME"]) for column in columns)
-            for table_name, columns in metadata.items()
-        }
-        project_scope_columns = {
-            table_name: PROJECT_SCOPE_COLUMNS[table_name] for table_name in identity.allowed_tables
-        }
-        for table_name, project_column in project_scope_columns.items():
-            normalized_columns = {column.upper() for column in table_columns[table_name]}
-            if "TENANT_ID" not in normalized_columns or project_column not in normalized_columns:
-                raise BusinessDatabaseConfigurationError(f"表 {table_name} 缺少租户或项目安全字段")
+        with self._query_scope(settings.connection) as scope:
+            resolved = self._resolve_policy(binding, scope.directory, max_rows_env=settings.max_rows)
+            policy = resolved.policy
 
-        staff_scope_columns = (
-            {}
-            if identity.allow_project_member_rows or "t_project_user" not in identity.allowed_tables
-            else {"t_project_user": "STAFF_ID"}
-        )
+            raw_metadata = repository.load_schema(policy.allowed_tables, connection=scope.connection)
+            missing_tables = policy.allowed_tables - set(raw_metadata)
+            if missing_tables:
+                raise BusinessDatabaseConfigurationError("授权表不存在：" + ", ".join(sorted(missing_tables)))
+            metadata = _visible_metadata(raw_metadata, policy.selectable_columns)
 
-        project_ids = repository.list_project_ids(
-            identity.tenant_id,
-            identity.staff_id,
-            allow_all_projects=identity.allow_all_projects,
-        )
-        guard = SQLSecurityGuard(
-            QueryPolicy(
-                tenant_id=identity.tenant_id,
-                staff_id=identity.staff_id,
-                allowed_tables=identity.allowed_tables,
-                table_columns=table_columns,
-                allowed_project_ids=project_ids,
-                selectable_columns=selectable_columns,
-                project_scope_columns=project_scope_columns,
-                staff_scope_columns=staff_scope_columns,
-                denied_columns=PERMANENTLY_DENIED_COLUMNS,
-                max_rows=settings.max_rows,
+            guard = SQLSecurityGuard(policy)
+            yield PreparedBusinessDatabaseAccess(resolved, metadata, guard, repository, scope.connection)
+
+    def _resolve_policy(
+        self, binding: BusinessDatabaseBinding, directory: BusinessDirectory, *, max_rows_env: int
+    ) -> ResolvedPolicy:
+        """每次调用都重新解析身份、功能门、资源与项目范围。
+
+        不缓存结果：撤权必须在下一次调用开始的新事务里可见，缓存会让旧授权继续放行。
+        `max_rows_env` 来自 `YUXI_BUSINESS_DB_MAX_ROWS`，在解析器内与代码上限、YAML 上限求交，只能收紧。
+        """
+        try:
+            return resolve_query_policy(
+                BusinessPrincipal(user_id=binding.business_user_id, tenant_id=binding.tenant_id),
+                directory,
+                allowed_tables=binding.allowed_tables,
+                allowed_columns=binding.allowed_columns,
+                max_rows_env=max_rows_env,
             )
-        )
-        return settings, repository, PreparedBusinessDatabaseAccess(identity, metadata, guard)
+        except nl2sql_errors.PolicyDenial as exc:
+            raise BusinessDatabaseAuthorizationError(f"{exc.code}: {exc.message}") from exc
 
 
-def _filter_metadata(
+def _visible_metadata(
     raw_metadata: dict[str, list[dict[str, Any]]],
-    allowed_columns: dict[str, frozenset[str]],
+    selectable_columns: Mapping[str, frozenset[str]],
 ) -> dict[str, list[dict[str, Any]]]:
-    filtered: dict[str, list[dict[str, Any]]] = {}
+    """按策略的 selectable_columns 裁剪模型可见 schema。
+
+    模型可见列的唯一来源是策略，不在服务层重新推导——否则容易出现
+    「守卫按策略校验、schema 按另一套展示」这种两套口径不一致的缺陷。
+    守卫内部列（租户/状态）因此不会出现在模型可见结构里。
+    """
+    visible: dict[str, list[dict[str, Any]]] = {}
     for table_name, columns in raw_metadata.items():
-        requested = allowed_columns.get(table_name)
-        visible: list[dict[str, Any]] = []
+        allowed = selectable_columns.get(table_name.lower())
+        if not allowed:
+            continue
+        kept: list[dict[str, Any]] = []
         for column in columns:
             column_name = str(column["COLUMN_NAME"]).upper()
             if column_name in PERMANENTLY_DENIED_COLUMNS or column_name.endswith(PERMANENTLY_DENIED_SUFFIXES):
                 continue
-            if requested is not None and column_name not in requested:
+            if column_name not in allowed:
                 continue
-            visible.append(column)
-        if not visible:
+            kept.append(column)
+        if not kept:
             raise BusinessDatabaseConfigurationError(f"表 {table_name} 没有可授权字段")
-        filtered[table_name] = visible
-    return filtered
+        visible[table_name] = kept
+    return visible
+
+
+def _mysql_connection_factory(connection: BusinessDatabaseConnection) -> Callable[[], pymysql.connections.Connection]:
+    """解析器用的只读连接工厂。连接的真实生命周期由 mysql_query_scope 管理。"""
+    timeout_seconds = max(1, (connection.query_timeout_ms + 999) // 1000)
+
+    def connect() -> pymysql.connections.Connection:
+        return pymysql.connect(
+            host=connection.host,
+            port=connection.port,
+            user=connection.user,
+            password=connection.password,
+            database=connection.database,
+            charset="utf8mb4",
+            cursorclass=pymysql.cursors.Cursor,
+            connect_timeout=timeout_seconds,
+            read_timeout=timeout_seconds,
+            write_timeout=timeout_seconds,
+        )
+
+    return connect
+
+
+@contextmanager
+def mysql_query_scope(
+    connection: BusinessDatabaseConnection,
+    *,
+    connect: Callable[[], pymysql.connections.Connection] | None = None,
+) -> Iterator[BusinessQueryScope]:
+    """默认作用域：一条只读连接 + 一个只读事务，供解析与最终 SQL 共用。
+
+    连接由本函数创建并负责关闭；目录绑定在它上面，不会自行关闭。
+    撤权生效边界：下一次工具调用会开启新的连接与事务，因此已提交的撤权必然可见。
+
+    `connect` 可替换连接来源（例如测试中计数，或将来的连接池）。
+    """
+    active = (connect or _mysql_connection_factory(connection))()
+    try:
+        with active.cursor() as cursor:
+            cursor.execute("SET SESSION TRANSACTION READ ONLY")
+            cursor.execute(f"SET SESSION MAX_EXECUTION_TIME = {connection.query_timeout_ms}")
+            cursor.execute("START TRANSACTION READ ONLY")
+        yield BusinessQueryScope(connection=active, directory=directory_on_connection(active))
+    finally:
+        active.close()
 
 
 def _positive_integer(value: Any, name: str) -> int:

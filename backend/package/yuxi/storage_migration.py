@@ -39,6 +39,7 @@ from yuxi.storage_migrations.v072_runtime_identity import (
     migrate_runtime_storage_identity,
     runtime_storage_requires_quiescence,
 )
+from yuxi.storage_migrations.v073_retire_business_database_tools import retire_business_database_tools
 
 _QUIESCENCE_TOKEN_ENV = "YUXI_STORAGE_MIGRATION_QUIESCENCE_TOKEN"
 _QUIESCENCE_FILE_ENV = "YUXI_STORAGE_MIGRATION_QUIESCENCE_FILE"
@@ -86,6 +87,8 @@ async def _converge_database_state(*, fail_nonterminal_runs: bool) -> None:
             session,
             legacy_config_file=get_legacy_storage_dir() / "config/base.toml",
         )
+        # 退休工具名清理：天然幂等，每次启动跑一遍也不会产生副作用。
+        await retire_business_database_tools(session)
         await session.commit()
 
 

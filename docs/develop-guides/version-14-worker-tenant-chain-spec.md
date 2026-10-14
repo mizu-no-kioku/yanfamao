@@ -462,6 +462,11 @@ worker"用例（`test_shipping_worker_periodic_reconciliation_recovers_pending_p
 （另：该文件在基线上跑全量时还会出现 1 条 `asyncpg ... Event loop is closed` 的
 `test_worker_startup_ensures_builtin_mcp_servers` 失败，同样是这类连接/循环收尾问题的另一副面孔。）
 
+**更新（并入主树连接池修复之后）**：上表那 1 个 teardown ERROR **本次回归未复现**——
+`test/unit/services/test_run_worker.py` 合并前 `52 passed + 1 ERROR / 139.36s`，
+合并后 **`56 passed / 0 ERROR / 20.72s`**。措辞从"未关闭项"改为"**本次回归未复现**"。
+**原有格式欠账（`ruff format` 4 文件 / `--select I` 5 处）与安全门槛不因此关闭。**
+
 **`test_docker_compose_service_boundaries.py` 的 45 个 `skipped` 不是失败**：该文件按
 `YUXI_PROJECT_ROOT` 或向上找 `docker-compose.yml` 定位仓库根，而 `docker compose run` 只挂了
 `backend/*`；把仓库根挂进来（`-v <worktree>:/repo:ro -e YUXI_PROJECT_ROOT=/repo`）后 **51 passed**。

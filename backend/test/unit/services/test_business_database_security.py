@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import pytest
-
 from yuxi.services.business_database_security import PolicyViolation, QueryPolicy, SQLSecurityGuard
 
 pytestmark = pytest.mark.unit
@@ -21,6 +20,7 @@ def make_guard(project_ids: tuple[int, ...] = (2, 71), max_rows: int = 50) -> SQ
             allowed_project_ids=project_ids,
             project_scope_columns={"t_project": "ID", "t_project_user": "PROJECT_ID"},
             staff_scope_columns={"t_project_user": "STAFF_ID"},
+            status_scope_columns={"t_project": "OPERATER_STATUS", "t_project_user": "OPERATER_STATUS"},
             denied_tables=frozenset({"t_user", "t_staff_wage"}),
             denied_columns=frozenset({"PASSWORD", "SALT", "ID_CARD", "PHONES"}),
             max_rows=max_rows,
@@ -42,6 +42,32 @@ def test_guard_injects_tenant_project_status_and_limit() -> None:
     assert "p.operater_status > 0" in lowered
     assert "p.id in (2, 71)" in lowered
     assert "limit 50" in lowered
+
+
+def test_guard_uses_policy_declared_status_column() -> None:
+    """状态列必须取自策略声明，而不是硬编码 OPERATER_STATUS。
+
+    代码上限里每张表各自声明状态列；硬编码会在换表或换列时静默失效——
+    谓词照旧注入，但注入了错误的列名，强制层看似生效、实际不生效。
+    """
+    guard = SQLSecurityGuard(
+        QueryPolicy(
+            tenant_id=1,
+            staff_id=13,
+            allowed_tables=frozenset({"t_project"}),
+            table_columns={"t_project": frozenset({"ID", "TENANT_ID", "PROJECT_NAME", "ENABLE_STATUS"})},
+            allowed_project_ids=(2,),
+            project_scope_columns={"t_project": "ID"},
+            status_scope_columns={"t_project": "ENABLE_STATUS"},
+            max_rows=50,
+        )
+    )
+
+    secured = guard.secure("SELECT p.ID FROM t_project p")
+
+    lowered = secured.final_sql.lower()
+    assert "p.enable_status > 0" in lowered
+    assert "operater_status" not in lowered
 
 
 def test_guard_filters_each_joined_physical_table() -> None:

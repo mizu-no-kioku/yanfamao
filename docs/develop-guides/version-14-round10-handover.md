@@ -16,6 +16,11 @@
 **但回归不是全绿**：受影响单元集合是 `216 passed + 1 teardown ERROR`。该 ERROR 已用 HEAD 基线
 对照证明**不是本轮引入**，但那只能支持"非新增"，**不能算验收通过**——它仍是**未关闭项**（§1、§5）。
 
+> **更新（合并主树连接池修复之后）**：该 teardown ERROR **本次回归未复现**。
+> `test/unit/services/test_run_worker.py` 合并前实测 `52 passed + 1 ERROR / 139.36s`，
+> **合并后 `56 passed / 0 ERROR / 20.72s`**。措辞据此改为"**本次回归未复现**"——
+> 这是复跑证据，**不是**"已根治"的证明。
+
 **ruff 口径**：CI 跑**三条**命令（目录仅 `backend/package`，ruff **0.16.4**）：`ruff check` /
 `ruff format --check` / `ruff check --select I`。三条均已用"导出 HEAD 基线、跑同一组命令再对比"
 的口径实测，结果为**零新增违规**——`format` 与 `--select I` 与基线逐项相同（§5）。
@@ -268,6 +273,8 @@ $RUFF check --select I --no-cache --config backend/pyproject.toml package
 6. **`@pytest.mark.asyncio` + `asyncio_mode=auto` 的 teardown 隐患**：
    `test_run_worker.py` 有 1 条用例的 teardown 会因残留 psycopg 异步池阻塞约 60s 报 ERROR
    （断言本身通过）。**HEAD 基线同样复现、同样 64.16s**，非本轮引入。跑这个文件时请带 `--timeout`。
+   **更新**：并入主树的连接池修复后，**本次回归未复现**该 ERROR（合并前 `52 passed + 1 ERROR`、
+   合并后 `56 passed / 0 ERROR`）。仍建议带 `--timeout`——这是"未复现"，不是"已根治"。
 7. **口径纪律**：本分支**有意去掉**隐式默认租户兜底（`explicit_tenant_id()` 不回落）。
    凡是在主树"能过"的夹具用例，在这里可能因 RLS 拒绝而红——那是**预期**，不是回归。
 8. **隔离 schema 与一次性测试库会累积，且**不会**被自动删除**：guardrails 每跑一轮多约 65 个
